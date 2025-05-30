@@ -8,7 +8,7 @@
 [![License: BSD-3](https://img.shields.io/badge/License-Apache--2-blue)](https://opensource.org/license/apache-2-0)
 [![](https://img.shields.io/badge/Contact-OptoLlama-orange?label=Contact)](jonas.schaible@helmholtz-berlin.de)
 
-OptoLlama is a transformer AI-model enabling the inverse design of opto-electric materials. Given an absorption-reflection-transmission input spectrum, OptoLlama is able to propose a corresponding stack of materials and their layer thickness producing the "prompted" characteristics.
+OptoLlama is a transformer AI-model enabling the inverse design of thin-film material stacks. Given an reflectance-absorptance-transmittance input spectrum (RAT), OptoLlama is able to propose a corresponding stack of materials and their layer thickness producing the "prompted" characteristics.
 
 ## Installation
 We heavily recommend installing the `OptoLlama` package in a dedicated `Python3.11+` virtual environment. You can
