@@ -29,108 +29,110 @@ def save_JSONPICKLE(PATH: str, pyobj: Any, name: str) -> None:
     with open(f"{PATH}/{name}.json", 'w') as f:
         json.dump(frozen, f)
 
+
+from typing import Union, List, Dict, Optional, Tuple, Any
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 
-
-def _build_baseline(wavelengths, baseline_segments):
+def _build_baseline(
+    wavelengths: np.ndarray,
+    baseline_segments: Union[float, List[Dict[str, float]]]
+) -> np.ndarray:
     """
     Create a baseline curve from user-defined segments.
-
-    Parameters
-    ----------
-    wavelengths : 1-D ndarray
-    baseline_segments : float | list[dict]
-        • float – constant baseline  
-        • list – each dict has keys {'start', 'end', 'value'}
-
-    Returns
-    -------
-    baseline_curve : ndarray
+    If baseline_segments is a float, produces a constant baseline.
+    If it’s a list of dicts with keys 'start', 'end', 'value', (and now optional 'noise'),
+    it uses 'value' for the baseline.
     """
     if isinstance(baseline_segments, (int, float)):
         return np.full_like(wavelengths, baseline_segments, dtype=float)
 
-    # start with zeros then paint segment values
     baseline_curve = np.zeros_like(wavelengths, dtype=float)
     for seg in baseline_segments:
         mask = (wavelengths >= seg["start"]) & (wavelengths <= seg["end"])
         baseline_curve[mask] = seg["value"]
     return baseline_curve
 
-from scipy.ndimage import gaussian_filter1d
+def _build_noise_std(
+    wavelengths: np.ndarray,
+    baseline_segments: Union[float, List[Dict[str, float]]]
+) -> np.ndarray:
+    """
+    Create a per-wavelength noise-std curve from the same segments list,
+    looking for a 'noise' key in each dict (defaulting to 0.0).
+    """
+    if isinstance(baseline_segments, (int, float)):
+        return np.zeros_like(wavelengths, dtype=float)
 
-def generate_signal(signal_type,
-                    start_wavelength,
-                    end_wavelength,
-                    step_size,
-                    num_samples,
-                    *,
-                    peaks=None,
-                    baseline=0.0,
-                    noise_std_dev=0.01,
-                    smooth_signal=False,
-                    smooth_sigma=1,
-                    **legacy_kwargs):
+    noise_curve = np.zeros_like(wavelengths, dtype=float)
+    for seg in baseline_segments:
+        mask = (wavelengths >= seg["start"]) & (wavelengths <= seg["end"])
+        noise_curve[mask] = seg.get("noise", 0.0)
+    return noise_curve
+
+def generate_signal(
+    start_wavelength: float,
+    end_wavelength: float,
+    step_size: float,
+    num_samples: int,
+    *,
+    peaks: Optional[List[Dict[str, float]]] = None,
+    baseline: Union[float, List[Dict[str, float]]] = 0.0,
+    noise_std_dev: float = 0.01,
+    smooth_signal: bool = False,
+    smooth_sigma: float = 1.0,
+    **legacy_kwargs: Any
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate pure, noisy and RAT signals with support for
     • multiple Gaussian peaks
-    • piece-wise baselines
-    • legacy single-peak Gaussian and step signals
-    • smoothing the signal before noise addition
-
-    Parameters
-    ----------
-    signal_type : {'gaussian', 'step'}
-    start_wavelength, end_wavelength, step_size : float
-    num_samples : int
-    peaks : list[dict] | None
-        Each dict needs {'anchor', 'fwhm', 'amplitude'}
-    baseline : float | list[dict]
-        Constant value    – e.g. 0.1  
-        Piece-wise list   – e.g. [{'start':300,'end':800,'value':0.1},
-                                  {'start':800,'end':1400,'value':0.3},
-                                  {'start':1400,'end':2000,'value':0.05}]
-    noise_std_dev : float
-    smooth_signal : bool
-        Whether to smooth the signal before noise addition
-    smooth_sigma : float
-        Sigma value for the Gaussian filter used for smoothing
-    legacy_kwargs : keeps old arguments working
-        • gaussian   – anchor_wavelength, fwhm, amplitude, baseline
-        • step       – step_wavelength, baseline1, baseline2
+    • piece-wise baselines (with per-segment noise via a 'noise' key)
+    • optional smoothing before noise addition
 
     Returns
     -------
-    wavelengths, signals, noisy_signals, RAT : ndarrays
+    wavelengths : ndarray
+    signals    : ndarray  # num_samples × len(wavelengths), pure repeated
+    noisy_signals : ndarray
+    RAT        : ndarray
     """
+    # 1) DEFINE GRID
     wavelengths = np.arange(start_wavelength, end_wavelength + step_size, step_size)
 
-    # --- 1) PURE SIGNAL ------------------------------------------------------
+    # 2) PURE SIGNAL
     if peaks is None:
         pure_signal = _build_baseline(wavelengths, baseline)
     else:
         baseline_curve = _build_baseline(wavelengths, baseline)
-        sigma_factor = 1 / (2 * np.sqrt(2 * np.log(2)))           # pre-compute
+        sigma_factor = 1 / (2 * np.sqrt(2 * np.log(2)))
         total_peak = np.zeros_like(wavelengths, dtype=float)
         for p in peaks:
             sigma = p["fwhm"] * sigma_factor
             total_peak += p["amplitude"] * np.exp(-((wavelengths - p["anchor"]) / sigma) ** 2)
+        pure_signal = np.clip(baseline_curve + total_peak, 0.0, 1.0)
 
-        pure_signal = np.clip(baseline_curve + total_peak, 0, 1)
-        
-    # --- 2) MONTE-CARLO SAMPLE MATRICES --------------------------------------
+    # 3) BUILD NOISE STD CURVE
+    per_segment_noise = _build_noise_std(wavelengths, baseline)
+    total_noise_std = noise_std_dev + per_segment_noise
+
+    # 4) MONTE-CARLO NOISE ADDITION
     signals = np.tile(pure_signal, (num_samples, 1))
-    noise = np.random.normal(0, noise_std_dev, size=signals.shape)
-    noisy_signals = np.clip(signals + noise, 0, 1)
+    noise = np.random.normal(loc=0.0, scale=total_noise_std, size=signals.shape)
+    noisy_signals = np.clip(signals + noise, 0.0, 1.0)
 
-    # --- 3) SMOOTH SIGNAL ----------------------------------------------------
+    # 5) OPTIONAL SMOOTHING
     if smooth_signal:
-        noisy_signals = np.array([gaussian_filter1d(ns, smooth_sigma) for ns in noisy_signals])
+        noisy_signals = np.array([
+            gaussian_filter1d(ns, smooth_sigma)
+            for ns in noisy_signals
+        ])
 
-    # --- 4) RAT EXTENSION ----------------------------------------------------
+    # 6) RAT EXTENSION
     RAT = np.concatenate(
-        (noisy_signals, np.zeros_like(noisy_signals), 1 - noisy_signals),
+        (noisy_signals,
+         np.zeros_like(noisy_signals),
+         1.0 - noisy_signals),
         axis=1
     )
 
@@ -192,17 +194,3 @@ def plot_signal(wavelengths, signals, noisy_signals, RAT):
 #     noise_std_dev=0.01
 # )
 # plot_signal(w, s, ns, rat)
-
-# # ---------------------------------------------------------------
-# # 2. Legacy usage still works
-# # ---------------------------------------------------------------
-# w, s, ns, rat = generate_signal(
-#     "gaussian",
-#     300, 2000, 10,
-#     num_samples=50,
-#     anchor_wavelength=1000,
-#     fwhm=200,
-#     amplitude=0.8,
-#     baseline=0.0,
-#     noise_std_dev=0.02
-# )

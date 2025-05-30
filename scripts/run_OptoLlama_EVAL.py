@@ -80,27 +80,27 @@ def main():
     elif c.TARGET == 'custom':
         wl0, wl1, step = 300, 2000, 10
         peaks = [
-            {"anchor": 420,  "fwhm": 150,  "amplitude": 0.9},
+            {"anchor": 550,  "fwhm": 150,  "amplitude": 0.9},
         ]
         baseline_segments = [
-            {"start": 300,  "end": 400, "value": 0.07},
-            {"start": 400, "end": 950, "value": 0.05},
-            {"start": 950, "end": 2000, "value": 0.07},
+            {"start": 300,  "end":  400, "value": 0.25, 'noise': 1.5},
+            {"start": 400,  "end":  950, "value": 0.05, 'noise': 0.0},
+            {"start": 950,  "end": 2000, "value": 0.25, 'noise': 1.5},
             # {"start": 300,  "end": 400, "value": 0.50},
             # {"start": 400, "end": 1200, "value": 0.93},
             # {"start": 1200, "end": 2000, "value": 0.07},
         ]
     
         w, s, ns, rat = generate_signal(
-            "step",
             wl0, wl1, step,
             num_samples=1000,
             peaks=peaks,
             baseline=baseline_segments,
             noise_std_dev=0.05,
             smooth_signal=True,
-            smooth_sigma=3,
+            smooth_sigma=1.5,
         )
+        
         plot_signal(w, s, ns, rat)
     
         wavelengths, signals, noisy_signals, spectrum_values = w, s, ns, rat
