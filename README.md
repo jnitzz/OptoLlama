@@ -6,6 +6,7 @@
 
 [![](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: BSD-3](https://img.shields.io/badge/License-Apache--2-blue)](https://opensource.org/license/apache-2-0)
+[![](https://img.shields.io/badge/Contact-OptoLlama-orange?label=Contact)](jonas.schaible@helmholtz-berlin.de)
 
 ## Installation
 We heavily recommend installing the `OptoLlama` package in a dedicated `Python3.11+` virtual environment. You can
