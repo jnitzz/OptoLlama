@@ -54,12 +54,12 @@ class OpticalGPTEvaluator:
         # ---- model ----------------------------------------------------
         self.model = OptoLlama(
             num_classes=self.num_classes,
-            d_model=512,
+            d_model=768,
             n_heads=8,
             n_layers=6,
             max_seq_length=max_seq_length,
             input_dim=3 * 171,
-            dropout=0.1,
+            dropout=0.2,
         ).to(self.device)
 
         # ---- checkpoint ----------------------------------------------

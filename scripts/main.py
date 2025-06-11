@@ -152,7 +152,7 @@ def _main(argv: list[str] | None = None,
             pad_idx=pad_idx,
             sos_idx=sos_idx,
             eos_idx=eos_idx,
-            max_seq_length=22,
+            max_seq_length=22,#22
         )
         
         if args.mode == "ray":

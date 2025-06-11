@@ -82,6 +82,7 @@ def generate_signal(
     noise_std_dev: float = 0.01,
     smooth_signal: bool = False,
     smooth_sigma: float = 1.0,
+    pure_signal: Optional[np.ndarray] = None,
     **legacy_kwargs: Any
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -101,7 +102,13 @@ def generate_signal(
     wavelengths = np.arange(start_wavelength, end_wavelength + step_size, step_size)
 
     # 2) PURE SIGNAL
-    if peaks is None:
+    if pure_signal is not None:
+        if len(pure_signal) != len(wavelengths):
+            raise ValueError("Provided pure_signal must match the length of the wavelength grid.")
+        pure_signal = np.clip(pure_signal, 0.0, 1.0)
+        baseline_curve = _build_baseline(wavelengths, baseline)
+        pure_signal = np.clip(baseline_curve + pure_signal, 0.0, 1.0)
+    elif peaks is None:
         pure_signal = _build_baseline(wavelengths, baseline)
     else:
         baseline_curve = _build_baseline(wavelengths, baseline)
