@@ -127,12 +127,8 @@ def _main(argv: list[str] | None = None,
         trainer = OpticalGPTTrainer(
             cfg=cfg,
             num_classes=len(mat2id) + 3,
-            d_model=1024,
-            n_heads=8,
-            n_layers=6,
             max_seq_length=22,
             input_dim=3 * 171,
-            dropout=0.1,
             epsilon=0.1,
             pad_idx=pad_idx,
             sos_idx=sos_idx,
@@ -152,7 +148,7 @@ def _main(argv: list[str] | None = None,
             pad_idx=pad_idx,
             sos_idx=sos_idx,
             eos_idx=eos_idx,
-            max_seq_length=22,#22
+            max_seq_length=22,
         )
         
         if args.mode == "ray":
