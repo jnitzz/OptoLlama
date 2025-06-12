@@ -10,7 +10,7 @@ from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_si
 from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
-import config_EVAL as c
+import config_OL16 as c
 
 from pathlib import Path
 import sys
@@ -135,7 +135,7 @@ def main():
         label_tensor = [lbl.clone().detach().to(torch.long) if isinstance(lbl, torch.Tensor) else torch.tensor(lbl, dtype=torch.long) for lbl in all_labels]
         torch_outfile = os.path.join(c.PATH_DATA, "my_dataset_interact.pt")
         torch.save((spectra_tensor, label_tensor), torch_outfile)
-    elif c.TARGET == 'validation':
+    elif c.TARGET == 'test':
         pass
     
     ckpt = rf'{c.PATH_RUN}/model_epoch_{c.RESUME_EPOCH}.pth'
@@ -161,7 +161,7 @@ def main():
                          sorted_by_first[i]['accuracy'], 
                          sorted_by_first[i]['mae'], 
                          i)
-    elif c.TARGET == 'validation':
+    elif c.TARGET == 'test':
         per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
         plot_accuracy(c, [i['accuracy'] for i in per_sample_results])
         plot_mae(c, [i['mae'] for i in per_sample_results])
