@@ -10,7 +10,7 @@ from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_si
 from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
-import config_OL16 as c
+import config_OL19 as c
 
 from pathlib import Path
 import sys
@@ -89,7 +89,7 @@ def main():
             wl0, wl1, step,
             pure_signal=pure_signal[:171],
             baseline=baseline_segments,
-            num_samples=500,
+            num_samples=300,
             noise_std_dev=0.05,
             smooth_signal=True,
             smooth_sigma=1.75,
@@ -149,13 +149,29 @@ def main():
     
     if c.TARGET == 'file':
         per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
-        sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[10:40]-x['pred_spectrum'][10:40])))
-        # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[:]-x['pred_spectrum'][:])))
+        # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[10:40]-x['pred_spectrum'][10:40])))
+        sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[:]-x['pred_spectrum'][:])))
         for i in np.arange(0,5,1):
             plot_samples(c, 
                          sorted_by_first[i]['pred_spectrum'], 
                          pure_signal,
                          # sorted_by_first[i]['target_spectrum'], 
+                         sorted_by_first[i]['pred_seq'], 
+                         sorted_by_first[i]['target_seq'], 
+                         sorted_by_first[i]['accuracy'], 
+                         sorted_by_first[i]['mae'], 
+                         i)
+    elif c.TARGET == 'custom':
+        per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
+        plot_mae(c, [i['mae'] for i in per_sample_results])
+        mses = [np.mean(np.square(np.array(i['target_spectrum']) - np.array(i['pred_spectrum']))) for i in per_sample_results]
+        plot_mse(c, mses)
+        target_comp = np.mean([i['target_spectrum'] for i in per_sample_results], axis=0)
+        sorted_by_first = sorted(per_sample_results, key=lambda x: x['mae'])
+        for i in np.arange(0,5,1):
+            plot_samples(c, 
+                         sorted_by_first[i]['pred_spectrum'], 
+                         target_comp, 
                          sorted_by_first[i]['pred_seq'], 
                          sorted_by_first[i]['target_seq'], 
                          sorted_by_first[i]['accuracy'], 
@@ -188,22 +204,6 @@ def main():
         plot_mse_comparison(c, comp_dict)
         comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['accuracy'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[0] for i in per_example_results]}
         plot_acc_comparison(c, comp_dict)
-    elif c.TARGET == 'custom':
-        per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
-        plot_mae(c, [i['mae'] for i in per_sample_results])
-        mses = [np.mean(np.square(np.array(i['target_spectrum']) - np.array(i['pred_spectrum']))) for i in per_sample_results]
-        plot_mse(c, mses)
-        target_comp = np.mean([i['target_spectrum'] for i in per_sample_results], axis=0)
-        sorted_by_first = sorted(per_sample_results, key=lambda x: x['mae'])
-        for i in np.arange(0,5,1):
-            plot_samples(c, 
-                         sorted_by_first[i]['pred_spectrum'], 
-                         target_comp, 
-                         sorted_by_first[i]['pred_seq'], 
-                         sorted_by_first[i]['target_seq'], 
-                         sorted_by_first[i]['accuracy'], 
-                         sorted_by_first[i]['mae'], 
-                         i)
     
     # exclude solutions
     # sorted_by_noAlorAg = [i for i in sorted_by_first if bool(all([True if j.split('__')[0] not in ['Ag','Al','TiN'][0:] else False for j in i[1] or i[2]]))]
