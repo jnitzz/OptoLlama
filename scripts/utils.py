@@ -152,30 +152,36 @@ def plot_signal(wavelengths, signals, noisy_signals, RAT):
     """
     num_samples = signals.shape[0]
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(10, 8))
     for i in range(num_samples):
-        plt.subplot(2, 1, 1)
+        plt.subplot(3, 1, 1)
         plt.plot(wavelengths, signals[i], alpha=0.1)
         plt.title("Pure Signals")
         plt.xlabel("Wavelength (nm)")
         plt.ylabel("Intensity")
 
-        plt.subplot(2, 1, 2)
+        plt.subplot(3, 1, 2)
         plt.plot(wavelengths, noisy_signals[i], alpha=0.1)
         plt.title("Signals with Gaussian Noise")
         plt.xlabel("Wavelength (nm)")
         plt.ylabel("Intensity")
-
-    plt.tight_layout()
-
-    plt.figure(figsize=(10, 4))
-    for i in range(num_samples):
+        
+        plt.subplot(3, 1, 3)
         plt.plot(RAT[i], alpha=0.1)
-    plt.title("RAT Signals")
-    plt.xlabel("Index")
-    plt.ylabel("Intensity")
+        plt.title("RAT Signals")
+        plt.xlabel("Index")
+        plt.ylabel("Intensity")
 
     plt.tight_layout()
+
+    # plt.figure(figsize=(10, 4))
+    # for i in range(num_samples):
+    #     plt.plot(RAT[i], alpha=0.1)
+    # plt.title("RAT Signals")
+    # plt.xlabel("Index")
+    # plt.ylabel("Intensity")
+
+    # plt.tight_layout()
     plt.show()
 
 # ---------------------------------------------------------------

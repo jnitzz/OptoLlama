@@ -10,7 +10,7 @@ from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_si
 from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
-import config_OL19 as c
+import config_OL20 as c
 
 from pathlib import Path
 import sys
@@ -79,11 +79,19 @@ def main():
         # stack_str_list = []
         pure_signal = Call_RayFlare_with_dict(c, stack_str_list)
         
+        xyz_bar = np.array(np.genfromtxt('CIE_xyz_1931_2deg.csv', delimiter=','))
+        pre = np.zeros((60,4))
+        pre[:,0] = np.arange(300, 360,1)
+        post = np.zeros((1170,4))
+        post[:,0] = np.arange(831, 2001,1)
+        pure_signals = np.concatenate([pre,xyz_bar,post])
+        pure_signal_R = pure_signals[::10,[3]].flatten()
+        pure_signal = np.clip(np.concatenate([pure_signal_R,np.zeros(171),1-pure_signal_R]), 0.0, 1.0)
         wl0, wl1, step = 300, 2000, 10
         baseline_segments = [
-            {"start": 300,  "end":  400, "value": 0.00, 'noise': 0.25},
-            {"start": 400,  "end":  700, "value": 0.00, 'noise': 0.1},
-            {"start": 700,  "end": 2000, "value": 0.00, 'noise': 0.25},
+            {"start": 300,  "end":  400, "value": 0.00, 'noise': 0.0},
+            {"start": 400,  "end":  700, "value": 0.00, 'noise': 0.0},
+            {"start": 700,  "end": 2000, "value": 0.00, 'noise': 0.0},
         ]
         wavelengths, signals, noisy_signals, spectrum_values = generate_signal(
             wl0, wl1, step,
@@ -104,7 +112,7 @@ def main():
     elif c.TARGET == 'custom':
         wl0, wl1, step = 300, 2000, 10
         peaks = [
-            {"anchor": 550,  "fwhm": 200,  "amplitude": 0.8},
+            {"anchor": 550,  "fwhm": 130,  "amplitude": 0.6},
         ]
         baseline_segments = [
             {"start": 300,  "end":  400, "value": 0.05, 'noise': 0.05},
@@ -117,7 +125,7 @@ def main():
     
         w, s, ns, rat = generate_signal(
             wl0, wl1, step,
-            num_samples=1000,
+            num_samples=300,
             peaks=peaks,
             baseline=baseline_segments,
             noise_std_dev=0.05,
@@ -149,9 +157,9 @@ def main():
     
     if c.TARGET == 'file':
         per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
-        # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[10:40]-x['pred_spectrum'][10:40])))
-        sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[:]-x['pred_spectrum'][:])))
-        for i in np.arange(0,5,1):
+        sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[6:44]-x['pred_spectrum'][6:44])))
+        # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[:]-x['pred_spectrum'][:])))
+        for i in np.arange(0,3,1):
             plot_samples(c, 
                          sorted_by_first[i]['pred_spectrum'], 
                          pure_signal,
@@ -165,10 +173,10 @@ def main():
         per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
         plot_mae(c, [i['mae'] for i in per_sample_results])
         mses = [np.mean(np.square(np.array(i['target_spectrum']) - np.array(i['pred_spectrum']))) for i in per_sample_results]
-        plot_mse(c, mses)
+        # plot_mse(c, mses)
         target_comp = np.mean([i['target_spectrum'] for i in per_sample_results], axis=0)
         sorted_by_first = sorted(per_sample_results, key=lambda x: x['mae'])
-        for i in np.arange(0,5,1):
+        for i in np.arange(0,3,1):
             plot_samples(c, 
                          sorted_by_first[i]['pred_spectrum'], 
                          target_comp, 
