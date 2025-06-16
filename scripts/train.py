@@ -148,7 +148,7 @@ class OpticalGPTTrainer:
 
             if self._rank == 0:
                 print(
-                    f"📈 Epoch {epoch+1:>3}/{self.cfg.EPOCHS} "
+                    f"📈 Epoch {epoch:>3}/{self.cfg.EPOCHS} "
                     f"train={tr_loss:.5f} (ce={tr_ce:.5f}|mse={tr_mse:.5f})   "
                     f"val={v_loss:.5f} (ce={v_ce:.5f}|mse={v_mse:.5f})  "
                     f"acc={v_acc:.3%}\n\n"
@@ -268,7 +268,7 @@ class OpticalGPTTrainer:
 
             if step % 10 == 0 and self._rank == 0:
                 print(
-                    f"  • epoch {epoch+1:>3} | "
+                    f"  • epoch {epoch:>3} | "
                     f"step {step:>4}/{self.train_len:<4} | "
                     f"loss {sum_loss/step:.5f}"
                 )
