@@ -87,6 +87,10 @@ def plot_samples(c, RAT_pred, RAT_tar, stack_pred, stack_tar, ACC, MSE, number, 
     # Automatically position the accuracy, MAE, and key text
     # spectrum_rss = np.sum(np.square(RAT_pred - RAT_tar))
     spectrum_mae = np.mean(np.absolute(RAT_pred - RAT_tar))
+    spectrum_mae = np.mean(np.absolute(np.concatenate([RAT_pred[10:81],RAT_pred[171*1+10:171*1+81],RAT_pred[171*2+10:171*2+81]])
+                                -np.concatenate([RAT_tar[10:81],RAT_tar[171*1+10:171*1+81],RAT_tar[171*2+10:171*2+81]])))
+    spectrum_mae = np.mean(np.absolute(np.concatenate([RAT_pred[10:81],RAT_pred[171*2+10:171*2+81]])
+                                -np.concatenate([RAT_tar[10:81],RAT_tar[171*2+10:171*2+81]])))
     plt.text(0.36, 1.10, "- - - - - - - - - - - - - -\nKey#:\nMAE:\nAccuracy:\n- - - - - - - - - - - - - -", ha='left', fontsize=10, transform=plt.gca().transAxes)
     plt.text(0.64, 1.10, f"\n{number}\n{spectrum_mae:.2f}\n{ACC:.2f}\n", ha='right', fontsize=10, transform=plt.gca().transAxes)
     
@@ -169,3 +173,222 @@ def plot_acc_comparison(c, model_accs_dict):
     plt.savefig(hist_path, dpi=400)
     print(f"ACC comparison plot saved to: {hist_path}")
     plt.show()
+    
+import matplotlib.pyplot as plt
+import numpy as np
+import torch           # NEW  – needed when the dataset returns tensors
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+import numpy as np, torch
+
+class MemmapSpectra(Dataset):
+    def __init__(self, npy_file: str):
+        self.mm = np.load(npy_file, mmap_mode="r", allow_pickle=False)   # read-only mem-map
+    def __len__(self):              return self.mm.shape[0]
+    def __getitem__(self, idx):     # only the spectrum (as tensor)
+        return torch.from_numpy(self.mm[idx])        # [513]
+    
+@torch.no_grad()
+def find_closest_mae(target: np.ndarray,
+                     dataset,
+                     batch_size: int = 4098,#8192
+                     device: str = "cuda"):
+
+    loader      = DataLoader(dataset,
+                             batch_size=batch_size,
+                             num_workers=8,
+                             pin_memory=True)
+
+    tgt   = torch.as_tensor(target, dtype=torch.float32, device=device)
+    best  = float("inf")
+    best_spec = None
+    best_idx  = -1
+
+    for b, spec in enumerate(loader):            # spec: [B, 513]
+        spec = spec.to(device, non_blocking=True)
+        mae  = torch.mean(torch.abs(spec - tgt), dim=1)  # [B]
+
+        val, idx = torch.min(mae, dim=0)         # best in this batch
+        if val.item() < best:
+            best, best_idx = val.item(), b * batch_size + idx.item()
+            best_spec      = spec[idx].cpu()     # keep a copy on CPU
+
+    return best_idx, best_spec.numpy(), best     # index, spectrum, MAE
+
+def plot_samples2(
+                c,
+                RAT_pred: np.ndarray,
+                RAT_tar : np.ndarray,
+                stack_pred: list[str],
+                stack_tar : list[str],
+                ACC      : float,
+                MSE      : float,
+                number   : int,
+                *,
+                ds_search = None,          # NEW (optional)
+                RAT_tar_mean: np.ndarray | None = None,
+        ):
+    """
+    Visualises one sample, *optionally* adding the closest training spectrum
+    (w.r.t. MAE in RAT space).
+
+    Parameters
+    ----------
+    ds_train : Dataset | None
+        Any dataset whose __getitem__(idx) returns a tuple with the first item
+        being the 3×171-value RAT spectrum. Pass e.g.
+
+            ds_train = SinglePTDataset('…/my_dataset_train.pt')
+
+        and call
+
+            plot_samples(c, RAT_pred, RAT_tar, …, ds_train=ds_train)
+    """
+    # ---------------------------------------------------------------
+    # 1) (Optional) find closest training spectrum
+    # ---------------------------------------------------------------
+    RAT_closest = None
+    mae_closest = None
+    if ds_search is not None:
+        idx, RAT_closest, mae_closest = find_closest_mae(
+            RAT_tar, ds_search, batch_size=8192)
+
+    # ---------------------------------------------------------------
+    # 2) plotting – original curves plus optional “closest train”
+    # ---------------------------------------------------------------
+    colormap = plt.cm.tab20(range(8))   # a few extra colours
+    wls = np.arange(c.WAVELENGTH_MIN,
+                    c.WAVELENGTH_MAX + 1,
+                    c.WAVELENGTH_STEPS)
+
+    # prediction vs. target
+    plt.plot(wls, RAT_pred[:171]      , label='Prediction (R)',  color=colormap[1])
+    if RAT_closest is not None:
+        plt.plot(wls, RAT_closest[:171]      , '--', label='Closest train (R)', color=colormap[1])
+    plt.plot(wls, RAT_tar [:171]      , label='Target     (R)',  color=colormap[0])
+    plt.plot(wls, RAT_pred[171:2*171] , label='Prediction (A)',  color=colormap[3])
+    if RAT_closest is not None:
+        plt.plot(wls, RAT_closest[171:2*171] , '--', label='Closest train (A)', color=colormap[3])
+    plt.plot(wls, RAT_tar [171:2*171] , label='Target     (A)',  color=colormap[2])
+    plt.plot(wls, RAT_pred[2*171:]    , label='Prediction (T)',  color=colormap[5])
+    if RAT_closest is not None:
+        plt.plot(wls, RAT_closest[2*171:]    , '--', label='Closest train (T)', color=colormap[5])
+    plt.plot(wls, RAT_tar [2*171:]    , label='Target     (T)',  color=colormap[4])
+
+    if RAT_tar_mean is not None:
+        plt.plot(wls, RAT_tar_mean[:171]      , '--', label='Target mean (R)', color=colormap[0])
+        plt.plot(wls, RAT_tar_mean[171:2*171] , '--', label='Target mean (A)', color=colormap[2])
+        plt.plot(wls, RAT_tar_mean[2*171:]    , '--', label='Target mean (T)', color=colormap[4])
+
+    # # NEW – closest train sample (dashed)
+    # if RAT_closest is not None:
+    #     plt.plot(wls, RAT_closest[:171]      , '--', label='Closest train (R)', color=colormap[1])
+    #     plt.plot(wls, RAT_closest[171:2*171] , '--', label='Closest train (A)', color=colormap[3])
+    #     plt.plot(wls, RAT_closest[2*171:]    , '--', label='Closest train (T)', color=colormap[5])
+
+    # ---------------------------------------------------------------
+    # 3) cosmetics (titles, text blocks, etc.) – mostly unchanged
+    # ---------------------------------------------------------------
+    plt.title(f'Prediction using OptoLlama [model: {c.RUN_NAME} epoch: {c.RESUME_EPOCH}]',
+              fontsize=10)
+    plt.xlabel('Wavelength [nm]', fontsize=10)
+    plt.ylabel('R - A - T', fontsize=10)
+    plt.legend(loc='upper right')
+
+    # compact helper
+    def _strip(seq): return [t for t in seq if t not in ("<PAD>", "<SOS>", "<EOS>")]
+
+    stack_tar  = _strip(stack_tar)
+    stack_pred = _strip(stack_pred)
+
+    # → Target materials / thicknesses
+    plt.text(0.02, 1.10,
+             "Target:\n" + "\n".join(f"{m.split('__')[0]}" for m in stack_tar),
+             ha='left', fontsize=8, transform=plt.gca().transAxes)
+    plt.text(0.24, 1.10,
+             "\n".join(f"{m.split('__')[1]}" for m in stack_tar),
+             ha='right', fontsize=8, transform=plt.gca().transAxes)
+
+    # → Prediction
+    plt.text(0.76, 1.10,
+             "Prediction:\n" + "\n".join(f"{m.split('__')[0]}" for m in stack_pred),
+             ha='left', fontsize=8, transform=plt.gca().transAxes)
+    plt.text(0.98, 1.10,
+             "\n".join(f"{m.split('__')[1]}" for m in stack_pred),
+             ha='right', fontsize=8, transform=plt.gca().transAxes)
+
+    # → Key figures
+    spectrum_mae = np.mean(np.abs(RAT_pred - RAT_tar))
+    key_block  = f"Key: {number}\n"
+    key_block += f"MAE (pred vs tgt): {spectrum_mae:.4f}\n"
+    if mae_closest is not None:
+        key_block += f"MAE (train vs tgt): {mae_closest:.4f}\n"
+    key_block += f"Token accuracy: {ACC:.2f}"
+    plt.text(0.36, 1.10, key_block,
+             ha='left', fontsize=9, transform=plt.gca().transAxes)
+
+    # plt.tight_layout()
+    plt.show()
+
+import torch, numpy as np
+from torch.utils.data import DataLoader
+from collections import namedtuple
+
+Nearest = namedtuple("Nearest", "train_idx mae train_tokens")
+
+@torch.no_grad()
+def all_closest_mae(test_ds,
+                    mm_train_file: str,
+                    train_tokens: list,
+                    *,
+                    batch_test  = 256,
+                    batch_train = 8192,
+                    device      = "cuda"):
+    """
+    For every spectrum in `test_ds` return the index in *training* that has the
+    lowest mean-squared-error (== L2) and the corresponding tokens.
+
+    Returns
+    -------
+    list[Nearest]  (same length as test_ds)
+    """
+    # ---------- 1. bring the *whole* test split onto the GPU in manageable slabs
+    results = []
+
+    N_test  = len(test_ds)
+    mm_tr   = np.load(mm_train_file, mmap_mode="r")
+    N_train = mm_tr.shape[0]
+
+    for t0 in range(0, N_test, batch_test):
+        t1  = min(t0 + batch_test, N_test)
+        # stack → [T,B] on GPU
+        test_batch = torch.stack([test_ds[i][0] for i in range(t0, t1)]).to(device)
+        T, D = test_batch.shape
+
+        best_mae  = torch.full((T,), float("inf"), device=device)
+        best_idx  = torch.full((T,), -1, dtype=torch.long, device=device)
+
+        # ---------- 2. stream through the (huge) training mem-map
+        for s0 in range(0, N_train, batch_train):
+            s1 = min(s0 + batch_train, N_train)
+            train_chunk = torch.from_numpy(mm_tr[s0:s1]).to(device, non_blocking=True)  # [B,D]
+
+            # pair-wise L2 → mean over D
+            diff = train_chunk.unsqueeze(1) - test_batch                # [B,T,D]
+            mae  = torch.mean(torch.abs(diff), dim=2)                       # [B,T]
+
+            chunk_best, chunk_arg = torch.min(mae, dim=0)               # per-test
+            update = chunk_best < best_mae
+            best_mae[update] = chunk_best[update]
+            best_idx[update] = chunk_arg[update] + s0                   # global idx
+
+        # ---------- 3. stash results for this slab
+        best_mae = best_mae.cpu().numpy()
+        best_idx = best_idx.cpu().numpy()
+        for local_i, (idx, mae_val) in enumerate(zip(best_idx, best_mae)):
+            results.append(
+                Nearest(train_idx   = int(idx),
+                        mae         = float(mae_val),
+                        train_tokens= train_tokens[idx]))
+    return results
