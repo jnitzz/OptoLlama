@@ -170,17 +170,17 @@ def main():
         #                             -np.concatenate([i['pred_spectrum'][10:81],i['pred_spectrum'][171*1+10:171*1+81],i['pred_spectrum'][171*2+10:171*2+81]]))) for i in per_sample_results]
         ds_train = MemmapSpectra(rf"{c.PATH_DATA}/my_dataset_16m.npy")
         i=0
-        for i in np.arange(0,10000,1000):
-            i = int(i)
-            plot_samples2(c, 
-                          sorted_by_first[i]['pred_spectrum'], 
-                          sorted_by_first[i]['target_spectrum'], 
-                          sorted_by_first[i]['pred_seq'], 
-                          sorted_by_first[i]['target_seq'], 
-                          sorted_by_first[i]['accuracy'], 
-                          sorted_by_first[i]['mae'], 
-                          i,
-                          ds_search=ds_train)
+        # for i in np.arange(0,2000,1000):
+        #     i = int(i)
+        #     plot_samples2(c, 
+        #                   sorted_by_first[i]['pred_spectrum'], 
+        #                   sorted_by_first[i]['target_spectrum'], 
+        #                   sorted_by_first[i]['pred_seq'], 
+        #                   sorted_by_first[i]['target_seq'], 
+        #                   sorted_by_first[i]['accuracy'], 
+        #                   sorted_by_first[i]['mae'], 
+        #                   i,
+        #                   ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy")
             
         if c.TARGET == 'custom':
             for i in np.arange(0,1,1):

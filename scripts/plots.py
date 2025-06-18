@@ -189,16 +189,60 @@ class MemmapSpectra(Dataset):
     def __getitem__(self, idx):     # only the spectrum (as tensor)
         return torch.from_numpy(self.mm[idx])        # [513]
     
+import numpy as np, torch
+from torch.utils.data import Dataset, get_worker_info
+
+def _read_npy_shape(path: str):
+    """
+    Return (shape, dtype) for any .npy version (v1.0 – v3.0) without
+    mem-mapping the data.  Works no matter whether NumPy returns
+    2 or 3 values from read_array_header_*().
+    """
+    import numpy as np
+    with open(path, "rb") as fh:
+        major, minor = np.lib.format.read_magic(fh)
+        if major == 1:
+            header_dict, *__ = np.lib.format.read_array_header_1_0(fh)
+        elif major in (2, 3):
+            header_dict, *__ = np.lib.format.read_array_header_2_0(fh)
+        else:
+            raise ValueError(f".npy version {major}.{minor} not supported")
+    return header_dict
+
+
+class LazyMemmapSpectra(Dataset):
+    def __init__(self, npy_path: str):
+        self.path          = str(npy_path)           # cheap to pickle
+        self.shape         = _read_npy_shape(self.path)
+        self._mm           = None                    # opened lazily
+
+    def _lazy_open(self):
+        if self._mm is None:                         # first use in *this worker*
+            self._mm = np.load(self.path, mmap_mode="r")
+
+    def __len__(self):  return self.shape[0]
+
+    def __getitem__(self, idx):
+        self._lazy_open()
+        return torch.from_numpy(self._mm[idx])
+
 @torch.no_grad()
 def find_closest_mae(target: np.ndarray,
-                     dataset,
-                     batch_size: int = 4098,#8192
-                     device: str = "cuda"):
+                     mm_path,
+                     batch_size: int = int(8192),#8192
+                     device: str = "cuda",
+                     workers: int = 4):
 
-    loader      = DataLoader(dataset,
-                             batch_size=batch_size,
-                             num_workers=8,
-                             pin_memory=True)
+    loader = torch.utils.data.DataLoader(
+        LazyMemmapSpectra(mm_path),
+        batch_size=batch_size,
+        num_workers=workers,     # can be >0 now
+        pin_memory=True
+    )
+    # loader      = DataLoader(dataset,
+    #                          batch_size=batch_size,
+    #                          num_workers=8,
+    #                          pin_memory=True)
 
     tgt   = torch.as_tensor(target, dtype=torch.float32, device=device)
     best  = float("inf")
@@ -252,7 +296,7 @@ def plot_samples2(
     mae_closest = None
     if ds_search is not None:
         idx, RAT_closest, mae_closest = find_closest_mae(
-            RAT_tar, ds_search, batch_size=8192)
+            RAT_tar, ds_search, batch_size=int(10*8192))
 
     # ---------------------------------------------------------------
     # 2) plotting – original curves plus optional “closest train”
