@@ -1,7 +1,14 @@
 from collections import defaultdict, Counter
 def parse_tokens(token):
-    parsed = [tuple([a, float(b)]) for a, b in (s.split("__") for s in token)]
+    a, b = token.split("__")
+    parsed = (a, float(b))
     return parsed
+def reconstruct_tokens(data):
+    reconstructed = [
+        [f"{a}__{b}" for a, b in sublist]
+        for sublist in data
+    ]
+    return reconstructed
     
 
 def aggregate_predictions(predictions):
@@ -66,7 +73,10 @@ def aggregation(predictions):
             parsed_stack = [] # create a new prediction
             for layer in sample: # for each predicted layer
                 parsed_stack.append(parse_tokens(layer)) # parse the tokens of the layer and add it to the new prediction
-            parsed_samples.append(parced_stack)
+            parsed_samples.append(parsed_stack)
         aggregated_samples = aggregate_predictions(parsed_samples)
         aggregated.append(parsed_stack)
+    final = reconstruct_tokens(aggregated)
+    return final
+
     

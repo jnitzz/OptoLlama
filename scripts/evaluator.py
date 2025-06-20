@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 # import config_GPT30N37 as c
 from data import SinglePTDataset, pad_collate_fn, create_masks
 from model import OptoLlama
+from mcd_inference import aggregation
 
 
 class OpticalGPTEvaluator:
@@ -179,7 +180,7 @@ class OpticalGPTEvaluator:
     # ------------------------------------------------------------------
     # NEW: per‑sample export
     # ------------------------------------------------------------------
-    def export_results_per_sample(self, *, out_name: str = "results_per_sample") -> None:
+    def export_results_per_sample(self, *, out_name: str = "results_per_sample", enableMCD: bool = False) -> None:
         """Create a JSON‑pickle with detailed results for every validation item."""
         from utils import save_JSONPICKLE
         from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
@@ -190,13 +191,22 @@ class OpticalGPTEvaluator:
         pad_tok, sos_tok, eos_tok = len(mats_sorted), len(mats_sorted) + 1, len(mats_sorted) + 2
 
         results: List[Dict[str, Any]] = []
-        self.model.eval()
+        if enableMCD:
+            self.model.train() 
+        else:
+            self.model.eval()
 
         with torch.no_grad():
             for spectra, mat_seq, thick_seq in self.val_dl:
                 B = spectra.size(0)
                 spectra_gpu = spectra.to(self.device, dtype=torch.float32)
-                pred_seqs = self._decode_batch(spectra_gpu)  # list[list[str]]
+                if enableMCD:
+                    pred_seqs = []
+                    for i in range(10):
+                        pred_seqs.append(self._decode_batch(spectra_gpu))  # list[list[list[str]]]
+                    pred_seqs = aggregation(pred_seqs)
+                else:
+                    pred_seqs = self._decode_batch(spectra_gpu)
 
                 # ⇢ predicted spectra via RayFlare
                 pred_specs = [np.asarray(Call_RayFlare_with_dict(self.cfg, st), dtype=np.float32).reshape(-1)

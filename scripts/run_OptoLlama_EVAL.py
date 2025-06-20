@@ -60,7 +60,8 @@ def main():
     
     c.THICKNESSES = np.arange(c.THICKNESS_MIN,c.THICKNESS_MAX+1,c.THICKNESS_STEPS)
     c.WAVELENGTHS = np.arange(c.WAVELENGTH_MIN,c.WAVELENGTH_MAX+1,c.WAVELENGTH_STEPS)
-    
+    enableMCD = False # Only enable in the validation
+
     #%% target generation methods
     if c.TARGET == 'file':
         # target = {}
@@ -136,14 +137,15 @@ def main():
         torch_outfile = os.path.join(c.PATH_DATA, "my_dataset_interact.pt")
         torch.save((spectra_tensor, label_tensor), torch_outfile)
     elif c.TARGET == 'validation':
-        pass
+        enableMCD = True
     
     ckpt = rf'{c.PATH_RUN}/model_epoch_{c.RESUME_EPOCH}.pth'
 
     optical_main._main(argv=["test", 
                              "--ckpt", str(ckpt), 
                              "--mode", "ray"], 
-                       cfg=c)
+                       cfg=c,
+                       enableMCD=enableMCD)
     
     # tgt_tokens, pred_tokens, target_spectrum, pred_spectrum, accuracy, mae = per_sample_results[0]
     
@@ -179,7 +181,7 @@ def main():
                          sorted_by_first[i]['mae'], 
                          i)
         # model comp
-        with open(c.PATH_RES_COMP, 'rb') as f:   
+        '''with open(c.PATH_RES_COMP, 'rb') as f:   
             per_example_results = pickle.load(f)
         # per_example_results = load_JSONPICKLE(c.PATH_RUN, f'per_sample_results_validation_411')
         comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['mae'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[3] for i in per_example_results]} #N67_GPT26
@@ -187,7 +189,7 @@ def main():
         comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': mses, 'N67_GPT26_Epoch207': [np.mean(np.square(i[4] - i[5])) for i in per_example_results]}
         plot_mse_comparison(c, comp_dict)
         comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['accuracy'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[0] for i in per_example_results]}
-        plot_acc_comparison(c, comp_dict)
+        plot_acc_comparison(c, comp_dict)'''
     elif c.TARGET == 'custom':
         per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
         plot_mae(c, [i['mae'] for i in per_sample_results])

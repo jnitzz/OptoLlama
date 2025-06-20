@@ -73,7 +73,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 def _main(argv: list[str] | None = None,
-          cfg: ModuleType | None = None) -> None:
+          cfg: ModuleType | None = None,
+          enableMCD: bool = False) -> None:
     """
     Entry-point callable from shell *and* other Python code.
 
@@ -156,7 +157,7 @@ def _main(argv: list[str] | None = None,
         )
         
         if args.mode == "ray":
-            evaluator.export_results_per_sample(out_name="val_sample_results")
+            evaluator.export_results_per_sample(out_name="val_sample_results", enableMCD=enableMCD)
         else:
             v_loss, v_ce, v_mse, v_acc = evaluator.evaluate_simple()
             print(f"✅  val_loss={v_loss:.5f}  acc={v_acc:.3%}")
