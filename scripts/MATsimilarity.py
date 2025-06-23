@@ -135,3 +135,47 @@ plt.show()
 # plt.show()
 # sns.heatmap(df_nk_mse.astype('float'))
 # plt.show()
+
+# for item in [df_nk_Matern, df_nk_RBF, df_nk_mae, df_nk_mse]:
+#     sns.heatmap(item.astype('float'))
+#     plt.show()
+
+# sns.heatmap(df_nk_mae.astype('float'))
+
+#%%
+df = df_nk_mae.astype(float)
+
+def softmax_row(row):
+    scores = -row
+    scores -= scores.max()
+    exps   = np.exp(scores)       # now this is a float64 Series
+    return exps / exps.sum()
+
+probs = df.apply(softmax_row, axis=0)
+sns.heatmap(probs)
+
+for alpha in np.arange(1,30,3):
+    # 1) make sure your MSE’s are floats
+    df = df_nk_mae.copy()
+    df = df.astype(float)
+    
+    # 2) choose a “sharpening” factor α – larger means more one-hot-y
+    alpha = 25.0
+    
+    # 3) build scores = –α·MSE
+    scores = -df * alpha
+    
+    # 4) shift each row by its max (numerical stability)
+    scores = scores.sub(scores.max(axis=1), axis=0)
+    
+    # 5) exponentiate and normalize per row
+    exp_scores = np.exp(scores)
+    probs = exp_scores.div(exp_scores.sum(axis=1), axis=0)
+    sns.heatmap(probs)
+    plt.show()
+
+probs.sum(axis=1)
+# torch.save(torch.Tensor(probs.to_numpy().tolist()),'sim_matrix.pth')
+sim_matrix = torch.load('sim_matrix.pth')
+rr
+sns.heatmap(rr)

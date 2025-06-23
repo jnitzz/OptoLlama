@@ -96,7 +96,7 @@ def save_validation_with_closest(
     """
     # -- 2.1  read validation split completely (small enough for RAM) ----------
     val_spec, val_tok = torch.load(val_pt, map_location="cpu")  # lists
-    val_spec, val_tok = val_spec[:10], val_tok[:10]
+    val_spec, val_tok = val_spec[:1000], val_tok[:1000]
     N_val             = len(val_spec)
     print(f"Validation set: {N_val:,d} spectra")
 
@@ -135,6 +135,8 @@ if __name__ == "__main__":
         train_spec_npy = rf"{c.PATH_DATA}/my_dataset_16m.npy",
         train_tok_npy  = rf"{c.PATH_DATA}/my_dataset_16m_tokens.npy",
         out_pt         = rf"{c.PATH_DATA}/my_dataset_val_closest.pt",
-        batch_test     = 512,      # tune ↔ GPU RAM
+        batch_test     = 256,      # tune ↔ GPU RAM
         batch_train    = 512,    # bigger ⇒ better GPU utilisation
         device         = "cuda")
+
+# data = torch.load(r'd:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/RF_T63_16m/my_dataset_val_closest.pt')

@@ -7,15 +7,15 @@ import torch
 import torch.distributed as dist
 
 from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_signal, plot_signal
-from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, plot_samples2, MemmapSpectra, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
+from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, train_data_comp, MemmapSpectra, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
-import config_OL19 as c
+import config_OL15 as c
 
 from pathlib import Path
 import sys
 
-# make sure the repo root is on sys.path
+# make sure the repo root is on sys.paths
 repo_root = Path(__file__).resolve().parent
 sys.path.append(str(repo_root))             # if not already on PYTHONPATH
 
@@ -80,9 +80,9 @@ def main():
             # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', 'TiO2__165.5', '9327_SiN_fit_formatted__203.0', 'TiO2__164.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0', '3Hal_LZ__550.0', 'C60_HZB__23', 'BCP__8.0','Ag__100.0', '<EOS>']
             # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0', '<EOS>']
             # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', '<EOS>']
-            # stack_str_list = ['9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', '<EOS>']
+            stack_str_list = ['9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', '<EOS>']
             # stack_str_list = []
-            # pure_signal = Call_RayFlare_with_dict(c, stack_str_list)
+            pure_signal = Call_RayFlare_with_dict(c, stack_str_list)
             
             # SIGNAL CMF XYZ
             # xyz_bar = np.array(np.genfromtxt('CIE_xyz_1931_2deg.csv', delimiter=','))
@@ -102,7 +102,7 @@ def main():
             wl0, wl1, step = 300, 2000, 10
             baseline_segments = [
                 {"start": 300,  "end":  600, "value": 0.0, 'noise': 0.0},
-                {"start": 600,  "end":  900, "value": 1.0, 'noise': 0.0},
+                {"start": 600,  "end":  900, "value": 0.0, 'noise': 0.0},
                 {"start": 900,  "end": 2000, "value": 0.0, 'noise': 0.0},
                 
                 # {"start": 300,  "end":  500, "value": 0.0, 'noise': 0.0},
@@ -114,11 +114,11 @@ def main():
             
             wavelengths, signals, noisy_signals, spectrum_values = generate_signal(
                 wl0, wl1, step,
-                # pure_signal=pure_signal[:171],
+                pure_signal=pure_signal[:171],
                 # peaks=peaks,
                 baseline=baseline_segments,
-                num_samples=20,
-                noise_std_dev=0.10,
+                num_samples=1,
+                noise_std_dev=0.01,
                 smooth_signal=True,
                 smooth_sigma=0.1,
             )
@@ -133,30 +133,22 @@ def main():
             pass
         
         ckpt = rf'{c.PATH_RUN}/model_epoch_{c.RESUME_EPOCH}.pth'
-    
-        optical_main._main(argv=["test", 
-                                 "--ckpt", str(ckpt), 
-                                 "--mode", "ray"], 
-                           cfg=c)
-        
+        if os.path.isfile(rf'{c.PATH_RUN}/val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}.json') and c.TARGET == 'test':
+            per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
+        else:
+            optical_main._main(argv=["test", 
+                                     "--ckpt", str(ckpt), 
+                                     "--mode", "ray"], 
+                               cfg=c)
+            per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
+            
         # tgt_tokens, pred_tokens, target_spectrum, pred_spectrum, accuracy, mae = per_sample_results[0]
-        per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
-        # plot_mae(c, [i['mae'] for i in per_sample_results])
+        plot_mae(c, [i['mae'] for i in per_sample_results])
         # plot_accuracy(c, [i['accuracy'] for i in per_sample_results])
         # mses = [np.mean(np.square(np.array(i['target_spectrum']) - np.array(i['pred_spectrum']))) for i in per_sample_results]
         # plot_mse(c, mses)
-        # model comp
-        # with open(c.PATH_RES_COMP, 'rb') as f:   
-        #     per_example_results = pickle.load(f)
-        # # per_example_results = load_JSONPICKLE(c.PATH_RUN, f'per_sample_results_validation_411')
-        # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['mae'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[3] for i in per_example_results]} #N67_GPT26
-        # plot_mae_comparison(c, comp_dict)
-        # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': mses, 'N67_GPT26_Epoch207': [np.mean(np.square(i[4] - i[5])) for i in per_example_results]}
-        # plot_mse_comparison(c, comp_dict)
-        # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['accuracy'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[0] for i in per_example_results]}
-        # plot_acc_comparison(c, comp_dict)
         
-        target = np.concatenate([np.zeros(30),np.ones(30),np.zeros(111),np.zeros(171),np.ones(30),np.zeros(30),np.ones(111)])
+        # target = np.concatenate([np.zeros(30),np.ones(30),np.zeros(111),np.zeros(171),np.ones(30),np.zeros(30),np.ones(111)])
         
         sorted_by_first = sorted(per_sample_results, key=lambda x: x['mae'])
         # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(np.mean(spectrum_values,axis=0)[6:44]-x['pred_spectrum'][6:44])))
@@ -165,45 +157,75 @@ def main():
         # sorted_by_first = sorted(per_sample_results, key=lambda i: np.mean(np.absolute(np.concatenate([target[10:81],target[171*2+10:171*2+81]])
         #                             -np.concatenate([i['pred_spectrum'][10:81],i['pred_spectrum'][171*2+10:171*2+81]]))))
         # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[:]-x['pred_spectrum'][:])))
-        
-        # mses = [np.mean(np.absolute(np.concatenate([target[10:81],target[171*1+10:171*1+81],target[171*2+10:171*2+81]])
-        #                             -np.concatenate([i['pred_spectrum'][10:81],i['pred_spectrum'][171*1+10:171*1+81],i['pred_spectrum'][171*2+10:171*2+81]]))) for i in per_sample_results]
-        ds_train = MemmapSpectra(rf"{c.PATH_DATA}/my_dataset_16m.npy")
-        i=0
-        # for i in np.arange(0,2000,1000):
-        #     i = int(i)
-        #     plot_samples2(c, 
-        #                   sorted_by_first[i]['pred_spectrum'], 
-        #                   sorted_by_first[i]['target_spectrum'], 
-        #                   sorted_by_first[i]['pred_seq'], 
-        #                   sorted_by_first[i]['target_seq'], 
-        #                   sorted_by_first[i]['accuracy'], 
-        #                   sorted_by_first[i]['mae'], 
-        #                   i,
-        #                   ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy")
-            
+
+                
         if c.TARGET == 'custom':
-            for i in np.arange(0,1,1):
-                plot_samples(c, 
+            for i in np.arange(0,3,1):
+                plot_samples(c,
                              sorted_by_first[i]['pred_spectrum'], 
-                             # np.mean(spectrum_values,axis=0), 
-                             target,
+                             np.mean(spectrum_values,axis=0), 
+                             # target,
                              sorted_by_first[i]['pred_seq'], 
                              sorted_by_first[i]['target_seq'], 
                              sorted_by_first[i]['accuracy'], 
                              sorted_by_first[i]['mae'], 
                              i)
         elif c.TARGET == 'test':
-            for i in np.arange(0,10,1):
-                i = int(i)
-                plot_samples(c, 
-                             sorted_by_first[i]['pred_spectrum'], 
-                             sorted_by_first[i]['target_spectrum'], 
-                             sorted_by_first[i]['pred_seq'], 
-                             sorted_by_first[i]['target_seq'], 
-                             sorted_by_first[i]['accuracy'], 
-                             sorted_by_first[i]['mae'], 
-                             i)
+            # model comp
+            with open(c.PATH_RES_COMP, 'rb') as f:   
+                per_example_results = pickle.load(f)
+            comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['mae'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[3] for i in per_example_results]} #N67_GPT26
+            plot_mae_comparison(c, comp_dict)
+            # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': mses, 'N67_GPT26_Epoch207': [np.mean(np.square(i[4] - i[5])) for i in per_example_results]}
+            # plot_mse_comparison(c, comp_dict)
+            # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['accuracy'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[0] for i in per_example_results]}
+            # plot_acc_comparison(c, comp_dict)
+            
+            # from plots import train_data_comp
+            MAE_scatter = train_data_comp(c,
+                            per_sample_results,
+                            # ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy",
+                            ds_search_precalc=r'd:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/RF_T63_16m/my_dataset_val_closest.pt',
+                            sample_plots=True)
+            MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: np.abs(x[1]['spectrum_mae']-x[1]['mae_closest']))
+            MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['mae_closest'])
+            # MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['spectrum_mae'])
+            MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.01]
+            # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']>=item[1]['mae_closest']]
+            # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.005]
+            # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']]
+
+            index = [_ for _, inner in MAE_scatter_sorted]
+            index = np.arange(len(index))
+            x = [inner['spectrum_mae'] for _, inner in MAE_scatter_sorted]
+            y = [inner['mae_closest']  for _, inner in MAE_scatter_sorted]
+            # 2) Make the scatter plot
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(8,6))
+            plt.scatter(index, x, label='spectrum_mae')
+            plt.scatter(index, y, label='mae_closest')
+            
+            # 3) Labeling
+            plt.xlabel('index')
+            plt.ylabel('mae')
+            plt.title(f'Index vs [Spectrum MAE, MAE Closest] [model: {c.RUN_NAME} epoch: {c.RESUME_EPOCH}]')
+            
+            # 4) (Optional) add a grid and show
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+            
+            # for i in np.arange(0,1000,200):
+            #     i = int(i)
+            #     plot_samples(c, 
+            #                  sorted_by_first[i]['pred_spectrum'], 
+            #                  sorted_by_first[i]['target_spectrum'], 
+            #                  sorted_by_first[i]['pred_seq'], 
+            #                  sorted_by_first[i]['target_seq'], 
+            #                  sorted_by_first[i]['accuracy'], 
+            #                  sorted_by_first[i]['mae'], 
+            #                  i)
         
         # exclude solutions
         # sorted_by_noAlorAg = [i for i in sorted_by_first if bool(all([True if j.split('__')[0] not in ['Ag','Al','TiN'][0:] else False for j in np.concatenate([i['pred_seq'],i['target_seq']])]))]

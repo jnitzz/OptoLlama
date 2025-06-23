@@ -174,13 +174,9 @@ def plot_acc_comparison(c, model_accs_dict):
     print(f"ACC comparison plot saved to: {hist_path}")
     plt.show()
     
-import matplotlib.pyplot as plt
-import numpy as np
 import torch           # NEW  – needed when the dataset returns tensors
-import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-import numpy as np, torch
 
 class MemmapSpectra(Dataset):
     def __init__(self, npy_file: str):
@@ -189,8 +185,7 @@ class MemmapSpectra(Dataset):
     def __getitem__(self, idx):     # only the spectrum (as tensor)
         return torch.from_numpy(self.mm[idx])        # [513]
     
-import numpy as np, torch
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import get_worker_info
 
 def _read_npy_shape(path: str):
     """
@@ -208,7 +203,6 @@ def _read_npy_shape(path: str):
         else:
             raise ValueError(f".npy version {major}.{minor} not supported")
     return header_dict
-
 
 class LazyMemmapSpectra(Dataset):
     def __init__(self, npy_path: str):
@@ -260,18 +254,13 @@ def find_closest_mae(target: np.ndarray,
 
     return best_idx, best_spec.numpy(), best     # index, spectrum, MAE
 
-def plot_samples2(
+def train_data_comp(
                 c,
-                RAT_pred: np.ndarray,
-                RAT_tar : np.ndarray,
-                stack_pred: list[str],
-                stack_tar : list[str],
-                ACC      : float,
-                MSE      : float,
-                number   : int,
-                *,
+                data,
                 ds_search = None,          # NEW (optional)
+                ds_search_precalc = None,
                 RAT_tar_mean: np.ndarray | None = None,
+                sample_plots = False,
         ):
     """
     Visualises one sample, *optionally* adding the closest training spectrum
@@ -289,94 +278,135 @@ def plot_samples2(
 
             plot_samples(c, RAT_pred, RAT_tar, …, ds_train=ds_train)
     """
-    # ---------------------------------------------------------------
-    # 1) (Optional) find closest training spectrum
-    # ---------------------------------------------------------------
-    RAT_closest = None
-    mae_closest = None
-    if ds_search is not None:
-        idx, RAT_closest, mae_closest = find_closest_mae(
-            RAT_tar, ds_search, batch_size=int(10*8192))
+    
+    import pandas as pd
+    MAE_scatter = dict()
+    if ds_search_precalc is not None:
+        from main import _prepare_token_maps
+        idx2tk, mat2id, pad_idx, sos_idx, eos_idx = _prepare_token_maps(c)
+        if isinstance(ds_search_precalc, str):
+            ds_search_precalc_file = torch.load(ds_search_precalc)
+        else:
+            ds_search_precalc_file = ds_search_precalc
+    for number, _ in enumerate(data):
+        # print(number)
+        stack_tar, stack_pred, RAT_tar, RAT_pred, ACC, MAE = data[number].values()
+        # ---------------------------------------------------------------
+        # 1) (Optional) find closest training spectrum
+        # ---------------------------------------------------------------
+        RAT_closest = None
+        mae_closest = None
+        if ds_search is not None:
+            idx, RAT_closest, mae_closest = find_closest_mae(
+                RAT_tar, ds_search, batch_size=int(10*8192))
+        RAT_closest, SEQ_closest = ds_search_precalc_file[0][number], ds_search_precalc_file[1][number]
+        SEQ_closest = [idx2tk[toke] for toke in SEQ_closest.tolist() if toke not in [1100, 1101, 1102]]
+        mae_closest = np.mean(np.absolute(RAT_tar - RAT_closest.tolist()))
+        spectrum_mae = np.mean(np.abs(RAT_pred - RAT_tar))
+        
+        # MAE_scatter[number] = [number,spectrum_mae,mae_closest]
+        MAE_scatter[number] = {'number': number,'spectrum_mae': spectrum_mae,'mae_closest': mae_closest}
+    
+        if sample_plots and number%int(len(data)/5)==0:
+            # ---------------------------------------------------------------
+            # 2) plotting – original curves plus optional “closest train”
+            # ---------------------------------------------------------------
+            colormap = plt.cm.tab20(range(8))   # a few extra colours
+            wls = np.arange(c.WAVELENGTH_MIN,
+                            c.WAVELENGTH_MAX + 1,
+                            c.WAVELENGTH_STEPS)
+        
+            plt.figure(figsize=(10,6))
+            # prediction vs. target
+            plt.plot(wls, RAT_pred[:171]      , label='Prediction (R)',  color=colormap[1])
+            if RAT_closest is not None:
+                plt.plot(wls, RAT_closest[:171]      , '--', label='Closest train (R)', color=colormap[1])
+            plt.plot(wls, RAT_tar [:171]      , label='Target     (R)',  color=colormap[0])
+            plt.plot(wls, RAT_pred[171:2*171] , label='Prediction (A)',  color=colormap[3])
+            if RAT_closest is not None:
+                plt.plot(wls, RAT_closest[171:2*171] , '--', label='Closest train (A)', color=colormap[3])
+            plt.plot(wls, RAT_tar [171:2*171] , label='Target     (A)',  color=colormap[2])
+            plt.plot(wls, RAT_pred[2*171:]    , label='Prediction (T)',  color=colormap[5])
+            if RAT_closest is not None:
+                plt.plot(wls, RAT_closest[2*171:]    , '--', label='Closest train (T)', color=colormap[5])
+            plt.plot(wls, RAT_tar [2*171:]    , label='Target     (T)',  color=colormap[4])
+        
+            if RAT_tar_mean is not None:
+                plt.plot(wls, RAT_tar_mean[:171]      , '--', label='Target mean (R)', color=colormap[0])
+                plt.plot(wls, RAT_tar_mean[171:2*171] , '--', label='Target mean (A)', color=colormap[2])
+                plt.plot(wls, RAT_tar_mean[2*171:]    , '--', label='Target mean (T)', color=colormap[4])
+        
+            # ---------------------------------------------------------------
+            # 3) cosmetics (titles, text blocks, etc.) – mostly unchanged
+            # ---------------------------------------------------------------
+            plt.title(f'Prediction using OptoLlama [model: {c.RUN_NAME} epoch: {c.RESUME_EPOCH}]',
+                      fontsize=12)
+            plt.xlabel('Wavelength [nm]', fontsize=10)
+            plt.ylabel('R - A - T', fontsize=10)
+            plt.legend(loc='center right', fontsize=10)
+        
+            # compact helper
+            def _strip(seq): return [t for t in seq if t not in ("<PAD>", "<SOS>", "<EOS>")]
+        
+            stack_tar  = _strip(stack_tar)
+            stack_pred = _strip(stack_pred)
+        
+            # → Target materials / thicknesses
+            plt.text(0.24, -0.12,
+                     "Target:\n" + "\n".join(f"{m.split('__')[0]}" for m in stack_tar),
+                     ha='left', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+            plt.text(0.46, -0.16,
+                     "\n".join(f"{m.split('__')[1]}" for m in stack_tar),
+                     ha='right', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+        
+            # → Prediction
+            plt.text(0.50, -0.12,
+                     "Prediction:\n" + "\n".join(f"{m.split('__')[0]}" for m in stack_pred),
+                     ha='left', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+            plt.text(0.72, -0.16,
+                     "\n".join(f"{m.split('__')[1]}" for m in stack_pred),
+                     ha='right', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+            
+            # → Trainset
+            plt.text(0.76, -0.12,
+                     "Closest in Train:\n" + "\n".join(f"{m.split('__')[0]}" for m in SEQ_closest),
+                     ha='left', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+            plt.text(0.98, -0.16,
+                     "\n".join(f"{m.split('__')[1]}" for m in SEQ_closest),
+                     ha='right', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+        
+            # → Key figures
+            spectrum_mae = np.mean(np.abs(RAT_pred - RAT_tar))
+            # key_block  = f"Key: {number}\n"
+            # key_block += f"MAE (pred vs tgt):  {spectrum_mae:.4f}\n"
+            # if mae_closest is not None:
+            #     key_block += f"MAE (train vs tgt):  {mae_closest:.4f}\n"
+            # key_block += f"Token accuracy:     {ACC:.2f}"
+            # plt.text(0.3, 1.1, key_block,
+            #          ha='left', fontsize=9, transform=plt.gca().transAxes)
+            
+            key_block_str = "Key: \n\nMAE (prediction): \nMAE (trainset): \n\nAccuracy:"
+            plt.text(-0.05, -0.12, key_block_str,
+                     ha='left', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+            
+            key_block_float = f"{number} \n\n{spectrum_mae:.4f} \n{mae_closest:.4f} \n\n{ACC:.2f}"
+            plt.text(0.12, -0.12, key_block_float,
+                     ha='left', fontsize=10, transform=plt.gca().transAxes,
+                     horizontalalignment='left',verticalalignment='top',)
+            
+            # plt.tight_layout()
+            plt.show()
+            
+    #%%
+    return MAE_scatter
 
-    # ---------------------------------------------------------------
-    # 2) plotting – original curves plus optional “closest train”
-    # ---------------------------------------------------------------
-    colormap = plt.cm.tab20(range(8))   # a few extra colours
-    wls = np.arange(c.WAVELENGTH_MIN,
-                    c.WAVELENGTH_MAX + 1,
-                    c.WAVELENGTH_STEPS)
-
-    # prediction vs. target
-    plt.plot(wls, RAT_pred[:171]      , label='Prediction (R)',  color=colormap[1])
-    if RAT_closest is not None:
-        plt.plot(wls, RAT_closest[:171]      , '--', label='Closest train (R)', color=colormap[1])
-    plt.plot(wls, RAT_tar [:171]      , label='Target     (R)',  color=colormap[0])
-    plt.plot(wls, RAT_pred[171:2*171] , label='Prediction (A)',  color=colormap[3])
-    if RAT_closest is not None:
-        plt.plot(wls, RAT_closest[171:2*171] , '--', label='Closest train (A)', color=colormap[3])
-    plt.plot(wls, RAT_tar [171:2*171] , label='Target     (A)',  color=colormap[2])
-    plt.plot(wls, RAT_pred[2*171:]    , label='Prediction (T)',  color=colormap[5])
-    if RAT_closest is not None:
-        plt.plot(wls, RAT_closest[2*171:]    , '--', label='Closest train (T)', color=colormap[5])
-    plt.plot(wls, RAT_tar [2*171:]    , label='Target     (T)',  color=colormap[4])
-
-    if RAT_tar_mean is not None:
-        plt.plot(wls, RAT_tar_mean[:171]      , '--', label='Target mean (R)', color=colormap[0])
-        plt.plot(wls, RAT_tar_mean[171:2*171] , '--', label='Target mean (A)', color=colormap[2])
-        plt.plot(wls, RAT_tar_mean[2*171:]    , '--', label='Target mean (T)', color=colormap[4])
-
-    # # NEW – closest train sample (dashed)
-    # if RAT_closest is not None:
-    #     plt.plot(wls, RAT_closest[:171]      , '--', label='Closest train (R)', color=colormap[1])
-    #     plt.plot(wls, RAT_closest[171:2*171] , '--', label='Closest train (A)', color=colormap[3])
-    #     plt.plot(wls, RAT_closest[2*171:]    , '--', label='Closest train (T)', color=colormap[5])
-
-    # ---------------------------------------------------------------
-    # 3) cosmetics (titles, text blocks, etc.) – mostly unchanged
-    # ---------------------------------------------------------------
-    plt.title(f'Prediction using OptoLlama [model: {c.RUN_NAME} epoch: {c.RESUME_EPOCH}]',
-              fontsize=10)
-    plt.xlabel('Wavelength [nm]', fontsize=10)
-    plt.ylabel('R - A - T', fontsize=10)
-    plt.legend(loc='upper right')
-
-    # compact helper
-    def _strip(seq): return [t for t in seq if t not in ("<PAD>", "<SOS>", "<EOS>")]
-
-    stack_tar  = _strip(stack_tar)
-    stack_pred = _strip(stack_pred)
-
-    # → Target materials / thicknesses
-    plt.text(0.02, 1.10,
-             "Target:\n" + "\n".join(f"{m.split('__')[0]}" for m in stack_tar),
-             ha='left', fontsize=8, transform=plt.gca().transAxes)
-    plt.text(0.24, 1.10,
-             "\n".join(f"{m.split('__')[1]}" for m in stack_tar),
-             ha='right', fontsize=8, transform=plt.gca().transAxes)
-
-    # → Prediction
-    plt.text(0.76, 1.10,
-             "Prediction:\n" + "\n".join(f"{m.split('__')[0]}" for m in stack_pred),
-             ha='left', fontsize=8, transform=plt.gca().transAxes)
-    plt.text(0.98, 1.10,
-             "\n".join(f"{m.split('__')[1]}" for m in stack_pred),
-             ha='right', fontsize=8, transform=plt.gca().transAxes)
-
-    # → Key figures
-    spectrum_mae = np.mean(np.abs(RAT_pred - RAT_tar))
-    key_block  = f"Key: {number}\n"
-    key_block += f"MAE (pred vs tgt): {spectrum_mae:.4f}\n"
-    if mae_closest is not None:
-        key_block += f"MAE (train vs tgt): {mae_closest:.4f}\n"
-    key_block += f"Token accuracy: {ACC:.2f}"
-    plt.text(0.36, 1.10, key_block,
-             ha='left', fontsize=9, transform=plt.gca().transAxes)
-
-    # plt.tight_layout()
-    plt.show()
-
-import torch, numpy as np
-from torch.utils.data import DataLoader
 from collections import namedtuple
 
 Nearest = namedtuple("Nearest", "train_idx mae train_tokens")
