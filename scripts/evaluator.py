@@ -75,6 +75,7 @@ class OpticalGPTEvaluator:
 
         # ---- dataloader ----------------------------------------------
         ds_val = SinglePTDataset(str(pt_file_val))
+        # ds_val = ds_val[:1000]                          #crop to 1k examples
         collate = functools.partial(
             pad_collate_fn,
             max_seq_length=max_seq_length,

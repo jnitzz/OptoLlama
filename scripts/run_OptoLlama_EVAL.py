@@ -10,7 +10,7 @@ from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_si
 from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, train_data_comp, MemmapSpectra, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
-import config_OL15 as c
+import config_OL19 as c
 
 from pathlib import Path
 import sys
@@ -141,7 +141,7 @@ def main():
                                      "--mode", "ray"], 
                                cfg=c)
             per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
-            
+        
         # tgt_tokens, pred_tokens, target_spectrum, pred_spectrum, accuracy, mae = per_sample_results[0]
         plot_mae(c, [i['mae'] for i in per_sample_results])
         # plot_accuracy(c, [i['accuracy'] for i in per_sample_results])
@@ -180,17 +180,18 @@ def main():
             # plot_mse_comparison(c, comp_dict)
             # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['accuracy'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[0] for i in per_example_results]}
             # plot_acc_comparison(c, comp_dict)
-            
+            if len(per_sample_results) != 1000:
+                per_sample_results = per_sample_results[:1000]
             # from plots import train_data_comp
             MAE_scatter = train_data_comp(c,
                             per_sample_results,
                             # ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy",
                             ds_search_precalc=r'd:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/RF_T63_16m/my_dataset_val_closest.pt',
-                            sample_plots=True)
+                            sample_plots=False)
             MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: np.abs(x[1]['spectrum_mae']-x[1]['mae_closest']))
             MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['mae_closest'])
-            # MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['spectrum_mae'])
-            MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.01]
+            MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['spectrum_mae'])
+            # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.01]
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']>=item[1]['mae_closest']]
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.005]
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']]
