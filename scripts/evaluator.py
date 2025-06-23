@@ -186,6 +186,7 @@ class OpticalGPTEvaluator:
         from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
         import numpy as np
 
+        heat_map = True
         DBinitNewMats(self.cfg)
         mats_sorted = sorted(self.material_to_id.keys())
         pad_tok, sos_tok, eos_tok = len(mats_sorted), len(mats_sorted) + 1, len(mats_sorted) + 2
@@ -204,7 +205,8 @@ class OpticalGPTEvaluator:
                     pred_seqs = []
                     for i in range(10):
                         pred_seqs.append(self._decode_batch(spectra_gpu))  # list[list[list[str]]]
-                    pred_seqs = aggregation(pred_seqs)
+                    pred_seqs = aggregation(pred_seqs, heat_map)
+                    
                 else:
                     pred_seqs = self._decode_batch(spectra_gpu)
 
@@ -231,6 +233,7 @@ class OpticalGPTEvaluator:
                         "mae": mae,
                     })
         
+                heat_map = False
         out_name = f'val_sample_results_{self.cfg.TARGET}_{self.cfg.RUN_NAME}_E{self.cfg.RESUME_EPOCH}'
         save_JSONPICKLE(self.cfg.PATH_RUN, results, out_name)
         print(f"💾 Saved {len(results)} samples → {self.cfg.PATH_RUN}/{out_name}.json")

@@ -1,4 +1,10 @@
 from collections import defaultdict, Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import config_EVAL as cfg
+import os
+
 def parse_tokens(token):
     a, b = token.split("__")
     parsed = (a, float(b))
@@ -64,7 +70,38 @@ def variance(predictions):
     return variance
 
 
-def aggregation(predictions):
+def heat_map(data, counter):
+    file_name = "heat_map_" + str(counter) + ".png"
+    result_path = os.path.join(cfg.PATH_RUN, file_name)
+    max_len = max(len(sublist) for sublist in data)
+    #data = [sublist + [("None", 0)] * (max_len - len(sublist)) for sublist in data]
+    all_mats = set()
+    for sublist in data:
+        for item in sublist:
+            all_mats.add(item[0])
+    all_mats = sorted(all_mats)
+
+    frequency = {s: [0] * max_len for s in all_mats}
+
+    for sublist in data:
+        for i, (s, _) in enumerate(sublist):
+            frequency[s][i] += 1
+
+    heatmap_data = np.array([frequency[s] for s in all_mats])
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(heatmap_data, annot=True, xticklabels=[f"Pos {i}" for i in range(max_len)],
+                yticklabels=all_mats, cmap="YlGnBu", cbar_kws={'label': 'Count'})
+    plt.title("Frequency of Materials at Each Layer")
+    plt.xlabel("Layer")
+    plt.ylabel("Material")
+    plt.tight_layout()
+    plt.savefig(result_path)
+
+
+
+def aggregation(predictions, plot):
+    counter = 0
     transposed = list(map(list, zip(*predictions))) # transpose list so that the batch dimension is on the outer side
     aggregated = [] # new prediction list
     for item in transposed: # for each item in batch
@@ -74,8 +111,11 @@ def aggregation(predictions):
             for layer in sample: # for each predicted layer
                 parsed_stack.append(parse_tokens(layer)) # parse the tokens of the layer and add it to the new prediction
             parsed_samples.append(parsed_stack)
+        if plot:
+            heat_map(parsed_samples, counter)
+            counter += 1
         aggregated_samples = aggregate_predictions(parsed_samples)
-        aggregated.append(parsed_stack)
+        aggregated.append(aggregated_samples)
     final = reconstruct_tokens(aggregated)
     return final
 
