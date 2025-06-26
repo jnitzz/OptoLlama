@@ -4,6 +4,8 @@ import seaborn as sns
 import numpy as np
 import config_EVAL as cfg
 import os
+from tabulate import tabulate
+from itertools import zip_longest
 
 def parse_tokens(token):
     a, b = token.split("__")
@@ -70,9 +72,11 @@ def variance(predictions):
     return variance
 
 
-def heat_map(data, counter):
-    file_name = "heat_map_" + str(counter) + ".png"
-    result_path = os.path.join(cfg.PATH_RUN, file_name)
+def heat_map(data, target, counter):
+    file_name_heat = "heat_map_" + str(counter) + ".png"
+    result_path_heat = os.path.join(cfg.PATH_RUN, file_name_heat)
+    file_name_table = "table_" + str(counter) + ".png"
+    result_path_table = os.path.join(cfg.PATH_RUN, file_name_table)
     max_len = max(len(sublist) for sublist in data)
     #data = [sublist + [("None", 0)] * (max_len - len(sublist)) for sublist in data]
     all_mats = set()
@@ -96,12 +100,90 @@ def heat_map(data, counter):
     plt.xlabel("Layer")
     plt.ylabel("Material")
     plt.tight_layout()
-    plt.savefig(result_path)
+    plt.savefig(result_path_heat)
+    plt.clf()
+
+    ordered_predictions = []
+    transposed = list(map(list, zip_longest(*data, fillvalue="")))
+
+    for i in range(len(transposed)):
+        freq_counter = dict()
+        for item in transposed[i]:
+            if item == "":
+                continue
+            if item[0] in freq_counter:
+                freq_counter[item[0]] += 1
+            else:
+                freq_counter[item[0]] = 1
+        sorted_frequency = sorted(freq_counter, key=lambda k: (-freq_counter[k], k))
+        ordered_predictions.append(sorted_frequency)
+    
+    transposed_predictions = list(map(list, zip_longest(*ordered_predictions, fillvalue="")))
 
 
 
-def aggregation(predictions, plot):
-    counter = 0
+    for i in range(len(transposed_predictions)):
+        while len(transposed_predictions[i]) < max_len:
+            transposed_predictions[i].append("")
+        transposed_predictions[i].insert(0, str("Prediction (Top " + str(i+1) + ")"))
+
+    target.insert(0, "Target")
+    transposed_predictions.insert(0, target)
+
+    max_cols = max(len(row) for row in transposed_predictions)
+    for row in transposed_predictions:
+        while len(row) < max_cols:
+            row.append("")
+
+    # Create the plot
+    fig, ax = plt.subplots()
+    ax.axis('off')
+
+    # Create the table
+    table = ax.table(
+        cellText=transposed_predictions,
+        cellLoc='center',
+        loc='center',
+        colWidths=[0.2]*max_cols
+    )
+
+    #print(transposed_predictions)
+    
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        value = transposed_predictions[row_idx][col_idx]
+        if row_idx == 0:
+            # Header
+            cell.set_text_props(weight='bold', color='white')
+            cell.set_facecolor('#40466e')
+        elif value == "":
+            # Empty cells
+            cell.set_facecolor('#ffe6e6')  # light red
+        else:
+            # Regular data cells
+            cell.set_facecolor('#f1f1f2')  # light gray
+
+    plt.savefig(result_path_table, bbox_inches='tight')
+    
+
+def plots(predictions, target):
+    transposed = list(map(list, zip(*predictions))) # transpose list so that the batch dimension is on the outer side
+    for i in range(len(transposed)): # for each item in batch
+        parsed_samples = []
+        parsed_target = []
+        for sample in transposed[i]: # for each sample drawn
+            parsed_stack = [] # create a new prediction
+            for layer in sample: # for each predicted layer
+                parsed_stack.append(parse_tokens(layer)) # parse the tokens of the layer and add it to the new prediction
+            parsed_samples.append(parsed_stack)
+        for tgt_layer in target[i]:
+            if tgt_layer == '<EOS>':
+                continue
+            token = parse_tokens(tgt_layer)
+            parsed_target.append(token[0])
+        heat_map(parsed_samples, parsed_target, i)
+
+
+def aggregation(predictions):
     transposed = list(map(list, zip(*predictions))) # transpose list so that the batch dimension is on the outer side
     aggregated = [] # new prediction list
     for item in transposed: # for each item in batch
@@ -111,9 +193,6 @@ def aggregation(predictions, plot):
             for layer in sample: # for each predicted layer
                 parsed_stack.append(parse_tokens(layer)) # parse the tokens of the layer and add it to the new prediction
             parsed_samples.append(parsed_stack)
-        if plot:
-            heat_map(parsed_samples, counter)
-            counter += 1
         aggregated_samples = aggregate_predictions(parsed_samples)
         aggregated.append(aggregated_samples)
     final = reconstruct_tokens(aggregated)

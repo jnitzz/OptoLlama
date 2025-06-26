@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 # import config_GPT30N37 as c
 from data import SinglePTDataset, pad_collate_fn, create_masks
 from model import OptoLlama
-from mcd_inference import aggregation
+from mcd_inference import aggregation, plots
 
 
 class OpticalGPTEvaluator:
@@ -205,7 +205,8 @@ class OpticalGPTEvaluator:
                     pred_seqs = []
                     for i in range(10):
                         pred_seqs.append(self._decode_batch(spectra_gpu))  # list[list[list[str]]]
-                    pred_seqs = aggregation(pred_seqs, heat_map)
+                    saved_seqs = pred_seqs
+                    pred_seqs = aggregation(pred_seqs)
                     
                 else:
                     pred_seqs = self._decode_batch(spectra_gpu)
@@ -218,6 +219,7 @@ class OpticalGPTEvaluator:
                 mat_seq = mat_seq.cpu()
                 thick_seq = thick_seq.cpu()
 
+                targets = []
                 for b in range(B):
                     tgt_tokens = self._reconstruct_sequence(mat_seq[b], thick_seq[b], mats_sorted, pad_tok, sos_tok, eos_tok)
                     pred_tokens = pred_seqs[b]
@@ -232,7 +234,11 @@ class OpticalGPTEvaluator:
                         "accuracy": acc,
                         "mae": mae,
                     })
+
+                    targets.append(tgt_tokens)
         
+                if heat_map:
+                    plots(saved_seqs, targets)
                 heat_map = False
         out_name = f'val_sample_results_{self.cfg.TARGET}_{self.cfg.RUN_NAME}_E{self.cfg.RESUME_EPOCH}'
         save_JSONPICKLE(self.cfg.PATH_RUN, results, out_name)
