@@ -87,10 +87,10 @@ def plot_samples(c, RAT_pred, RAT_tar, stack_pred, stack_tar, ACC, MSE, number, 
     # Automatically position the accuracy, MAE, and key text
     # spectrum_rss = np.sum(np.square(RAT_pred - RAT_tar))
     spectrum_mae = np.mean(np.absolute(RAT_pred - RAT_tar))
-    spectrum_mae = np.mean(np.absolute(np.concatenate([RAT_pred[10:81],RAT_pred[171*1+10:171*1+81],RAT_pred[171*2+10:171*2+81]])
-                                -np.concatenate([RAT_tar[10:81],RAT_tar[171*1+10:171*1+81],RAT_tar[171*2+10:171*2+81]])))
-    spectrum_mae = np.mean(np.absolute(np.concatenate([RAT_pred[10:81],RAT_pred[171*2+10:171*2+81]])
-                                -np.concatenate([RAT_tar[10:81],RAT_tar[171*2+10:171*2+81]])))
+    # spectrum_mae = np.mean(np.absolute(np.concatenate([RAT_pred[10:81],RAT_pred[171*1+10:171*1+81],RAT_pred[171*2+10:171*2+81]])
+    #                             -np.concatenate([RAT_tar[10:81],RAT_tar[171*1+10:171*1+81],RAT_tar[171*2+10:171*2+81]])))
+    # spectrum_mae = np.mean(np.absolute(np.concatenate([RAT_pred[10:81],RAT_pred[171*2+10:171*2+81]])
+    #                             -np.concatenate([RAT_tar[10:81],RAT_tar[171*2+10:171*2+81]])))
     plt.text(0.36, 1.10, "- - - - - - - - - - - - - -\nKey#:\nMAE:\nAccuracy:\n- - - - - - - - - - - - - -", ha='left', fontsize=10, transform=plt.gca().transAxes)
     plt.text(0.64, 1.10, f"\n{number}\n{spectrum_mae:.2f}\n{ACC:.2f}\n", ha='right', fontsize=10, transform=plt.gca().transAxes)
     

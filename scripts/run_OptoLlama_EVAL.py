@@ -6,12 +6,18 @@ import pickle
 import torch
 import torch.distributed as dist
 
-from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_signal, plot_signal
+from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_signal2, plot_signal
 from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, train_data_comp, MemmapSpectra, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
-import config_OL19 as c
-
+from matchValTrain import save_validation_with_closest
+import config_OL23 as c
+import config_OL24 as c
+import config_OL26 as c
+# import config_OL15 as c
+# import config_OL19 as c
+# import config_GPT30 as c
+c.RESUME_EPOCH = 3
 from pathlib import Path
 import sys
 
@@ -76,10 +82,9 @@ def main():
             # pure_signal = np.concatenate([target['R'], target['A'], target['T']])
             
             # SIGNAL RAYFLARE
-            # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__164.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0','3Hal_LZ__550.0', 'Ag__100.0', '<EOS>']
-            # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', 'TiO2__165.5', '9327_SiN_fit_formatted__203.0', 'TiO2__164.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0', '3Hal_LZ__550.0', 'C60_HZB__23', 'BCP__8.0','Ag__100.0', '<EOS>']
-            # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0', '<EOS>']
-            # stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', '<EOS>']
+            stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__164.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0','3Hal_LZ__550.0', 'Ag__100.0', '<EOS>']
+            stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', 'ITO__110.0', '<EOS>']
+            stack_str_list = ['ARC_ISE__100','soda-lime_0-01__2000','9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', '<EOS>']
             stack_str_list = ['9327_SiN_fit_formatted__142.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__203.0', '9333_TiO2_fit_formatted__165.5', '9327_SiN_fit_formatted__90.7', '<EOS>']
             # stack_str_list = []
             pure_signal = Call_RayFlare_with_dict(c, stack_str_list)
@@ -112,17 +117,17 @@ def main():
                 # {"start": 1000,  "end": 2000, "value": 0.0, 'noise': 0.0},
             ]
             
-            wavelengths, signals, noisy_signals, spectrum_values = generate_signal(
+            wavelengths, signals, noisy_signals, spectrum_values = generate_signal2(
                 wl0, wl1, step,
-                pure_signal=pure_signal[:171],
+                pure_signal=pure_signal[:],
                 # peaks=peaks,
                 baseline=baseline_segments,
-                num_samples=1,
-                noise_std_dev=0.01,
+                num_samples=200,
+                noise_std_dev=0.1,
                 smooth_signal=True,
-                smooth_sigma=0.1,
+                smooth_sigma=1.0,
             )
-            # plot_signal(wavelengths, signals, noisy_signals, spectrum_values)
+            plot_signal(wavelengths, signals, noisy_signals, spectrum_values)
             all_spectra = torch.tensor(spectrum_values.tolist())#.unsqueeze(0) # shape: [1, 513]
             all_labels = [[eos_idx]]*int(all_spectra.shape[0])
             spectra_tensor = [arr.clone().detach().to(torch.float16) if isinstance(arr, torch.Tensor) else torch.tensor(arr, dtype=torch.float16) for arr in all_spectra]
@@ -157,25 +162,72 @@ def main():
         # sorted_by_first = sorted(per_sample_results, key=lambda i: np.mean(np.absolute(np.concatenate([target[10:81],target[171*2+10:171*2+81]])
         #                             -np.concatenate([i['pred_spectrum'][10:81],i['pred_spectrum'][171*2+10:171*2+81]]))))
         # sorted_by_first = sorted(per_sample_results, key=lambda x: np.mean(np.absolute(pure_signal[:]-x['pred_spectrum'][:])))
-
+        stack_str = ['ARC_ISE__100','soda-lime__2000','SiN_fit__142.0', 'TiO2_fit__165.5', 'SiN_fit__203.0', 'TiO2_fit__164.5', 'SiN_fit__90.7', 'ITO__110.0','3Hal__550.0', 'Ag__100.0', '<EOS>']
                 
         if c.TARGET == 'custom':
             for i in np.arange(0,3,1):
                 plot_samples(c,
                              sorted_by_first[i]['pred_spectrum'], 
-                             np.mean(spectrum_values,axis=0), 
-                             # target,
+                             per_sample_results[0]['target_spectrum'], 
                              sorted_by_first[i]['pred_seq'], 
-                             sorted_by_first[i]['target_seq'], 
+                             # sorted_by_first[i]['target_seq'], 
+                             stack_str,
                              sorted_by_first[i]['accuracy'], 
                              sorted_by_first[i]['mae'], 
                              i)
+            
+            # save_validation_with_closest(
+            #     val_pt         = rf"{c.PATH_DATA}/my_dataset_interact.pt",
+            #     train_spec_npy = rf"{c.PATH_DATA}/my_dataset_16m.npy",
+            #     train_tok_npy  = rf"{c.PATH_DATA}/my_dataset_16m_tokens.npy",
+            #     out_pt         = rf"{c.PATH_DATA}/my_dataset_interact_closest.pt",
+            #     batch_test     = 256,      # tune ↔ GPU RAM
+            #     batch_train    = 4096*4,    # bigger ⇒ better GPU utilisation
+            #     device         = "cuda")
+            
+            # MAE_scatter = train_data_comp(c,
+            #                 per_sample_results,
+            #                 # ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy",
+            #                 ds_search_precalc=r'd:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/RF_T63_16m/my_dataset_interact_closest.pt',
+            #                 sample_plots=True)
+            # MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: np.abs(x[1]['spectrum_mae']-x[1]['mae_closest']))
+            # MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['mae_closest'])
+            # # MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['spectrum_mae'])
+            # # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.01]
+            # # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']>=item[1]['mae_closest']]
+            # # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.005]
+            # # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']]
+            # print(len(MAE_scatter_sorted))
+            # index = [_ for _, inner in MAE_scatter_sorted]
+            # index = np.arange(len(index))
+            # x = [inner['spectrum_mae'] for _, inner in MAE_scatter_sorted]
+            # y = [inner['mae_closest']  for _, inner in MAE_scatter_sorted]
+            # # 2) Make the scatter plot
+            # import matplotlib.pyplot as plt
+            # plt.figure(figsize=(8,6))
+            # plt.scatter(index, x, label='spectrum_mae')
+            # plt.scatter(index, y, label='mae_closest')
+            
+            # # 3) Labeling
+            # plt.xlabel('index')
+            # plt.ylabel('mae')
+            # plt.title(f'Index vs [Spectrum MAE, MAE Closest] [model: {c.RUN_NAME} epoch: {c.RESUME_EPOCH}]')
+            
+            # # 4) (Optional) add a grid and show
+            # plt.grid(True)
+            # plt.legend()
+            # plt.tight_layout()
+            # plt.show()
         elif c.TARGET == 'test':
             # model comp
             with open(c.PATH_RES_COMP, 'rb') as f:   
                 per_example_results = pickle.load(f)
             comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['mae'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[3] for i in per_example_results]} #N67_GPT26
-            plot_mae_comparison(c, comp_dict)
+            
+            # per_example_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E15')
+            # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['mae'] for i in per_sample_results], f'{c.RUN_NAME}_Epoch15': [i['mae'] for i in per_example_results]} #N67_GPT26
+            
+            # plot_mae_comparison(c, comp_dict)
             # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': mses, 'N67_GPT26_Epoch207': [np.mean(np.square(i[4] - i[5])) for i in per_example_results]}
             # plot_mse_comparison(c, comp_dict)
             # comp_dict = {f'{c.RUN_NAME}_Epoch{c.RESUME_EPOCH}': [i['accuracy'] for i in per_sample_results], 'N67_GPT26_Epoch207': [i[0] for i in per_example_results]}
@@ -183,6 +235,7 @@ def main():
             if len(per_sample_results) != 1000:
                 per_sample_results = per_sample_results[:1000]
             # from plots import train_data_comp
+            #%%
             MAE_scatter = train_data_comp(c,
                             per_sample_results,
                             # ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy",
@@ -190,12 +243,12 @@ def main():
                             sample_plots=False)
             MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: np.abs(x[1]['spectrum_mae']-x[1]['mae_closest']))
             MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['mae_closest'])
-            MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['spectrum_mae'])
+            # MAE_scatter_sorted = sorted(MAE_scatter.items(), key=lambda x: x[1]['spectrum_mae'])
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.01]
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']>=item[1]['mae_closest']]
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.005]
             # MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']]
-
+            print(len(MAE_scatter_sorted))
             index = [_ for _, inner in MAE_scatter_sorted]
             index = np.arange(len(index))
             x = [inner['spectrum_mae'] for _, inner in MAE_scatter_sorted]
@@ -216,7 +269,7 @@ def main():
             plt.legend()
             plt.tight_layout()
             plt.show()
-            
+            #%%
             # for i in np.arange(0,1000,200):
             #     i = int(i)
             #     plot_samples(c, 

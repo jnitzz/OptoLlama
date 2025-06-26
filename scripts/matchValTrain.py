@@ -128,15 +128,16 @@ def save_validation_with_closest(
 
 # ---------------------------------------------------------------------------
 #  3.  CLI / example ---------------------------------------------------------
-import config_OL19 as c
-if __name__ == "__main__":
-    save_validation_with_closest(
-        val_pt         = rf"{c.PATH_DATA}/my_dataset_val.pt",
-        train_spec_npy = rf"{c.PATH_DATA}/my_dataset_16m.npy",
-        train_tok_npy  = rf"{c.PATH_DATA}/my_dataset_16m_tokens.npy",
-        out_pt         = rf"{c.PATH_DATA}/my_dataset_val_closest.pt",
-        batch_test     = 256,      # tune ↔ GPU RAM
-        batch_train    = 512,    # bigger ⇒ better GPU utilisation
-        device         = "cuda")
+# import config_OL15 as c
+# if __name__ == "__main__":
+#     save_validation_with_closest(
+#         val_pt         = rf"{c.PATH_DATA}/my_dataset_interact.pt",
+#         train_spec_npy = rf"{c.PATH_DATA}/my_dataset_16m.npy",
+#         train_tok_npy  = rf"{c.PATH_DATA}/my_dataset_16m_tokens.npy",
+#         out_pt         = rf"{c.PATH_DATA}/my_dataset_interact_closest.pt",
+#         batch_test     = 128,      # tune ↔ GPU RAM
+#         batch_train    = 4096*2,    # bigger ⇒ better GPU utilisation
+#         device         = "cuda")
 
 # data = torch.load(r'd:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/RF_T63_16m/my_dataset_val_closest.pt')
+# data = torch.load(r'd:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/RF_T63_16m/my_dataset_interact_closest.pt')

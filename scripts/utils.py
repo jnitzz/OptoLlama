@@ -144,6 +144,133 @@ def generate_signal(
     )
 
     return wavelengths, signals, noisy_signals, RAT
+    
+from typing import Union, List, Dict, Optional, Tuple, Any
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+
+from typing import Union, List, Dict, Optional, Tuple, Any
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+
+def generate_signal2(
+    start_wavelength: float,
+    end_wavelength: float,
+    step_size: float,
+    num_samples: int,
+    *,
+    peaks: Optional[List[Dict[str, float]]] = None,
+    baseline: Union[float, List[Dict[str, float]]] = 0.0,
+    noise_std_dev: float = 0.01,
+    smooth_signal: bool = False,
+    smooth_sigma: float = 1.0,
+    pure_signal: Optional[np.ndarray] = None,      # now always 1-D if provided
+    **legacy_kwargs: Any
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate pure, noisy and RAT signals.
+
+    pure_signal (optional, 1-D)
+        • len == n_wl            → only R is supplied (legacy mode)
+        • len == 3·n_wl          → concatenated R|A|T
+        • len == 2·n_wl          → concatenated R|T   (A is inferred)
+
+    All other behaviour is unchanged.
+    """
+    # ------------------------------------------------------------------ 1) λ-grid
+    wl = np.arange(start_wavelength, end_wavelength + step_size, step_size)
+    n_wl = len(wl)
+
+    # -------------------------------------------- helpers for baseline & noise std
+    def _baseline_curve():
+        if isinstance(baseline, (int, float)):
+            return np.full(n_wl, baseline, dtype=float)
+        out = np.zeros(n_wl, dtype=float)
+        for seg in baseline:
+            m = (wl >= seg["start"]) & (wl <= seg["end"])
+            out[m] = seg["value"]
+        return out
+
+    def _noise_std_curve():
+        if isinstance(baseline, (int, float)):
+            return np.zeros(n_wl, dtype=float)
+        out = np.zeros(n_wl, dtype=float)
+        for seg in baseline:
+            m = (wl >= seg["start"]) & (wl <= seg["end"])
+            out[m] = seg.get("noise", 0.0)
+        return out + noise_std_dev
+
+    # -------------------------------------------------------- 2) build pure RAT
+    if pure_signal is not None:                           # user-supplied curve
+        vec = np.asarray(pure_signal, dtype=float).ravel()   # ensure 1-D
+
+        if len(vec) == n_wl:                                  # R only
+            R = np.clip(vec, 0.0, 1.0)
+            A = np.zeros_like(R)
+            T = 1.0 - R
+
+        elif len(vec) == 2 * n_wl:                            # R|T
+            R, T = vec[:n_wl], vec[n_wl:]
+            A = 1.0 - R - T
+
+        elif len(vec) == 3 * n_wl:                            # R|A|T
+            R, A, T = np.split(vec, 3)
+
+        else:
+            raise ValueError(
+                "pure_signal must have length n_wl, 2·n_wl or 3·n_wl "
+                f"(got {len(vec)} for n_wl={n_wl})."
+            )
+
+        # clip & renormalise so that R+A+T = 1
+        RAT = np.clip(np.stack([R, A, T]), 0.0, 1.0)
+        s = RAT.sum(axis=0, keepdims=True)
+        s[s == 0.0] = 1.0
+        RAT /= s
+        R, A, T = RAT
+
+    else:                                                  # build R from peaks
+        sigma_fac = 1.0 / (2 * np.sqrt(2 * np.log(2)))
+        R = _baseline_curve()
+        if peaks:
+            for p in peaks:
+                sigma = p["fwhm"] * sigma_fac
+                R += p["amplitude"] * np.exp(-((wl - p["anchor"]) / sigma) ** 2)
+        R = np.clip(R, 0.0, 1.0)
+        A = np.zeros_like(R)
+        T = 1.0 - R
+
+    # --------------------------------------------- 3) Monte-Carlo noise & smooth
+    noise_sigma = _noise_std_curve()
+
+    def _noisy(base):
+        y = np.tile(base, (num_samples, 1))
+        y += np.random.normal(0.0, noise_sigma, y.shape)
+        y = np.clip(y, 0.0, 1.0)
+        if smooth_signal:
+            y = np.array([gaussian_filter1d(v, smooth_sigma) for v in y])
+        return y
+
+    Rn, An, Tn = map(_noisy, (R, A, T))
+
+    # --------------------------------------------- 4) renormalise after noise
+    RAT_noisy = np.stack([Rn, An, Tn], axis=1)          # (N, 3, λ)
+    s = RAT_noisy.sum(axis=1, keepdims=True)
+    s[s == 0.0] = 1.0
+    RAT_noisy = np.clip(RAT_noisy / s, 0.0, 1.0)
+
+    # ------------------------------------------------------- 5) prepare outputs
+    wavelengths   = wl
+    signals       = np.tile(R, (num_samples, 1))               # pure R
+    noisy_signals = RAT_noisy[:, 0, :]                         # noisy R
+    RAT_out       = RAT_noisy.reshape(num_samples, -1)         # flattened R|A|T
+    # RAT_out = np.insert(RAT_out, 0, np.concatenate([R, A, T]), axis=0)
+    RAT_out[0] = np.concatenate([R, A, T])
+
+    return wavelengths, signals, noisy_signals, RAT_out
+
 
 def plot_signal(wavelengths, signals, noisy_signals, RAT):
     """
