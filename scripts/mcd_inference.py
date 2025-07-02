@@ -6,6 +6,8 @@ import config_EVAL as cfg
 import os
 from tabulate import tabulate
 from itertools import zip_longest
+import seaborn as sns
+import pandas as pd
 
 def parse_tokens(token):
     a, b = token.split("__")
@@ -102,6 +104,7 @@ def heat_map(data, target, counter):
     plt.tight_layout()
     plt.savefig(result_path_heat)
     plt.clf()
+    plt.close()
 
     ordered_predictions = []
     transposed = list(map(list, zip_longest(*data, fillvalue="")))
@@ -119,8 +122,6 @@ def heat_map(data, target, counter):
         ordered_predictions.append(sorted_frequency)
     
     transposed_predictions = list(map(list, zip_longest(*ordered_predictions, fillvalue="")))
-
-
 
     for i in range(len(transposed_predictions)):
         while len(transposed_predictions[i]) < max_len:
@@ -163,6 +164,43 @@ def heat_map(data, target, counter):
             cell.set_facecolor('#f1f1f2')  # light gray
 
     plt.savefig(result_path_table, bbox_inches='tight')
+    plt.close()
+
+
+def box_plot(predictions, counter):
+    file_name_box_plot = "box_plot_" + str(counter) + ".png"
+    result_path_box_plot = os.path.join(cfg.PATH_RUN, file_name_box_plot)
+
+    layer_material_thickness = defaultdict(list)
+    for pred in predictions:
+        for layer_idx, (mat, thick) in enumerate(pred):
+            layer_material_thickness[(layer_idx, mat)].append(thick)
+
+    data = []
+    for (layer, mat), thicknesses in layer_material_thickness.items():
+        for t in thicknesses:
+            data.append({'Layer': f'Layer {layer+1}', 'Material': mat, 'Thickness': t})
+    df = pd.DataFrame(data)
+
+    # Plot
+    palette = sns.color_palette('tab20')
+    plt.figure(figsize=(8, 6))
+    ax = sns.stripplot(data=df, x='Layer', y='Thickness', hue='Material',
+                    dodge=True, jitter=True, size=6, alpha=0.8, palette=palette)
+
+    # Move legend outside
+    handles, labels = ax.get_legend_handles_labels()
+    plt.legend(handles, labels, title='Material', bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    plt.title('Thickness Predictions per Layer and Material')
+
+    num_layers = df['Layer'].nunique()
+    for x in range(num_layers - 1):
+        plt.axvline(x + 0.5, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(result_path_box_plot)
+    plt.close()
     
 
 def plots(predictions, target):
@@ -181,6 +219,7 @@ def plots(predictions, target):
             token = parse_tokens(tgt_layer)
             parsed_target.append(token[0])
         heat_map(parsed_samples, parsed_target, i)
+        box_plot(parsed_samples, i)
 
 
 def aggregation(predictions):
