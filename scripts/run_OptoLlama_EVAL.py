@@ -6,18 +6,25 @@ import pickle
 import torch
 import torch.distributed as dist
 
-from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_signal2, plot_signal
+from utils import seed_everything, load_JSONPICKLE, save_JSONPICKLE, generate_signal2, generate_signal3, plot_signal
 from plots import plot_accuracy, plot_mse, plot_mae, plot_samples, train_data_comp, MemmapSpectra, plot_mae_comparison, plot_mse_comparison, plot_acc_comparison
 
 from call_rayflare import DBinitNewMats, Call_RayFlare_with_dict
 from matchValTrain import save_validation_with_closest
-import config_OL23 as c
-import config_OL24 as c
-import config_OL26 as c
-# import config_OL15 as c
-# import config_OL19 as c
-# import config_GPT30 as c
-c.RESUME_EPOCH = 3
+
+import config_OL34 as c
+c.RESUME_EPOCH = 187
+c.RESUME_EPOCH = 207
+
+import config_OL35 as c
+c.RESUME_EPOCH = 169
+
+import config_OL36 as c
+c.RESUME_EPOCH = 177
+
+import config_OL37 as c
+c.RESUME_EPOCH = 244
+
 from pathlib import Path
 import sys
 
@@ -68,7 +75,10 @@ def main():
     c.WAVELENGTHS = np.arange(c.WAVELENGTH_MIN,c.WAVELENGTH_MAX+1,c.WAVELENGTH_STEPS)
     
     #%% target generation methods
-    for peek in [1]:
+    save_stuff = {}
+    save_JSONPICKLE(c.PATH_RUN, save_stuff, 'save_stuff')
+    for peek in np.arange(0,1,1):
+        # c.RESUME_EPOCH = peek
     # for peek in range(360,830,10):
         if c.TARGET == 'custom':
             # SIGNAL FILE
@@ -106,9 +116,10 @@ def main():
             
             wl0, wl1, step = 300, 2000, 10
             baseline_segments = [
-                {"start": 300,  "end":  600, "value": 0.0, 'noise': 0.0},
-                {"start": 600,  "end":  900, "value": 0.0, 'noise': 0.0},
-                {"start": 900,  "end": 2000, "value": 0.0, 'noise': 0.0},
+                {"start": 300,  "end":  2000, "value": 0.0, 'noise': 0.0},
+                # {"start": 300,  "end":  600, "value": 0.0, 'noise': 0.0},
+                # {"start": 600,  "end":  900, "value": 0.0, 'noise': 0.0},
+                # {"start": 900,  "end": 2000, "value": 0.0, 'noise': 0.0},
                 
                 # {"start": 300,  "end":  500, "value": 0.0, 'noise': 0.0},
                 # {"start": 500,  "end":  600, "value": 1.0, 'noise': 0.0},
@@ -122,7 +133,7 @@ def main():
                 pure_signal=pure_signal[:],
                 # peaks=peaks,
                 baseline=baseline_segments,
-                num_samples=200,
+                num_samples=3,
                 noise_std_dev=0.1,
                 smooth_signal=True,
                 smooth_sigma=1.0,
@@ -141,14 +152,55 @@ def main():
         if os.path.isfile(rf'{c.PATH_RUN}/val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}.json') and c.TARGET == 'test':
             per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
         else:
+            n_samples_noise = 3
+            torch_infile = os.path.join(c.PATH_DATA, "my_dataset_val.pt")
+            all_spectra, all_label_tokens = torch.load(torch_infile)
+            all_spectra, all_label_tokens = all_spectra[:1000], all_label_tokens[:1000]
+            from itertools import chain, repeat
+            all_label_tokens_3x = list(chain.from_iterable(zip(*repeat(all_label_tokens, n_samples_noise))))
+            pure_signals = all_spectra #np.stack([np.ones(171)*0.2, np.ones(171)*0.5, np.ones(171)*0.8])
+            wl0, wl1, step = 300, 2000, 10
+            wavelengths, signals, noisy_signals, spectrum_values = generate_signal3(
+                wl0, wl1, step,                 # λ-range
+                num_samples=n_samples_noise,              # each R gets 50 noise realisations
+                pure_signals=pure_signals,   # <-- multiple inputs
+                noise_std_dev=0.15,
+                smooth_signal=True, smooth_sigma=1.2,
+            )
+            # plot_signal(wavelengths, signals, noisy_signals, spectrum_values)
+            all_spectra = torch.tensor(spectrum_values.tolist())#.unsqueeze(0) # shape: [1, 513]
+            all_labels = all_label_tokens_3x   #[[eos_idx]]*int(all_spectra.shape[0])
+            spectra_tensor = [arr.clone().detach().to(torch.float16) if isinstance(arr, torch.Tensor) else torch.tensor(arr, dtype=torch.float16) for arr in all_spectra]
+            label_tensor = [lbl.clone().detach().to(torch.long) if isinstance(lbl, torch.Tensor) else torch.tensor(lbl, dtype=torch.long) for lbl in all_labels]
+            torch_outfile = os.path.join(c.PATH_DATA, f"my_dataset_val_1000x{n_samples_noise}.pt")
+            torch.save((spectra_tensor, label_tensor), torch_outfile)
+            c.PT_VAL = rf'{c.PATH_DATA}/my_dataset_val_1000x{n_samples_noise}.pt'
+            
             optical_main._main(argv=["test", 
                                      "--ckpt", str(ckpt), 
                                      "--mode", "ray"], 
                                cfg=c)
+            # per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}_1000x{n_samples_noise}')
             per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
+        #%%
+        per_sample_results_filtered = []
+        for i,item in enumerate(per_sample_results):
+            # print(i)
+            if i%n_samples_noise==0:
+                j = i
+                per_sample_results_filtered.append(item)
+            elif np.mean(np.absolute(per_sample_results[j]['target_spectrum']-item['pred_spectrum'])) < np.mean(np.absolute(per_sample_results[j]['target_spectrum']-per_sample_results[j]['pred_spectrum'])):
+                pass
+                per_sample_results_filtered[int(j/n_samples_noise)]['pred_spectrum'] = item['pred_spectrum']
+                per_sample_results_filtered[int(j/n_samples_noise)]['pred_seq'] = item['pred_seq']
+                per_sample_results_filtered[int(j/n_samples_noise)]['mae'] = np.mean(np.absolute(per_sample_results[j]['target_spectrum']-item['pred_spectrum']))
+        
+        per_sample_results = per_sample_results_filtered
+        #%% 
         
         # tgt_tokens, pred_tokens, target_spectrum, pred_spectrum, accuracy, mae = per_sample_results[0]
-        plot_mae(c, [i['mae'] for i in per_sample_results])
+        plot_mae(c, [np.mean(np.absolute(i['target_spectrum']-i['pred_spectrum'])) for i in per_sample_results])
+        # save_stuff[peek] = {'MAE_mean':np.mean([i['mae'] for i in per_sample_results])}
         # plot_accuracy(c, [i['accuracy'] for i in per_sample_results])
         # mses = [np.mean(np.square(np.array(i['target_spectrum']) - np.array(i['pred_spectrum']))) for i in per_sample_results]
         # plot_mse(c, mses)
@@ -269,6 +321,13 @@ def main():
             plt.legend()
             plt.tight_layout()
             plt.show()
+            
+            MAE_scatter_sorted = [item for item in MAE_scatter_sorted if item[1]['spectrum_mae']<=item[1]['mae_closest']+0.01]
+            save_stuff = load_JSONPICKLE(c.PATH_RUN, 'save_stuff')
+            save_stuff[f'{peek}'] = {'MAE_mean':np.mean([i['mae'] for i in per_sample_results]), 
+                                'belowTESTSET': len(MAE_scatter_sorted)}
+            save_JSONPICKLE(c.PATH_RUN, save_stuff, 'save_stuff')
+
             #%%
             # for i in np.arange(0,1000,200):
             #     i = int(i)

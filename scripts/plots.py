@@ -404,7 +404,6 @@ def train_data_comp(
             # plt.tight_layout()
             plt.show()
             
-    #%%
     return MAE_scatter
 
 from collections import namedtuple
@@ -466,3 +465,140 @@ def all_closest_mae(test_ds,
                         mae         = float(mae_val),
                         train_tokens= train_tokens[idx]))
     return results
+
+#%%
+data = [['Al2O3__48','Al__283','Ge__249','ZnSe__251','AlN__254'],
+['Al2O3__49','Al__280','AlN__255','ZnSe__251'],
+['Al2O3__55','Al__273','AlN__252','ZnSe__251'],
+['Al2O3__70','Al__303','AlN__253','ZnSe__251'],
+['Al2O3__65','Al__312','AlN__245','ZnSe__251'],
+['Al2O3__68','Al__306','AlN__246','ZnSe__251'],
+['Al2O3__58','Al__302','AlN__247','ZnSe__251'],
+['Al2O3__48','Al__287','AlN__248','MgF2__247'],
+['Al2O3__61','Al__289','AlN__250','MgF2__245'],
+['Al2O3__57','Al__294','AlN__249','ZnO__246']]
+
+#!/usr/bin/env python3
+import matplotlib.pyplot as plt
+import numpy as np
+import ast
+from collections import Counter
+
+def load_block(filepath, block_id=0):
+    """
+    Reads the file at `filepath`, finds the line matching block_id,
+    and returns the list of (material, thickness) rows for that block.
+    """
+    with open(filepath, 'r') as f:
+        lines = f.read().splitlines()
+    # find the line equal to the block label
+    idx = lines.index(str(block_id))
+    # the data is two lines below that label
+    return ast.literal_eval(lines[idx + 2])
+
+def make_plot(data, figsize=(12,6), output_path=None):
+    """
+    Given a list of lists [(mat, value), ...] for each stack,
+    creates the inverted-y, offset-marker plot.
+    """
+    # extract sequences and unique sequence list
+    sequences = [tuple(mat for mat,_ in row) for row in data]
+    unique_seqs = list(dict.fromkeys(sequences))
+    # assign one distinct color per sequence
+    cmap_seq = plt.cm.tab10(np.linspace(0,1,len(unique_seqs)))
+    seq_color = {seq: cmap_seq[i] for i,seq in enumerate(unique_seqs)}
+
+    # find max layer depth
+    max_layers = max(len(row) for row in data)
+    layers = np.arange(1, max_layers+1)
+
+    # collect all materials for marker/color mapping
+    all_materials = sorted({mat for row in data for mat,_ in row})
+    marker_list = ['o','s','^','D','P','X','*','v','<','>','p','8']
+    cmap_mat = plt.cm.tab20(np.linspace(0,1,len(all_materials)))
+    marker_map = {m: marker_list[i % len(marker_list)] for i,m in enumerate(all_materials)}
+    color_map  = {m: cmap_mat[i] for i,m in enumerate(all_materials)}
+
+    # compute majority material at each layer
+    majority = {}
+    for L in layers:
+        mats = [row[L-1][0] for row in data if len(row)>=L]
+        majority[L] = Counter(mats).most_common(1)[0][0]
+
+    # compute small offsets for stacks at each layer
+    delta = 0.1
+    offsets = {}
+    for L in layers:
+        idxs = [i for i,row in enumerate(data) if len(row)>=L]
+        offs = np.linspace(-delta, delta, len(idxs))
+        for i,off in zip(idxs, offs):
+            offsets[(i, L)] = off
+
+    # start plotting
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # draw background lines per sequence
+    for row, seq in zip(data, sequences):
+        thickness = [val for _,val in row] + [np.nan]*(max_layers - len(row))
+        ax.plot(thickness, layers, color=seq_color[seq],
+                linewidth=2, alpha=0.7, zorder=1)
+
+    # draw majority‐layer markers on centerline
+    for i,row in enumerate(data):
+        for L,(mat,val) in enumerate(row, start=1):
+            if mat==majority[L]:
+                ax.scatter(val, L,
+                           marker=marker_map[mat],
+                           color=color_map[mat],
+                           s=60, edgecolors='black', zorder=2)
+
+    # draw outlier markers with vertical offset
+    for i,row in enumerate(data):
+        for L,(mat,val) in enumerate(row, start=1):
+            if mat!=majority[L]:
+                y = L #+ offsets[(i,L)]
+                ax.scatter(val, y,
+                           marker=marker_map[mat],
+                           color=color_map[mat],
+                           s=60, edgecolors='black', zorder=3)
+
+    # invert y-axis so layer 1 is at the top
+    ax.set_yticks(layers)
+    ax.set_ylim(max_layers+0.5, 0.5)
+    ax.grid(True)
+    ax.set_xlabel('Thickness Value')
+    ax.set_ylabel('Layer Number')
+    ax.set_title(f'Predicted Thickness Profiles (Block {block})')
+
+    # build combined legend
+    seq_handles = [
+        plt.Line2D([], [], color=seq_color[seq], linewidth=2, label='-'.join(seq))
+        for seq in unique_seqs
+    ]
+    mat_handles = [
+        plt.Line2D([], [], marker=marker_map[m], color=color_map[m],
+                   linestyle='None', markersize=6, markeredgecolor='black', label=m)
+        for m in all_materials
+    ]
+    ax.legend(handles=seq_handles + mat_handles,
+              title='Sequences & Materials',
+              bbox_to_anchor=(1.05,1), loc='upper left')
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+    else:
+        plt.show()
+
+if __name__ == '__main__':
+    import sys
+    fp = r'D:\Profile\a3536\Nextcloud\PhD - HEIBRiDS\Conferences\20250801_NatureMachineIntelligence\results\MC00\predictions_10.txt'
+    for block in range(10):    
+        # block = 2
+        if len(sys.argv) > 1:
+            fp = sys.argv[1]            # first arg can override file path
+        if len(sys.argv) > 2:
+            block = int(sys.argv[2])    # second arg can override block ID
+        data = load_block(fp, block_id=block)
+        make_plot(data)
+

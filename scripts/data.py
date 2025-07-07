@@ -42,7 +42,7 @@ class SinglePTDataset(Dataset[Tuple[Tensor, Tensor]]):
             raise FileNotFoundError(pt_file)
         print(f"Loading spectra/tokens from ➜  {pt_file}")
         self.all_spectra, self.all_label_tokens = torch.load(pt_file)
-        self.all_spectra, self.all_label_tokens = self.all_spectra[:1000], self.all_label_tokens[:1000]
+        # self.all_spectra, self.all_label_tokens = self.all_spectra[:1000], self.all_label_tokens[:1000]
 
     # --------------------------------------------------------------------- #
     # PyTorch overrides                                                     #
