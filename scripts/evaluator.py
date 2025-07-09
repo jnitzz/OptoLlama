@@ -54,12 +54,12 @@ class OpticalGPTEvaluator:
         # ---- model ----------------------------------------------------
         self.model = OptoLlama(
             num_classes=self.num_classes,
-            d_model=768,
-            n_heads=8,
-            n_layers=6,
+            d_model=self.cfg.D_MODEL,
+            n_heads=self.cfg.N_HEADS,
+            n_layers=self.cfg.N_LAYERS,
             max_seq_length=max_seq_length,
             input_dim=3 * 171,
-            dropout=0.2,
+            dropout=self.cfg.T_DROPOUT,
         ).to(self.device)
 
         # ---- checkpoint ----------------------------------------------
@@ -75,6 +75,7 @@ class OpticalGPTEvaluator:
 
         # ---- dataloader ----------------------------------------------
         ds_val = SinglePTDataset(str(pt_file_val))
+        # ds_val = ds_val[:1000]                          #crop to 1k examples
         collate = functools.partial(
             pad_collate_fn,
             max_seq_length=max_seq_length,

@@ -49,12 +49,8 @@ class OpticalGPTTrainer:
         *,
         cfg,
         num_classes: int,
-        d_model: int,
-        n_heads: int,
-        n_layers: int,
         max_seq_length: int,
         input_dim: int,
-        dropout: float,
         epsilon: float,
         pad_idx: int,
         sos_idx: int,
@@ -84,12 +80,12 @@ class OpticalGPTTrainer:
         # ---------------------------------------------------------------- #
         self.model = OptoLlama(
             num_classes=num_classes,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
+            d_model=self.cfg.D_MODEL,
+            n_heads=self.cfg.N_HEADS,
+            n_layers=self.cfg.N_LAYERS,
             max_seq_length=max_seq_length,
             input_dim=input_dim,
-            dropout=dropout,
+            dropout=self.cfg.T_DROPOUT,
         ).to(self.device)
         self.model = DDP(
             self.model,
@@ -101,12 +97,12 @@ class OpticalGPTTrainer:
         # Optimiser, scheduler, loss
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
-            lr=self.cfg.LEARNING_RATE,
+            lr=self.cfg.LEARNING_RATE/512*self.cfg.BATCH_SIZE,
             betas=(0.9, 0.98),
             eps=1e-9,
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=400
+            self.optimizer, T_max=self.cfg.BATCH_SIZE - 10, eta_min=self.cfg.LEARNING_RATE/10
         )
         self.criterion = nn.CrossEntropyLoss(reduction="mean")
         self.mse_loss = nn.MSELoss(reduction="mean")
@@ -152,10 +148,10 @@ class OpticalGPTTrainer:
 
             if self._rank == 0:
                 print(
-                    f"📈 Epoch {epoch+1:>3}/{self.cfg.EPOCHS} "
+                    f"📈 Epoch {epoch:>3}/{self.cfg.EPOCHS} "
                     f"train={tr_loss:.5f} (ce={tr_ce:.5f}|mse={tr_mse:.5f})   "
                     f"val={v_loss:.5f} (ce={v_ce:.5f}|mse={v_mse:.5f})  "
-                    f"acc={v_acc:.3%}"
+                    f"acc={v_acc:.3%}\n\n"
                 )
             self._save_checkpoint(
                 epoch, tr_loss, tr_ce, tr_mse, v_loss, v_ce, v_mse, v_acc
@@ -272,7 +268,7 @@ class OpticalGPTTrainer:
 
             if step % 10 == 0 and self._rank == 0:
                 print(
-                    f"  • epoch {epoch+1:>3} | "
+                    f"  • epoch {epoch:>3} | "
                     f"step {step:>4}/{self.train_len:<4} | "
                     f"loss {sum_loss/step:.5f}"
                 )
@@ -376,7 +372,7 @@ class OpticalGPTTrainer:
         # Flatten so shapes always match, no matter if we pass [B] or [B,T]
         pred = pred.reshape(-1)
         gold = gold.reshape(-1)
-        return self.mse_loss(pred / 50.0, gold / 50.0)/4
+        return self.mse_loss(pred / 50.0, gold / 50.0)/8
 
     # ---------------------- 4) Checkpointing ------------------------------- #
 

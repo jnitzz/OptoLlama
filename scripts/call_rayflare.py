@@ -14,6 +14,7 @@ from solcore.structure import Layer
 from rayflare.transfer_matrix_method import tmm_structure
 from solcore.absorption_calculator import download_db
 from solcore.material_system import create_new_material
+from scipy.interpolate import CubicSpline, interp1d
 from functools import lru_cache
 import numpy as np
 # import config_RAYFLARE as c
@@ -131,6 +132,14 @@ def DBinitNewMats(c):
             continue
 
         wavelengths_si, n_vals, k_vals, short_name = load_materialdata_file(full_path)
+        xnew = np.linspace(c.WAVELENGTH_MIN* 1e-9, c.WAVELENGTH_MAX* 1e-9, 171)
+        # clamped_n = CubicSpline(wavelengths_si, n_vals, bc_type='not-a-knot')
+        # clamped_k = CubicSpline(wavelengths_si, k_vals, bc_type='not-a-knot')
+        clamped_n = interp1d(wavelengths_si, n_vals, axis=0, bounds_error=False, kind='linear', fill_value=(n_vals[0], n_vals[-1]))
+        clamped_k = interp1d(wavelengths_si, k_vals, axis=0, bounds_error=False, kind='linear', fill_value=(k_vals[0], k_vals[-1]))
+        n_vals_new = clamped_n(xnew)
+        k_vals_new = clamped_k(xnew)
+        wavelengths_si, n_vals, k_vals = xnew, n_vals_new, k_vals_new
         np.savetxt("temp_n.txt",np.array([wavelengths_si,n_vals]).T)            #TODO tempfile
         np.savetxt("temp_k.txt",np.array([wavelengths_si,k_vals]).T)
         create_new_material(mat_name = f'{short_name}', n_source='temp_n.txt', k_source='temp_k.txt', overwrite=True)
@@ -140,24 +149,26 @@ def DBinitNewMats(c):
         # Create database entries
         # print(short_name, wavelengths_si[:5], wavelengths_si[-5:])  # Debug
         data_list.append((short_name, wavelengths_si, n_vals, k_vals))
-    
+        # np.savetxt(rf"d:\Profile\a3536\Eigene Dateien\GitHub\ColorAppearanceToolbox\data\NK4GenPro4\new\{short_name}.nk",np.array([wavelengths_si,n_vals,k_vals]).T)
     if bool(c.DB_PLOTNK):
         import matplotlib.pyplot as plt
         # Now define the wavelength limits in nm, and convert to meters.
         plot_min_m = c.WAVELENGTH_MIN * 1e-9
         plot_max_m = c.WAVELENGTH_MAX * 1e-9
-    
+        colormap = plt.cm.plasma(np.linspace(0,1,22))#np.linspace(0,1,20))
+        # colormap = plt.cm.tab20b(22)#np.linspace(0,1,20))
         # First plot: all n vs. wavelength
         plt.figure(figsize=(10,8), dpi=400)
+        i=0
         for (short_name, w_si, n_array, k_array) in data_list:
             # Optionally filter to the x-range
             in_range = (w_si >= plot_min_m) & (w_si <= plot_max_m)
             if not np.any(in_range):
                 continue
-            
             wl_plot = w_si[in_range]
             n_plot = n_array[in_range]
-            plt.plot(wl_plot, n_plot, label=short_name)
+            plt.plot(wl_plot, n_plot, label=short_name, color=colormap[i])
+            i +=1
     
         plt.xlim(plot_min_m, plot_max_m)
         plt.title("Refractive index (n) vs. Wavelength")
@@ -168,6 +179,7 @@ def DBinitNewMats(c):
     
         # Second plot: all k vs. wavelength
         plt.figure(figsize=(10,8), dpi=400)
+        i=0
         for (short_name, w_si, n_array, k_array) in data_list:
             # Optionally filter to the x-range
             in_range = (w_si >= plot_min_m) & (w_si <= plot_max_m)
@@ -176,7 +188,8 @@ def DBinitNewMats(c):
             
             wl_plot = w_si[in_range]
             k_plot = k_array[in_range]
-            plt.plot(wl_plot, k_plot, label=short_name)
+            plt.plot(wl_plot, k_plot, label=short_name, color=colormap[i])
+            i +=1
     
         plt.xlim(plot_min_m, plot_max_m)
         plt.title("Extinction coefficient (k) vs. Wavelength")
@@ -198,7 +211,7 @@ def Call_RayFlare_with_dict(c, stack_str_list):
     options = default_options()
     options.wavelength = c.WAVELENGTHS * 1e-9  # convert nm to meters
     options.parallel = True
-
+    # options.bulk_profile = True
     # incidence and transmission media
     incidence = material('air')()
     transmission = material('EVA')()
@@ -215,10 +228,10 @@ def Call_RayFlare_with_dict(c, stack_str_list):
         # thickness in nm => convert to m with si()
         layer_list.append(Layer(si(thick_str + 'nm'), material(mat_str)()))
 
-    struc = tmm_structure(layer_list, incidence=incidence, transmission=transmission)
+    struc = tmm_structure(layer_list, incidence=incidence, transmission=transmission,no_back_reflection=False)
     options.coherent = True
     options.theta_in = np.deg2rad(c.INCIDENCE_ANGLE)
-    RAT = tmm_structure.calculate(struc, options)
+    RAT = tmm_structure.calculate(struc, options, profile=True)
     # Flatten R, A, T
     R = RAT['R']
     A = RAT['A']
