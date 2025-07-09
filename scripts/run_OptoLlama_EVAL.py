@@ -23,7 +23,13 @@ import config_OL36 as c
 c.RESUME_EPOCH = 177
 
 import config_OL37 as c
-c.RESUME_EPOCH = 244
+c.RESUME_EPOCH = 245
+
+import config_OL40 as c
+c.RESUME_EPOCH = 133
+
+# import config_OL43 as c
+# c.RESUME_EPOCH = 71
 
 from pathlib import Path
 import sys
@@ -152,7 +158,7 @@ def main():
         if os.path.isfile(rf'{c.PATH_RUN}/val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}.json') and c.TARGET == 'test':
             per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
         else:
-            n_samples_noise = 3
+            n_samples_noise = 1
             torch_infile = os.path.join(c.PATH_DATA, "my_dataset_val.pt")
             all_spectra, all_label_tokens = torch.load(torch_infile)
             all_spectra, all_label_tokens = all_spectra[:1000], all_label_tokens[:1000]
@@ -183,6 +189,7 @@ def main():
             # per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}_1000x{n_samples_noise}')
             per_sample_results = load_JSONPICKLE(c.PATH_RUN, f'val_sample_results_{c.TARGET}_{c.RUN_NAME}_E{c.RESUME_EPOCH}')
         #%%
+        n_samples_noise = 1
         per_sample_results_filtered = []
         for i,item in enumerate(per_sample_results):
             # print(i)
@@ -190,7 +197,7 @@ def main():
                 j = i
                 per_sample_results_filtered.append(item)
             elif np.mean(np.absolute(per_sample_results[j]['target_spectrum']-item['pred_spectrum'])) < np.mean(np.absolute(per_sample_results[j]['target_spectrum']-per_sample_results[j]['pred_spectrum'])):
-                pass
+                # pass
                 per_sample_results_filtered[int(j/n_samples_noise)]['pred_spectrum'] = item['pred_spectrum']
                 per_sample_results_filtered[int(j/n_samples_noise)]['pred_seq'] = item['pred_seq']
                 per_sample_results_filtered[int(j/n_samples_noise)]['mae'] = np.mean(np.absolute(per_sample_results[j]['target_spectrum']-item['pred_spectrum']))
@@ -226,8 +233,7 @@ def main():
                              stack_str,
                              sorted_by_first[i]['accuracy'], 
                              sorted_by_first[i]['mae'], 
-                             i)
-            
+                             i)    
             # save_validation_with_closest(
             #     val_pt         = rf"{c.PATH_DATA}/my_dataset_interact.pt",
             #     train_spec_npy = rf"{c.PATH_DATA}/my_dataset_16m.npy",
@@ -236,7 +242,6 @@ def main():
             #     batch_test     = 256,      # tune ↔ GPU RAM
             #     batch_train    = 4096*4,    # bigger ⇒ better GPU utilisation
             #     device         = "cuda")
-            
             # MAE_scatter = train_data_comp(c,
             #                 per_sample_results,
             #                 # ds_search=rf"{c.PATH_DATA}/my_dataset_16m.npy",
@@ -259,12 +264,10 @@ def main():
             # plt.figure(figsize=(8,6))
             # plt.scatter(index, x, label='spectrum_mae')
             # plt.scatter(index, y, label='mae_closest')
-            
             # # 3) Labeling
             # plt.xlabel('index')
             # plt.ylabel('mae')
             # plt.title(f'Index vs [Spectrum MAE, MAE Closest] [model: {c.RUN_NAME} epoch: {c.RESUME_EPOCH}]')
-            
             # # 4) (Optional) add a grid and show
             # plt.grid(True)
             # plt.legend()
