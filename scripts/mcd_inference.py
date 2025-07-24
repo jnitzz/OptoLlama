@@ -44,6 +44,20 @@ def aggregate_predictions(predictions):
         # Average the floats for the selected string
         avg_float = sum(value_map[selected_string]) / len(value_map[selected_string])
         result.append((selected_string, avg_float))
+    
+    # Use the closest prediction to the aggregated prediction for forecasting
+    '''
+    closest = None
+    min_dist = -1
+    for prediction in predictions:
+        dist = pairwise_distance(prediction,result)
+        if closest == None:
+            closest = prediction
+            min_dist = dist
+        elif dist < min_dist:
+            min_dist = dist
+            closest = prediction
+    '''
 
     return result
 
