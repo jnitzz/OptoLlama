@@ -23,7 +23,8 @@ from torch.utils.data import DataLoader
 # import config_GPT30N37 as c
 from data import SinglePTDataset, pad_collate_fn, create_masks
 from model import OptoLlama
-from mcd_inference import aggregation, plots
+from mcd_inference import aggregation
+from mcd_plots import plots
 
 
 class OpticalGPTEvaluator:
@@ -235,9 +236,10 @@ class OpticalGPTEvaluator:
                         "mae": mae,
                     })
 
-                    targets.append(tgt_tokens)
+                    if enableMCD and heat_map:
+                        targets.append(tgt_tokens)
         
-                if heat_map:
+                if enableMCD and heat_map:
                     plots(saved_seqs, targets)
                 heat_map = False
         out_name = f'val_sample_results_{self.cfg.TARGET}_{self.cfg.RUN_NAME}_E{self.cfg.RESUME_EPOCH}'

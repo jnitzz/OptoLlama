@@ -137,6 +137,7 @@ def main():
         torch_outfile = os.path.join(c.PATH_DATA, "my_dataset_interact.pt")
         torch.save((spectra_tensor, label_tensor), torch_outfile)
     elif c.TARGET == 'validation':
+        #pass
         enableMCD = True
     
     ckpt = rf'{c.PATH_RUN}/model_epoch_{c.RESUME_EPOCH}.pth'
