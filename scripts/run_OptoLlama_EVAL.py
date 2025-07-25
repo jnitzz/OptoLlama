@@ -26,7 +26,10 @@ import config_OL37 as c
 c.RESUME_EPOCH = 245
 
 import config_OL40 as c
-c.RESUME_EPOCH = 133
+c.RESUME_EPOCH = 268
+
+# import config_OL42 as c
+# c.RESUME_EPOCH = 59
 
 # import config_OL43 as c
 # c.RESUME_EPOCH = 71

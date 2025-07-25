@@ -147,18 +147,15 @@ def DBinitNewMats(c):
         os.remove('temp_k.txt')
         
         # Create database entries
-        # print(short_name, wavelengths_si[:5], wavelengths_si[-5:])  # Debug
         data_list.append((short_name, wavelengths_si, n_vals, k_vals))
-        # np.savetxt(rf"d:\Profile\a3536\Eigene Dateien\GitHub\ColorAppearanceToolbox\data\NK4GenPro4\new\{short_name}.nk",np.array([wavelengths_si,n_vals,k_vals]).T)
     if bool(c.DB_PLOTNK):
         import matplotlib.pyplot as plt
         # Now define the wavelength limits in nm, and convert to meters.
         plot_min_m = c.WAVELENGTH_MIN * 1e-9
         plot_max_m = c.WAVELENGTH_MAX * 1e-9
-        colormap = plt.cm.plasma(np.linspace(0,1,22))#np.linspace(0,1,20))
-        # colormap = plt.cm.tab20b(22)#np.linspace(0,1,20))
+        colormap = plt.cm.tab10(np.linspace(0,1,10))#np.linspace(0,1,20))
         # First plot: all n vs. wavelength
-        plt.figure(figsize=(10,8), dpi=400)
+        plt.figure(figsize=(8,6), dpi=400)
         i=0
         for (short_name, w_si, n_array, k_array) in data_list:
             # Optionally filter to the x-range
@@ -167,7 +164,12 @@ def DBinitNewMats(c):
                 continue
             wl_plot = w_si[in_range]
             n_plot = n_array[in_range]
-            plt.plot(wl_plot, n_plot, label=short_name, color=colormap[i])
+            if i < 10:
+                plt.plot(wl_plot, n_plot, '-', label=short_name, color=colormap[i])
+            elif i >= 10 and i < 20:
+                plt.plot(wl_plot, n_plot, '--', label=short_name, color=colormap[i-10])
+            elif i >= 20:
+                plt.plot(wl_plot, n_plot, '-.', label=short_name, color=colormap[i-20])
             i +=1
     
         plt.xlim(plot_min_m, plot_max_m)
@@ -178,7 +180,7 @@ def DBinitNewMats(c):
         plt.savefig(f"{c.PATH_RUN}/refractive_index_data_n.pdf", dpi=600, bbox_inches='tight')
     
         # Second plot: all k vs. wavelength
-        plt.figure(figsize=(10,8), dpi=400)
+        plt.figure(figsize=(8,6), dpi=400)
         i=0
         for (short_name, w_si, n_array, k_array) in data_list:
             # Optionally filter to the x-range
@@ -188,7 +190,12 @@ def DBinitNewMats(c):
             
             wl_plot = w_si[in_range]
             k_plot = k_array[in_range]
-            plt.plot(wl_plot, k_plot, label=short_name, color=colormap[i])
+            if i < 10:
+                plt.plot(wl_plot, k_plot, '-', label=short_name, color=colormap[i])
+            elif i >= 10 and i < 20:
+                plt.plot(wl_plot, k_plot, '--', label=short_name, color=colormap[i-10])
+            elif i >= 20:
+                plt.plot(wl_plot, k_plot, '-.', label=short_name, color=colormap[i-20])
             i +=1
     
         plt.xlim(plot_min_m, plot_max_m)

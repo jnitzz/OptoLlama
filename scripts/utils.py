@@ -10,7 +10,7 @@ import random
 
 import json
 import jsonpickle
-from typing import Any
+from typing import Any, List, Union, Dict, Optional, Tuple
 
 def seed_everything(seed: int = 42) -> None:
     torch.manual_seed(seed)
@@ -29,9 +29,34 @@ def save_JSONPICKLE(PATH: str, pyobj: Any, name: str) -> None:
     with open(f"{PATH}/{name}.json", 'w') as f:
         json.dump(frozen, f)
 
+def load_JSONPICKLE_NEW(PATH: str, name: str) -> Any:
+    with open(f'{PATH}/{name}.json', 'r') as f:
+        data = f.read()
+    return jsonpickle.decode(data)
 
-from typing import Union, List, Dict, Optional, Tuple, Any
-import numpy as np
+def save_JSONPICKLE_NEW(PATH: str, pyobj: Any, name: str) -> None:
+    frozen = jsonpickle.encode(pyobj)
+    with open(f"{PATH}/{name}.json", 'w') as f:
+        f.write(frozen)
+
+def init_tokenmaps(PATH: str) -> List[str]:                 #TODO type hints correctly
+    tokens = load_JSONPICKLE_NEW(PATH, 'tokens')
+    
+    # Insert special tokens if not present
+    PAD_TOKEN = "<PAD>"
+    SOS_TOKEN = "<SOS>"
+    EOS_TOKEN = "<EOS>"
+    for special_tk in [PAD_TOKEN, SOS_TOKEN, EOS_TOKEN]:
+        if special_tk not in tokens:
+            tokens.append(special_tk)
+    
+    token_to_idx = {tk: i for i, tk in enumerate(tokens)}
+    pad_idx = token_to_idx[PAD_TOKEN]
+    sos_idx = token_to_idx[SOS_TOKEN]
+    eos_idx = token_to_idx[EOS_TOKEN]
+    idx_to_token = {i: tk for i, tk in enumerate(token_to_idx)}
+    return tokens, token_to_idx, idx_to_token, pad_idx, sos_idx, eos_idx
+
 from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 
