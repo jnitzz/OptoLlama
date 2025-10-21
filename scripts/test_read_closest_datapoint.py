@@ -4,6 +4,11 @@ Created on Mon Jun 16 16:07:09 2025
 
 @author: a3536
 """
+
+import tmm_fast as tmm
+tmm.coh_tmm(pol, N, T, Theta, lambda_vacuum)
+
+
 import numpy as np
 from data import SinglePTDataset
 pt_file_val = r'd:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\data\RF_T63_16m\my_dataset_val.pt'
