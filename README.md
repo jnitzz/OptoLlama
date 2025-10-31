@@ -24,6 +24,20 @@ Alternatively, you can install ``OptoLlama`` locally. To achieve this, there are
    ```
 2. Install the package from the main branch:
    - Install basic dependencies: ``pip install -e .``
+  
+## Data and model checkpoints
+
+You can find all necessary data on our [HuggingFace](https://huggingface.co/HZBSolarOptics) page. It contains the [training and test data](https://huggingface.co/datasets/HZBSolarOptics/MultiLayerThinFilms) as well as the [model checkpoint](https://huggingface.co/HZBSolarOptics/OptoLlama). The data is stored in the [safetensors](https://huggingface.co/docs/safetensors/index) format. Please find a small usage example below:
+
+```python
+from safetensors.torch import load_file
+
+model = OptoLlama()
+
+safetensors_path = "optollama-model.safetensors"
+state_dict = load_file(safetensors_path)
+model.load_state_dict(state_dict)
+```
 
 ## How to contribute
 Check out our [contribution guidelines](CONTRIBUTING.md) if you are interested in contributing to the `OptoLlama` project :fire:.
