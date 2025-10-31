@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "optollama"
+version = "0.9.0"
+description = "AI model for inverse stack thin film layer design "
+authors = [
+    {name = "Schaible, Jonas", email="jonas.schaible@helmholtz-berlin.de"}
+]
+maintainers = [
+    {name = "Schaible, Jonas", email="jonas.schaible@helmholtz-berlin.de"}
+]
+readme = "README.md"
+license = {file = "LICENSE.md"}
+keywords = ["AI", "neural network", "masked diffusion model", "multi-layer thin film", "optics", "inverse design"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed"
+]
+
+requires-python = ">=3.11"
+
+dependencies = [
+  "numpy",
+  "pandas",
+  "matplotlib",
+  "scipy",
+  "torch",
+  "safetensors",
+  "tmm_fast",
+  "tqdm"
+]
+
+[project.urls]
+Homepage = "https://www.helmholtz-berlin.de/forschung/oe/se/solarenergieoptik/index_en.html"
+Repository = "https://github.com/jnitzz/OptoLlama"
+Issues = "https://github.com/jnitzz/OptoLlama/issues"

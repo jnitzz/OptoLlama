@@ -7,6 +7,7 @@
 [![](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: BSD-3](https://img.shields.io/badge/License-Apache--2-blue)](https://opensource.org/license/apache-2-0)
 [![](https://img.shields.io/badge/Contact-OptoLlama-orange?label=Contact)](jonas.schaible@helmholtz-berlin.de)
+[![](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 OptoLlama is a transformer AI-model enabling the inverse design of thin-film material stacks. Given an reflectance-absorptance-transmittance input spectrum (RAT), OptoLlama is able to propose a corresponding stack of materials and their layer thickness producing the "prompted" characteristics.
 
@@ -23,6 +24,20 @@ Alternatively, you can install ``OptoLlama`` locally. To achieve this, there are
    ```
 2. Install the package from the main branch:
    - Install basic dependencies: ``pip install -e .``
+  
+## Data and model checkpoints
+
+You can find all necessary data on our [HuggingFace](https://huggingface.co/HZBSolarOptics) page. It contains the [training and test data](https://huggingface.co/datasets/HZBSolarOptics/MultiLayerThinFilms) as well as the [model checkpoint](https://huggingface.co/HZBSolarOptics/OptoLlama). The data is stored in the [safetensors](https://huggingface.co/docs/safetensors/index) format. Please find a small usage example below:
+
+```python
+from safetensors.torch import load_file
+
+model = OptoLlama()
+
+safetensors_path = "optollama-model.safetensors"
+state_dict = load_file(safetensors_path)
+model.load_state_dict(state_dict)
+```
 
 ## How to contribute
 Check out our [contribution guidelines](CONTRIBUTING.md) if you are interested in contributing to the `OptoLlama` project :fire:.
