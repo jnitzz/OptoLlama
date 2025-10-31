@@ -21,7 +21,7 @@ Outputs:
 """
 from __future__ import annotations
 
-import os
+import os, sys
 import importlib
 from typing import Any, Dict, Optional, Tuple
 
@@ -30,7 +30,6 @@ import torch
 # Project imports (local files in the repo)
 import cli
 from utils import init_tokenmaps, save_JSONPICKLE
-from cli import parse_arguments
 from utils_runner import setup_run, _is_ddp
 from utils_data import make_loader, SpectraDataset
 from utils_model import build_model
@@ -224,9 +223,13 @@ def run_inference(
 
 # ----------------------------- CLI entry -----------------------------
 if __name__ == "__main__":
-    import sys
-    sys.argv.extend(["--config", "config_MD58"])
+    if "--config" not in sys.argv:
+        sys.argv.extend(["--config", "config_MD60.py"])                             #TODO rename to better name
+
+    # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()
+    cfg = cli.load_config_with_overrides(args)
+    
     run_inference(
         config=args.config,
         validsim=args.validsim,

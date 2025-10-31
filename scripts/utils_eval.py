@@ -201,8 +201,8 @@ def validate_model(
             if do_sim and best_pred_spectra is not None:
                 rec.update({
                     "mae": float(best_mae[i].item()),
-                    "RAT_target_flat": spectra[i].T.reshape(-1).detach().cpu().numpy().tolist(),
-                    "RAT_pred_flat":   best_pred_spectra[i].T.reshape(-1).detach().cpu().numpy().tolist(),
+                    "RAT_target_flat": spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
+                    "RAT_pred_flat":   best_pred_spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
                 })
             results.append(rec)
 

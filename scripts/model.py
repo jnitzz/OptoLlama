@@ -566,7 +566,6 @@ class OriginalDecoderWrapper(nn.Module):
         self.sample_temperature = float(temperature)
         self.sample_top_k = int(top_k)
         self.sample_top_p = float(top_p)
-        print(self.sample_temperature,self.sample_top_k)
 
     def _decode_logits(self, memory: torch.Tensor, tgt_tokens: torch.Tensor) -> torch.Tensor:
         # memory: [B,1,D], tgt_tokens: [B,S]

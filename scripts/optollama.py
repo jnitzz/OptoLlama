@@ -286,11 +286,8 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-
     if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "config_MD58.py"]) #TODO rename to better name
-        sys.argv.extend(["--validsim", "TMM_FAST"]) #TODO rename to better name
-        sys.argv.extend(["--set", "EPOCH=10"]) #TODO rename to better name
+        sys.argv.extend(["--config", "config_MD60.py"])                             #TODO rename to better name
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()
@@ -300,13 +297,11 @@ if __name__ == "__main__":
     if getattr(args, "print_config", True):
         for k in sorted([k for k in dir(cfg) if not k.startswith("_") and not callable(getattr(cfg, k))]):
             print(f"{k} = {getattr(cfg, k)!r}")
-        sys.exit(0)
 
     try:
-        # Pass both args and cfg so train has everything it needs
         train(args, cfg)
     finally:
-        # Always clean up DDP even if train throws
+        # Always clean up DDP
         try:
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
