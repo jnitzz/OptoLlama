@@ -25,7 +25,7 @@ def _import_config_module(config_arg: str):
         if spec is None or spec.loader is None:
             raise ImportError(f"Could not load config from path: {config_arg}")
         module = importlib.util.module_from_spec(spec)
-        sys.modules["cfg"] = module
+        sys.modules["user_cfg"] = module
         spec.loader.exec_module(module)  # type: ignore[attr-defined]
         return module
     else:
@@ -71,8 +71,10 @@ def parse_arguments() -> argparse.Namespace:
                    help="Override MC_SAMPLES for Monte Carlo best-of-N")
     p.add_argument("--set", dest="sets", action="append", default=[],
                    help="Top-level override(s), e.g. --set EPOCHS=200 --set TRAIN_BATCH=128")
-    p.add_argument("--print-config", action="store_true",
+    p.add_argument("--print-config", action="store_true", default=True,
                    help="Print the final config and exit")
+    p.add_argument("--target", type=str, default=None, 
+                   help="Path to a JSON/CSV RAT file for interactive inference.")
     return p.parse_args()
 
 def load_config_with_overrides(args: argparse.Namespace):

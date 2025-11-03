@@ -4,7 +4,7 @@
 import os
 import torch
 import torch.nn as nn
-from typing import Dict, Any
+from typing import Dict, Any, NamedTuple
 from tmm_fast import coh_tmm
 from scipy.interpolate import interp1d
 import pandas as pd
@@ -190,3 +190,24 @@ def _build_tmm(incidence_angle, device, wavelengths, path_materials, idx_to_toke
     nk_dict = load_materials(path_materials, wavelengths)
     tmm = TMMSpectrum(nk_dict, idx_to_token, device=device).to(device).eval()
     return tmm, wl_tensor, theta
+
+
+class TMMContext(NamedTuple):
+    tmm: torch.nn.Module          # TMMSpectrum
+    wl: torch.Tensor              # [W] complex128
+    theta: torch.Tensor           # [] or [1] complex128
+
+
+@torch.no_grad()
+def build_tmm_context(*, cfg, idx_to_token, device) -> TMMContext:
+    """
+    Centralized TMM init, identical to how you do it in train/MC.
+    """
+    tmm, wl_tensor, theta = _build_tmm(
+        incidence_angle=cfg.INCIDENCE_ANGLE,
+        device=device,
+        wavelengths=cfg.WAVELENGTHS,
+        path_materials=cfg.PATH_MATERIALS,
+        idx_to_token=idx_to_token,
+    )
+    return TMMContext(tmm, wl_tensor, theta)

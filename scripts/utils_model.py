@@ -51,11 +51,3 @@ def build_model( #TODO optollamam und optoGPT
         ).to(torch.float32).to(device)
     else:
         raise ValueError(f"Unsupported model key: {mt}")
-
-
-def extract_sampling_cfg(cfg):
-    return (
-        getattr(cfg, "sample_temperature", 1.0),
-        getattr(cfg, "sample_top_k", 0),
-        getattr(cfg, "sample_top_p", 1.0),
-    )

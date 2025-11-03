@@ -21,77 +21,20 @@ Outputs:
 """
 from __future__ import annotations
 
-import os, sys
+import os, sys, torch
 import importlib
-from typing import Any, Dict, Optional, Tuple
-
-import torch
+from typing import Any, Dict, Optional
 
 # Project imports (local files in the repo)
 import cli
-from utils import init_tokenmaps, save_JSONPICKLE
+from utils import init_tokenmaps, save_JSON, load_checkpoint, apply_sampling_from_sources
 from utils_runner import setup_run, _is_ddp
 from utils_data import make_loader, SpectraDataset
 from utils_model import build_model
-from utils_eval import build_tmm_context, validate_model
-
+from utils_eval import validate_model
+from call_tmm_fast import build_tmm_context
 
 # ----------------------------- helpers -----------------------------
-def _flex_load_state_dict(model: torch.nn.Module, state: Dict[str, Any]) -> None:
-    """
-    Try several common checkpoint layouts and load into (possibly DDP-wrapped) model.
-    """
-    from utils import core_module_crop, load_state_dict_flexible
-    core = core_module_crop(model)
-
-    # Training script stored {'model_state': ..., 'optimizer_state': ..., ...}
-    if isinstance(state, dict) and "model_state" in state:
-        sd = state["model_state"]
-        load_state_dict_flexible(core, sd)
-        return
-
-    # utils.save_checkpoint(state={'model': ...})
-    if isinstance(state, dict) and "model" in state:
-        sd = state["model"]
-        load_state_dict_flexible(core, sd)
-        return
-
-    # Maybe the file *is* a plain state_dict already
-    if isinstance(state, dict) and any(torch.is_tensor(v) for v in state.values()):
-        load_state_dict_flexible(core, state)
-        return
-
-    raise RuntimeError("Unrecognized checkpoint format; expected keys 'model_state' or 'model'.")
-
-
-def _maybe_load_checkpoint(model: torch.nn.Module, ckpt_path: Optional[str], device: str) -> Tuple[torch.nn.Module, Optional[int]]:
-    """
-    Load a checkpoint if provided and return (model, start_epoch) where epoch may be None.
-    """
-    if not ckpt_path:
-        return model, None
-
-    if not os.path.exists(ckpt_path):
-        print(f"⚠️  Checkpoint not found: {ckpt_path}")
-        return model, None
-
-    print(f"📦 Loading checkpoint: {ckpt_path}")
-    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-    # if it's a dict with epoch, keep it; otherwise None
-    start_epoch = None
-    if isinstance(blob, dict) and "epoch" in blob and isinstance(blob["epoch"], (int, float)):
-        start_epoch = int(blob["epoch"])
-
-    try:
-        _flex_load_state_dict(model, blob)
-    except Exception as e:
-        print(f"⚠️  Failed to load model weights from checkpoint: {e}")
-
-    # move to device (safe if already there)
-    return model.to(device), start_epoch
-
-
 def _build_model_for_cfg(cfg, example_spectrum, vocab_size, max_stack_depth, token_meta, device: str) -> torch.nn.Module:
     model = build_model(
         model_type=getattr(cfg, "ARCH", getattr(cfg, "OL_MODEL", "dit")),
@@ -109,20 +52,9 @@ def _build_model_for_cfg(cfg, example_spectrum, vocab_size, max_stack_depth, tok
         eos_idx=token_meta["eos_idx"],
         device=device,
     )
-    # sampling knobs (optional)
-    temp = float(getattr(cfg, "TEMPERATURE", 0.0))
-    top_k = int(getattr(cfg, "TOP_K", 0))
-    top_p = float(getattr(cfg, "TOP_P", 0.0))
-    if hasattr(model, "set_sampling"):
-        model.set_sampling(temperature=temp, top_k=top_k, top_p=top_p)
+    # remove the local temp/top_k/top_p extraction and do:
+    apply_sampling_from_sources(model, args=args, cfg=cfg)
     return model
-
-
-def _ensure_dirs(cfg):
-    # Only create PATH_SAVED if present
-    path_saved = getattr(cfg, "PATH_SAVED", None)
-    if path_saved:
-        os.makedirs(path_saved, exist_ok=True)
 
 
 # ----------------------------- core API -----------------------------
@@ -171,8 +103,17 @@ def run_inference(
 
     # Load weights (ckpt argument wins; else try cfg.PATH_CHKPT)
     ckpt_path = ckpt or getattr(cfg, "PATH_CHKPT", None)
-    model, _ = _maybe_load_checkpoint(model, ckpt_path, device)
-
+    ckpt_path_best = ckpt_path.split(".")[0] + '_best.' + ckpt_path.split(".")[1]
+    if ckpt_path_best and os.path.exists(ckpt_path_best):
+        print(f"📦 Loading checkpoint: {ckpt_path_best}")
+        _, _ = load_checkpoint(ckpt_path_best, model, map_location="cpu", strict=True)
+    elif ckpt_path and os.path.exists(ckpt_path):
+        print(f"📦 Loading checkpoint: {ckpt_path}")
+        _, _ = load_checkpoint(ckpt_path, model, map_location="cpu", strict=True)
+    else:
+        print("No valid ckpt path set")
+    model = model.to(device)
+    
     # Optional TMM context
     tmm_ctx = None
     mode = (validsim or "NOSIM").upper()
@@ -203,9 +144,11 @@ def run_inference(
 
     # Persist per-example results on rank 0 (or single-process)
     if (not is_ddp) or rank == 0:
-        _ensure_dirs(cfg)
+        path_saved = getattr(cfg, "PATH_SAVED", None)
+        if path_saved:
+            os.makedirs(path_saved, exist_ok=True)
         try:
-            save_JSONPICKLE(cfg.PATH_SAVED, out.get("results", []), f"results_{getattr(cfg,'RUN_NAME','infer')}")
+            save_JSON(cfg.PATH_SAVED, out.get("results", []), f"results_{getattr(cfg,'RUN_NAME','infer')}")
             print(f"💾 Saved {len(out.get('results', []))} records to {cfg.PATH_SAVED}")
         except Exception as e:
             print(f"⚠️  Could not save results JSON: {e}")

@@ -7,10 +7,12 @@ import torch
 import tqdm
 
 import cli as cli
+from utils import apply_sampling_from_sources, save_JSON
 from utils_runner import setup_run, _is_ddp
 from utils_data import make_loader, SpectraDataset
 from utils_model import build_model
-from utils_eval import build_tmm_context, token_accuracy, validate_model
+from utils_eval import token_accuracy, validate_model
+from call_tmm_fast import build_tmm_context
 
 
 # ------------------------------- training loop -------------------------------
@@ -66,7 +68,11 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
         eos_idx=eos_idx,
         device=device,
     ).to(device)
+    sampling_cfg = apply_sampling_from_sources(model, args=args, cfg=cfg)
+    if rank == 0:
+        print(f"[sampling] {sampling_cfg}")
 
+    
     # --- DDP wrapper (only when actually in DDP) ---
     is_ddp = _is_ddp()
     if is_ddp and torch.cuda.is_available():
@@ -87,24 +93,50 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
     train_acc        = torch.zeros(E)
     valid_acc          = torch.zeros(E)
     valid_MAE          = torch.ones(E) * np.inf
-    start_epoch = 0
+    # start_epoch = 0
 
     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
+    # best_valid_acc = 0.0
+    # best_valid_mae = np.inf
+
+    # if os.path.exists(checkpoint):
+    #     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    #     start_epoch = int(state.get("epoch", -1)) + 1
+    #     # The file stores {'model_state', 'optimizer_state', ...}; load back
+    #     if "model_state" in state:
+    #         model.load_state_dict(state["model_state"], strict=True)
+    #     if "optimizer_state" in state:
+    #         optimizer.load_state_dict(state["optimizer_state"])
+    #     if "train_losses" in state: train_losses = state["train_losses"]
+    #     if "train_acc" in state:    train_acc    = state["train_acc"]
+    #     if "valid_acc" in state:      valid_acc      = state["valid_acc"]
+    #     if "valid_MAE" in state:      valid_MAE      = state["valid_MAE"]
+    #     # robust bests
+    #     acc_arr = valid_acc.detach().cpu().numpy()
+    #     if np.any(np.isfinite(acc_arr)):
+    #         best_valid_acc = float(np.nanmax(acc_arr[np.isfinite(acc_arr)]))
+    #     mae_arr = valid_MAE.detach().cpu().numpy()
+    #     if np.any(np.isfinite(mae_arr)):
+    #         best_valid_mae = float(np.nanmin(mae_arr[np.isfinite(mae_arr)]))
+    
+    
+    from utils import load_checkpoint, save_checkpoint
+
     best_valid_acc = 0.0
     best_valid_mae = np.inf
-
+    start_epoch = 0
+    
     if os.path.exists(checkpoint):
-        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        start_epoch = int(state.get("epoch", -1)) + 1
-        # The file stores {'model_state', 'optimizer_state', ...}; load back
-        if "model_state" in state:
-            model.load_state_dict(state["model_state"], strict=True)
-        if "optimizer_state" in state:
-            optimizer.load_state_dict(state["optimizer_state"])
-        if "train_losses" in state: train_losses = state["train_losses"]
-        if "train_acc" in state:    train_acc    = state["train_acc"]
-        if "valid_acc" in state:      valid_acc      = state["valid_acc"]
-        if "valid_MAE" in state:      valid_MAE      = state["valid_MAE"]
+        start_epoch, blob = load_checkpoint(
+            checkpoint, model, optimizer=optimizer, map_location="cpu", strict=True
+        )
+        start_epoch = start_epoch or 0
+        # recover metric buffers if present
+        train_losses = blob.get("train_losses", train_losses)
+        train_acc    = blob.get("train_acc", train_acc)
+        valid_acc    = blob.get("valid_acc", valid_acc)
+        valid_MAE    = blob.get("valid_MAE", valid_MAE)
+    
         # robust bests
         acc_arr = valid_acc.detach().cpu().numpy()
         if np.any(np.isfinite(acc_arr)):
@@ -112,6 +144,8 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
         mae_arr = valid_MAE.detach().cpu().numpy()
         if np.any(np.isfinite(mae_arr)):
             best_valid_mae = float(np.nanmin(mae_arr[np.isfinite(mae_arr)]))
+    
+    
 
     # ------------------------------ epochs ------------------------------
     for epoch in range(start_epoch, cfg.EPOCHS):
@@ -223,8 +257,7 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
         if rank == 0 and 'results' in val_out:
             os.makedirs(cfg.PATH_SAVED, exist_ok=True)
             out_name = f"results_{cfg.RUN_NAME}"
-            from utils import save_JSONPICKLE
-            save_JSONPICKLE(cfg.PATH_SAVED, val_out['results'], out_name)
+            save_JSON(cfg.PATH_SAVED, val_out['results'], out_name)
             print(f"💾 [rank 0] Saved {len(val_out['results'])} samples → …/{out_name}.json")
             if mode == "TMM_FAST":
                 print(f" min valid MAE: {float(torch.min(valid_MAE).item()) if torch.isfinite(valid_MAE).any() else valid_MAE[epoch]:.4f}")
@@ -237,31 +270,39 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
 
         # ------------------------------ checkpointing ------------------------------
         if not args.notrain and rank == 0:
-            os.makedirs(cfg.PATH_SAVED, exist_ok=True)
-            state = {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "train_losses": train_losses,
-                "train_acc": train_acc,
-                "valid_acc": valid_acc,
-                "valid_MAE": valid_MAE,
-            }
-
             if not args.validsim:
-                # accuracy-based checkpointing
-                cur_best = float(np.nanmax(valid_acc.numpy()))
-                if cur_best >= best_valid_acc:
-                    best_valid_acc = cur_best
-                    print(f"Checkpoint saved (ACC): best={best_valid_acc:.6f} [epoch {epoch}]")
-                    torch.save(state, checkpoint)
+                # accuracy-based checkpointing (higher is better); 
+                # use small epsilon to force strict improvement
+                new_acc = float(valid_acc[epoch].item())
+                if new_acc > (best_valid_acc + 1e-7):
+                    print(f"Checkpoint saved (ACC): new={new_acc:.6f} < best={best_valid_acc:.6f} [epoch {epoch}]")
+                    best_valid_mae = new_acc
+                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
+                else:
+                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
             else:
-                # MAE-based checkpointing (lower is better); use small epsilon to force strict improvement
+                # MAE-based checkpointing (lower is better); 
+                # use small epsilon to force strict improvement
                 new_mae = float(valid_MAE[epoch].item())
                 if new_mae < (best_valid_mae - 1e-7):
                     print(f"Checkpoint saved (MAE): new={new_mae:.6f} < best={best_valid_mae:.6f} [epoch {epoch}]")
                     best_valid_mae = new_mae
-                    torch.save(state, checkpoint)
+                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
+                else:
+                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
+            
+            os.makedirs(cfg.PATH_SAVED, exist_ok=True)
+            save_checkpoint(
+                checkpoint,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                train_losses=train_losses,
+                train_acc=train_acc,
+                valid_acc=valid_acc,
+                valid_MAE=valid_MAE,
+                extra={"sampling": sampling_cfg},
+            )
 
 
 # -------------------------------- entry point --------------------------------

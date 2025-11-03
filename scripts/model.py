@@ -256,7 +256,6 @@ class OptoLlama(torch.nn.Module):
         self.sample_temperature = float(temperature)
         self.sample_top_k = int(top_k)
         self.sample_top_p = float(top_p)
-        print(self.sample_temperature,self.sample_top_k)
 
     def _top_k_top_p_filtering(self, logits: torch.Tensor, top_k: int, top_p: float, filter_value: float = -float('inf')) -> torch.Tensor:
         logits = torch.nan_to_num(logits, neginf=-1e9, posinf=1e9)  # guard

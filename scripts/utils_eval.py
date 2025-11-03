@@ -1,6 +1,6 @@
-from typing import NamedTuple, List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 import torch
-from call_tmm_fast import _build_tmm
+from call_tmm_fast import TMMContext
 
 # ---------------------- metrics & helpers ----------------------
 def token_accuracy(stacks, preds, eos, pad, msk):
@@ -52,27 +52,6 @@ def masked_mae(x, y):
     num = (torch.abs(x - torch.nan_to_num(y))).where(valid, torch.zeros_like(x)).sum(dim=1).sum(dim=1)
     den = valid.sum(dim=1).sum(dim=1).clamp_min(1)
     return num / den
-
-
-class TMMContext(NamedTuple):
-    tmm: torch.nn.Module          # TMMSpectrum
-    wl: torch.Tensor              # [W] complex128
-    theta: torch.Tensor           # [] or [1] complex128
-
-
-@torch.no_grad()
-def build_tmm_context(*, cfg, idx_to_token, device) -> TMMContext:
-    """
-    Centralized TMM init, identical to how you do it in train/MC.
-    """
-    tmm, wl_tensor, theta = _build_tmm(
-        incidence_angle=cfg.INCIDENCE_ANGLE,
-        device=device,
-        wavelengths=cfg.WAVELENGTHS,
-        path_materials=cfg.PATH_MATERIALS,
-        idx_to_token=idx_to_token,
-    )
-    return TMMContext(tmm, wl_tensor, theta)
 
 
 def _simulate_spectra_ids(
