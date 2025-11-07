@@ -2,8 +2,9 @@
 import json, csv, math
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
-# ---------- core helpers ----------
 
 def _cfg_grid_or_default(cfg=None, json_obj=None):
     """
@@ -24,28 +25,9 @@ def _cfg_grid_or_default(cfg=None, json_obj=None):
         return wl
     return np.arange(300.0, 2000.0 + 1e-9, 10.0, dtype=float)
 
+
 def _nonneg(x):
     return np.maximum(x, 0.0)
-
-def normalize_rat(R, A, T, normalize_to=1.0, fallback=(0.0, 0.0, 1.0)):
-    """
-    Enforce non-negativity and normalize per wavelength so R+A+T = normalize_to.
-    If the sum is 0, use fallback (defaults to T=1).
-    """
-    R = _nonneg(np.asarray(R, dtype=float))
-    A = _nonneg(np.asarray(A, dtype=float))
-    T = _nonneg(np.asarray(T, dtype=float))
-    total = R + A + T
-    eps = 1e-12
-    mask = total > eps
-    scale = np.zeros_like(total)
-    scale[mask] = normalize_to / total[mask]
-    R[mask] *= scale[mask]
-    A[mask] *= scale[mask]
-    T[mask] *= scale[mask]
-    if np.any(~mask):
-        R[~mask], A[~mask], T[~mask] = fallback
-    return R.astype(np.float32), A.astype(np.float32), T.astype(np.float32)
 
 
 def normalize_rat_fill_crop(R, A, T, target=1.0):
@@ -99,8 +81,6 @@ def normalize_rat_fill_crop(R, A, T, target=1.0):
     return R.astype(np.float32), A.astype(np.float32), T.astype(np.float32)
 
 
-import torch.nn.functional as F
-
 def _ensure_3W(x: torch.Tensor):
     """
     Accept [3,W], [W,3], [B,3,W], or [B,W,3]; return (x_[...,3,W], was_permuted)
@@ -116,18 +96,21 @@ def _ensure_3W(x: torch.Tensor):
         elif x.size(2) == 3:
             return x.permute(0, 2, 1).contiguous(), True
     raise ValueError(f"Expected shape [...,3,W] or [...,W,3], got {tuple(x.shape)}")
-    
+
+
 def _wl_mask(wavelengths, wl_min: float, wl_max: float, device):
     if wavelengths is None:
         return None
     wl = torch.as_tensor(wavelengths, dtype=torch.float32, device=device)
     return (wl >= float(wl_min)) & (wl <= float(wl_max))
 
+
 def _boxcar_kernel(win: int, device):
     win = max(1, int(win))
     if win % 2 == 0: win += 1
     k = torch.ones(win, device=device, dtype=torch.float32) / float(win)
     return k
+
 
 def _gauss_kernel(win: int, sigma: float, device):
     win = max(1, int(win))
@@ -137,6 +120,7 @@ def _gauss_kernel(win: int, sigma: float, device):
     k = torch.exp(-0.5 * (xs / max(1e-6, float(sigma)))**2)
     k = k / k.sum().clamp_min(1e-6)
     return k
+
 
 def _smooth_1d(x_3w: torch.Tensor, method: str, win: int, sigma: float) -> torch.Tensor:
     # x_3w: [...,3,W] -> do depthwise 1D conv along last dim
@@ -155,6 +139,7 @@ def _smooth_1d(x_3w: torch.Tensor, method: str, win: int, sigma: float) -> torch
     x = x[:, :, :W]
     return x.squeeze(0) if orig_dim == 2 else x
 
+
 def _parse_order(order_str: str):
     order_str = (order_str or "R>A>T").upper()
     mapping = {'R':0, 'A':1, 'T':2}
@@ -162,6 +147,7 @@ def _parse_order(order_str: str):
     rest = [i for i in (0,1,2) if i not in seq]
     seq.extend(rest)
     return tuple(seq[:3])
+
 
 def _redistribute_mismatch(x: torch.Tensor, order: str, target_sum: float = 1.0):
     """
@@ -195,6 +181,7 @@ def _redistribute_mismatch(x: torch.Tensor, order: str, target_sum: float = 1.0)
 
     x = x.clamp_(0.0, 1.0)
     return x.squeeze(0) if orig_dim == 2 else x
+
 
 def _apply_noise(x: torch.Tensor, noise_cfg: dict, wavelengths):
     if not noise_cfg or not noise_cfg.get("enabled", False):
@@ -231,6 +218,7 @@ def _apply_noise(x: torch.Tensor, noise_cfg: dict, wavelengths):
 
     return x.squeeze(0) if orig_dim == 2 else x
 
+
 def _apply_smoothing(x: torch.Tensor, smooth_cfg: dict):
     if not smooth_cfg or not smooth_cfg.get("enabled", False):
         return x
@@ -239,24 +227,27 @@ def _apply_smoothing(x: torch.Tensor, smooth_cfg: dict):
     win    = int(smooth_cfg.get("win", 5))
     sigma  = float(smooth_cfg.get("sigma", 1.0))
     return _smooth_1d(x, method, win, sigma)
-# ------------------------------------------------------------------------------
 
 
 def _fwhm_to_sigma(fwhm):
     return float(fwhm) / (2.0 * math.sqrt(2.0 * math.log(2.0)))
 
+
 def _gaussian(x, center, fwhm, amplitude):
     sigma = _fwhm_to_sigma(fwhm)
     return float(amplitude) * np.exp(-0.5 * ((x - float(center)) / sigma) ** 2)
+
 
 def _lorentzian(x, center, fwhm, amplitude):
     gamma = float(fwhm) / 2.0
     return float(amplitude) * (gamma**2) / ((x - float(center))**2 + gamma**2)
 
+
 def _supergaussian(x, center, fwhm, amplitude, order=4):
     # supergaussian: exp(-0.5 * ((x-c)/sigma)^(2*order))
     sigma = _fwhm_to_sigma(fwhm)
     return float(amplitude) * np.exp(-0.5 * np.abs((x - float(center)) / sigma) ** (2 * int(order)))
+
 
 def _box(x, lo, hi, value):
     lo, hi = float(lo), float(hi)
@@ -264,6 +255,7 @@ def _box(x, lo, hi, value):
     mask = (x >= lo) & (x <= hi)
     y[mask] = float(value)
     return y
+
 
 def _linear_ramp(x, lo, hi, start, end):
     lo, hi = float(lo), float(hi)
@@ -274,6 +266,7 @@ def _linear_ramp(x, lo, hi, start, end):
         t = (x[m] - lo) / (hi - lo)
         y[m] = start + t * (end - start)
     return y
+
 
 def _apply_combine(dst, src, how="overwrite"):
     how = (how or "overwrite").lower()
@@ -288,6 +281,7 @@ def _apply_combine(dst, src, how="overwrite"):
     if how == "multiply":
         return dst * src
     raise ValueError(f"Unknown combine policy: {how}")
+
 
 def _apply_json_edit(wl, arr, edit, combine="overwrite"):
     """
@@ -343,82 +337,6 @@ def _apply_json_edit(wl, arr, edit, combine="overwrite"):
     out[mask] = combined[mask]
     return out
 
-# ---------- CSV loader ----------
-
-def _load_csv(path, wl_grid, defaults=(0.0, 1.0, 0.0)):
-    """
-    Load sparse numeric samples from CSV with columns: wavelength_nm,R,T,A
-    Interpolate onto wl_grid; missing columns fall back to defaults.
-    """
-    data = {"wavelength_nm": [], "R": [], "T": [], "A": []}
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        cols = [c.strip() for c in reader.fieldnames or []]
-        if "wavelength_nm" not in cols:
-            raise ValueError("CSV must contain a 'wavelength_nm' column.")
-        for row in reader:
-            w = float(row["wavelength_nm"])
-            data["wavelength_nm"].append(w)
-            for ch in ("R", "T", "A"):
-                v = row.get(ch, "")
-                data[ch].append(float(v) if (v is not None and v.strip() != "") else np.nan)
-
-    if len(data["wavelength_nm"]) == 0:
-        raise ValueError("CSV appears empty.")
-
-    w = np.asarray(data["wavelength_nm"], dtype=float)
-    order = np.argsort(w)
-    w = w[order]
-
-    def interp_or_default(series, default_val):
-        y = np.asarray(series, dtype=float)[order]
-        # mask valid samples
-        mask = np.isfinite(y)
-        if np.count_nonzero(mask) >= 2:
-            return np.interp(wl_grid, w[mask], y[mask])
-        elif np.count_nonzero(mask) == 1:
-            # constant extrapolation from the single known point
-            return np.full_like(wl_grid, y[mask][0], dtype=float)
-        else:
-            return np.full_like(wl_grid, float(default_val), dtype=float)
-
-    R = interp_or_default(data["R"], defaults[0])
-    T = interp_or_default(data["T"], defaults[1])
-    A = interp_or_default(data["A"], defaults[2])
-    return R, A, T
-
-# ---------- JSON loader ----------
-
-def _load_json(path, cfg=None):
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-    wl = _cfg_grid_or_default(cfg, obj)
-
-    # defaults
-    d = obj.get("defaults", {}) or {}
-    R = np.full_like(wl, float(d.get("R", 0.0)), dtype=float)
-    A = np.full_like(wl, float(d.get("A", 0.0)), dtype=float)
-    T = np.full_like(wl, float(d.get("T", 1.0)), dtype=float)
-
-    combine = (obj.get("combine") or "overwrite").lower()
-    edits = obj.get("edits", []) or []
-    for ed in edits:
-        target = ed.get("target", "").upper()
-        if target not in ("R", "A", "T"):
-            raise ValueError(f"Edit missing/invalid 'target': {ed}")
-        if target == "R":
-            R = _apply_json_edit(wl, R, ed, combine)
-        elif target == "A":
-            A = _apply_json_edit(wl, A, ed, combine)
-        else:
-            T = _apply_json_edit(wl, T, ed, combine)
-
-    # normalize_to = float(obj.get("normalize_to", 1.0))
-    # Enforce non-negativity and normalize
-    # R, A, T = normalize_rat(R, A, T, normalize_to=normalize_to, fallback=(0.0, 0.0, normalize_to))
-    R, A, T = normalize_rat_fill_crop(R, A, T, target=float(obj.get("normalize_to", 1.0)))
-    return wl, R, A, T, obj
-
 
 def load_spectra_from_json_or_csv(
     path: str,
@@ -430,7 +348,6 @@ def load_spectra_from_json_or_csv(
     smooth_cfg=None,
     mismatch_order=None,
 ):
-    import json, csv
     import numpy as np
     import torch
 
@@ -548,12 +465,7 @@ def load_spectra_from_json_or_csv(
         return x
 
 
-# %%
-
 # --- single-spec dataset for interactive inference ---------------------------
-import torch
-from torch.utils.data import Dataset, DataLoader
-
 class _SingleSpecDataset(Dataset):
     """
     Minimal dataset to feed a single [W,3] spectrum into validate_model.
