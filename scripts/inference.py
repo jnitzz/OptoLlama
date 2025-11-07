@@ -45,7 +45,7 @@ def normalize_rat(R, A, T, normalize_to=1.0, fallback=(0.0, 0.0, 1.0)):
     T[mask] *= scale[mask]
     if np.any(~mask):
         R[~mask], A[~mask], T[~mask] = fallback
-    return R, A, T
+    return R.astype(np.float32), A.astype(np.float32), T.astype(np.float32)
 
 
 def normalize_rat_fill_crop(R, A, T, target=1.0):
@@ -96,13 +96,9 @@ def normalize_rat_fill_crop(R, A, T, target=1.0):
             R[still] -= cut
             over[still] -= cut
         
-    return R, A, T
+    return R.astype(np.float32), A.astype(np.float32), T.astype(np.float32)
 
 
-# ---------- shapes for JSON "edits" ----------
-
-# ---- signal-ops (local, no external deps) -----------------------------------
-import torch
 import torch.nn.functional as F
 
 def _ensure_3W(x: torch.Tensor):
@@ -120,7 +116,7 @@ def _ensure_3W(x: torch.Tensor):
         elif x.size(2) == 3:
             return x.permute(0, 2, 1).contiguous(), True
     raise ValueError(f"Expected shape [...,3,W] or [...,W,3], got {tuple(x.shape)}")
-
+    
 def _wl_mask(wavelengths, wl_min: float, wl_max: float, device):
     if wavelengths is None:
         return None
@@ -167,18 +163,20 @@ def _parse_order(order_str: str):
     seq.extend(rest)
     return tuple(seq[:3])
 
-def _redistribute_mismatch(x: torch.Tensor, order: str):
+def _redistribute_mismatch(x: torch.Tensor, order: str, target_sum: float = 1.0):
     """
-    x: [...,3,W] with values in [0,1], enforce per-W sum≈1
+    x: [...,3,W] with values in [0,1]. Enforce per-W sum≈target_sum
+    by distributing residual in the given priority order.
     """
     x, _ = _ensure_3W(x)
     orig_dim = x.dim()
-    if orig_dim == 2:  # [3,W] -> add B
-        x = x.unsqueeze(0)
+    if orig_dim == 2:
+        x = x.unsqueeze(0)  # [1,3,W]
     B, C, W = x.shape
     pri = _parse_order(order)
-    total = x.sum(dim=1, keepdim=True)  # [B,1,W]
-    res = 1.0 - total
+    total = x.sum(dim=1, keepdim=True)                  # [B,1,W]
+    res = float(target_sum) - total                     # +: add, -: remove
+
     for idx in pri:
         ch = x[:, idx:idx+1, :]
         if (res.abs() < 1e-12).all():
@@ -194,6 +192,7 @@ def _redistribute_mismatch(x: torch.Tensor, order: str):
         ch = ch + rem
         res = res - rem
         x[:, idx:idx+1, :] = ch
+
     x = x.clamp_(0.0, 1.0)
     return x.squeeze(0) if orig_dim == 2 else x
 
@@ -296,6 +295,14 @@ def _apply_json_edit(wl, arr, edit, combine="overwrite"):
     """
     edit = dict(edit)  # shallow copy
     typ = edit.get("type")
+    # Optional wavelength mask
+    rng = edit.get("range", None)
+    if rng and len(rng) == 2:
+        lo, hi = float(rng[0]), float(rng[1])
+        mask = (wl >= lo) & (wl <= hi)
+    else:
+        mask = np.ones_like(wl, dtype=bool)
+        
     if "at" in edit and "value" in edit and typ is None:
         # point assignment
         x = float(edit["at"])
@@ -330,7 +337,11 @@ def _apply_json_edit(wl, arr, edit, combine="overwrite"):
     else:
         raise ValueError(f"Unsupported edit type: {typ}")
 
-    return _apply_combine(arr, tgt, combine)
+    # Apply combine, but only inside mask; outside keep original
+    out = arr.copy()
+    combined = _apply_combine(arr, tgt, combine)
+    out[mask] = combined[mask]
+    return out
 
 # ---------- CSV loader ----------
 
@@ -386,8 +397,8 @@ def _load_json(path, cfg=None):
     # defaults
     d = obj.get("defaults", {}) or {}
     R = np.full_like(wl, float(d.get("R", 0.0)), dtype=float)
-    T = np.full_like(wl, float(d.get("T", 0.0)), dtype=float)
-    A = np.full_like(wl, float(d.get("A", 1.0)), dtype=float)
+    A = np.full_like(wl, float(d.get("A", 0.0)), dtype=float)
+    T = np.full_like(wl, float(d.get("T", 1.0)), dtype=float)
 
     combine = (obj.get("combine") or "overwrite").lower()
     edits = obj.get("edits", []) or []
@@ -407,152 +418,6 @@ def _load_json(path, cfg=None):
     # R, A, T = normalize_rat(R, A, T, normalize_to=normalize_to, fallback=(0.0, 0.0, normalize_to))
     R, A, T = normalize_rat_fill_crop(R, A, T, target=float(obj.get("normalize_to", 1.0)))
     return wl, R, A, T, obj
-
-
-# ---- signal-ops (local, no external deps) -----------------------------------
-import torch.nn.functional as F
-
-def _ensure_3W(x: torch.Tensor):
-    """
-    Accept [3,W], [W,3], [B,3,W], or [B,W,3]; return (x_[...,3,W], was_permuted)
-    """
-    if x.dim() == 2:
-        if x.size(0) == 3:
-            return x, False
-        elif x.size(1) == 3:
-            return x.permute(1, 0).contiguous(), True
-    elif x.dim() == 3:
-        if x.size(1) == 3:
-            return x, False
-        elif x.size(2) == 3:
-            return x.permute(0, 2, 1).contiguous(), True
-    raise ValueError(f"Expected shape [...,3,W] or [...,W,3], got {tuple(x.shape)}")
-
-def _wl_mask(wavelengths, wl_min: float, wl_max: float, device):
-    if wavelengths is None:
-        return None
-    wl = torch.as_tensor(wavelengths, dtype=torch.float32, device=device)
-    return (wl >= float(wl_min)) & (wl <= float(wl_max))
-
-def _boxcar_kernel(win: int, device):
-    win = max(1, int(win))
-    if win % 2 == 0: win += 1
-    k = torch.ones(win, device=device, dtype=torch.float32) / float(win)
-    return k
-
-def _gauss_kernel(win: int, sigma: float, device):
-    win = max(1, int(win))
-    if win % 2 == 0: win += 1
-    r = (win - 1) // 2
-    xs = torch.arange(-r, r+1, device=device, dtype=torch.float32)
-    k = torch.exp(-0.5 * (xs / max(1e-6, float(sigma)))**2)
-    k = k / k.sum().clamp_min(1e-6)
-    return k
-
-def _smooth_1d(x_3w: torch.Tensor, method: str, win: int, sigma: float) -> torch.Tensor:
-    # x_3w: [...,3,W] -> do depthwise 1D conv along last dim
-    orig_dim = x_3w.dim()
-    if orig_dim == 2:
-        x_3w = x_3w.unsqueeze(0)  # [1,3,W]
-    _, C, W = x_3w.shape
-    device = x_3w.device
-    if method.lower() == "gaussian":
-        k = _gauss_kernel(win, sigma, device)
-    else:
-        k = _boxcar_kernel(win, device)
-    weight = k.view(1, 1, -1).repeat(C, 1, 1)  # [C,1,K]
-    x = F.pad(x_3w, (k.numel()//2, k.numel()//2), mode="reflect")
-    x = F.conv1d(x, weight, groups=C)
-    x = x[:, :, :W]
-    return x.squeeze(0) if orig_dim == 2 else x
-
-def _parse_order(order_str: str):
-    order_str = (order_str or "R>A>T").upper()
-    mapping = {'R':0, 'A':1, 'T':2}
-    seq = [mapping[c.strip()] for c in order_str.split('>') if c.strip() in mapping]
-    rest = [i for i in (0,1,2) if i not in seq]
-    seq.extend(rest)
-    return tuple(seq[:3])
-
-def _redistribute_mismatch(x: torch.Tensor, order: str, target_sum: float = 1.0):
-    """
-    x: [...,3,W] with values in [0,1]. Enforce per-W sum≈target_sum
-    by distributing residual in the given priority order.
-    """
-    x, _ = _ensure_3W(x)
-    orig_dim = x.dim()
-    if orig_dim == 2:
-        x = x.unsqueeze(0)  # [1,3,W]
-    B, C, W = x.shape
-    pri = _parse_order(order)
-    total = x.sum(dim=1, keepdim=True)                  # [B,1,W]
-    res = float(target_sum) - total                     # +: add, -: remove
-
-    for idx in pri:
-        ch = x[:, idx:idx+1, :]
-        if (res.abs() < 1e-12).all():
-            break
-        # add
-        add_capacity = (1.0 - ch).clamp_min(0.0)
-        add = torch.sign(res) * torch.minimum(res.clamp_min(0.0), add_capacity)
-        ch = ch + add
-        res = res - add
-        # remove
-        rem_capacity = ch.clamp_max(1.0)
-        rem = -torch.minimum((-res).clamp_min(0.0), rem_capacity)
-        ch = ch + rem
-        res = res - rem
-        x[:, idx:idx+1, :] = ch
-
-    x = x.clamp_(0.0, 1.0)
-    return x.squeeze(0) if orig_dim == 2 else x
-
-
-def _apply_noise(x: torch.Tensor, noise_cfg: dict, wavelengths):
-    if not noise_cfg or not noise_cfg.get("enabled", False):
-        return x
-    x, _ = _ensure_3W(x)
-    orig_dim = x.dim()
-    if orig_dim == 2:
-        x = x.unsqueeze(0)  # [1,3,W]
-    B, C, W = x.shape
-    device = x.device
-
-    sigma_abs = float(noise_cfg.get("sigma_abs", 0.0))
-    sigma_rel = float(noise_cfg.get("sigma_rel", 0.0))
-    per_ch = noise_cfg.get("per_channel", [1.0, 1.0, 1.0])
-    per_ch = torch.tensor(per_ch, dtype=torch.float32, device=device).view(1, C, 1)
-
-    wl_min = noise_cfg.get("wl_min", None)
-    wl_max = noise_cfg.get("wl_max", None)
-    mask = None
-    if wl_min is not None and wl_max is not None:
-        mask = _wl_mask(wavelengths, wl_min, wl_max, device) if wavelengths is not None else None
-
-    eps = torch.randn_like(x) * (sigma_abs + sigma_rel * x)
-    eps = eps * per_ch
-
-    if mask is not None:
-        m = mask.view(1, 1, W)
-        x = torch.where(m, x + eps, x)
-    else:
-        x = x + eps
-
-    if noise_cfg.get("clip_0_1", True):
-        x = x.clamp_(0.0, 1.0)
-
-    return x.squeeze(0) if orig_dim == 2 else x
-
-def _apply_smoothing(x: torch.Tensor, smooth_cfg: dict):
-    if not smooth_cfg or not smooth_cfg.get("enabled", False):
-        return x
-    x, _ = _ensure_3W(x)
-    method = smooth_cfg.get("method", "gaussian")
-    win    = int(smooth_cfg.get("win", 5))
-    sigma  = float(smooth_cfg.get("sigma", 1.0))
-    return _smooth_1d(x, method, win, sigma)
-# ------------------------------------------------------------------------------
-
 
 
 def load_spectra_from_json_or_csv(
@@ -601,40 +466,61 @@ def load_spectra_from_json_or_csv(
             defaults = data.get("defaults", {})
             R0 = float(defaults.get("R", 0.0))
             A0 = float(defaults.get("A", 0.0))
-            T0 = float(defaults.get("T", 0.0))
+            T0 = float(defaults.get("T", 1.0))
             base = np.stack([np.full(W, R0, np.float32),
                              np.full(W, A0, np.float32),
                              np.full(W, T0, np.float32)], axis=0)  # [3,W]
 
             # --- apply edits (optional)
-            # supported edit fields:
-            #   - "range": [wl_min, wl_max]  (inclusive)
-            #   - absolute overrides: "R", "A", "T" (scalars)
-            #   - additive changes: "+R", "+A", "+T" (scalars)
-            #   - multiplicative: "*R", "*A", "*T" (scalars)
+            # Supported edit fields:
+            #   range: [wl_min, wl_max] (inclusive; honoured for both scalars and procedural types)
+            #   absolute overrides: "R", "A", "T" (scalars)
+            #   additive changes:   "+R", "+A", "+T" (scalars)
+            #   multiplicative:     "*R", "*A", "*T" (scalars)
+            #   procedural:         {"target":"R|A|T" or ["R","A",...], "type":"gaussian_peak|lorentzian_peak|supergaussian_peak|box|linear_ramp", ...}
+            # Combine policy can be given per-edit via "combine" or as file default via top-level "combine" / "combine_policy".
+            file_combine = (data.get("combine_policy")
+                            or data.get("combine")
+                            or "overwrite")
             for e in data.get("edits", []):
                 if not isinstance(e, dict):
                     continue
-                # mask by wavelength range
-                mask = np.ones(W, dtype=bool)
+                # Scalar channel edits (R/A/T, +R, *R etc.)
+                did_scalar = False
                 rng = e.get("range", None)
                 if rng and len(rng) == 2:
                     lo, hi = float(rng[0]), float(rng[1])
                     mask = (wl >= lo) & (wl <= hi)
-
+                else:
+                    mask = np.ones(W, dtype=bool)
                 for ch_name, idx in (("R",0), ("A",1), ("T",2)):
                     if ch_name in e:
-                        base[idx, mask] = float(e[ch_name])
+                        base[idx, mask] = float(e[ch_name]); did_scalar = True
                     if ("+"+ch_name) in e:
-                        base[idx, mask] = base[idx, mask] + float(e["+"+ch_name])
+                        base[idx, mask] = base[idx, mask] + float(e["+"+ch_name]); did_scalar = True
                     if ("*"+ch_name) in e:
-                        base[idx, mask] = base[idx, mask] * float(e["*"+ch_name])
+                        base[idx, mask] = base[idx, mask] * float(e["*"+ch_name]); did_scalar = True
+
+                # Procedural edit (type/target)
+                if (not did_scalar) and ("type" in e):
+                    # allow single string or list for target(s)
+                    targets = e.get("target", "R")
+                    if isinstance(targets, str):
+                        targets = [targets]
+                    combine_policy = e.get("combine", file_combine) or "overwrite"
+                    for tname in targets:
+                        tname = tname.upper()
+                        if tname not in ("R","A","T"):
+                            continue
+                        idx = {"R":0,"A":1,"T":2}[tname]
+                        base[idx] = _apply_json_edit(wl, base[idx], e, combine=combine_policy)
 
             x = torch.from_numpy(base)  # [3,W]
 
-            # optional normalize_to from file (uses the same ordered-redistribution)
+            # Normalize using fill-crop (fill deficits into T, crop excess from T then A then R)
             target_sum = float(data.get("normalize_to", 1.0))
-            x = _redistribute_mismatch(x, morder, target_sum=target_sum)
+            Rn, An, Tn = normalize_rat_fill_crop(base[0], base[1], base[2], target=target_sum)
+            x = torch.from_numpy(np.stack([Rn, An, Tn], axis=0).astype(np.float32))
 
     else:
         # CSV path unchanged; adapt to your CSV layout as you already had
@@ -648,8 +534,11 @@ def load_spectra_from_json_or_csv(
     # --- final processing: noise -> smoothing -> enforce sum to 1 with order
     x = _apply_noise(x, ncfg, wl)
     x = _apply_smoothing(x, scfg)
+    # Keep a small final correction, but DO NOT re-create a zero-baseline fill into R
+    # If you want to be extra safe, prefer filling into T by default:
+    #   (set cfg.MISMATCH_FILL_ORDER = "T>A>R")
     x = _redistribute_mismatch(x, morder, target_sum=1.0)
-
+    x = x.to(torch.float32)
     # --- output shape
     if expect_shape.lower() in ("3xw", "chw"):
         return x  # [3,W]

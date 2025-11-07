@@ -236,7 +236,7 @@ class OptoLlama(torch.nn.Module):
         
         return predicted_stacks
 
-    def _train(self, spectra: torch.Tensor, stacks: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    def _train(self, spectra: torch.Tensor, stacks: torch.Tensor) -> (torch.Tensor):
         # sample time points
         timesteps = self._sample_t(stacks)
 

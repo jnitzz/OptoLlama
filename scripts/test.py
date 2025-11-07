@@ -52,7 +52,7 @@ def _build_model_for_cfg(cfg, example_spectrum, vocab_size, max_stack_depth, tok
         device=device,
     )
     # remove the local temp/top_k/top_p extraction and do:
-    apply_sampling_from_sources(model, args=args, cfg=cfg)
+    apply_sampling_from_sources(model, args=None, cfg=cfg)
     return model
 
 
@@ -203,13 +203,14 @@ def run_inference(
 if __name__ == "__main__":
     if "--config" not in sys.argv:
         sys.argv.extend(["--config", "config_MD63.py"])                             #TODO rename to better name
-        sys.argv.extend(["--config", "config_MD64.py"])                             #TODO rename to better name
+        # sys.argv.extend(["--config", "config_MD64.py"])                             #TODO rename to better name
     if "--target" not in sys.argv:
         sys.argv.extend(["--target",
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandpass.json"])
-        "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandstop.json"])
-        # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_gaussian_peak.json"])
+        # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandstop.json"])
+        "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_gaussian_peak.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test1.json"])
+        # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/testfile.csv"])
         
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()

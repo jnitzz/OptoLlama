@@ -17,7 +17,7 @@ class SpectraDataset(torch.utils.data.Dataset): #TODO in separate dataset.py
       (spectrum_[W,3] float32, stack_[S] long, index)
     """
 
-    def __init__(self, paths: List[str] | str, device: str = "cpu"):
+    def __init__(self, paths: List[str] | str):
         super().__init__()
 
         # normalize paths (accept dir or list of files)
@@ -101,7 +101,7 @@ def make_loader(
         raise ValueError(f"Unknown split '{split}' — must be 'train' or 'valid'.")
 
     # --- build dataset ---
-    ds = SpectraDataset(dataset_path, device="cpu")
+    ds = SpectraDataset(dataset_path)
 
     # --- optional subset for quick debugging ---
     if subset_n is not None and subset_n < len(ds):
