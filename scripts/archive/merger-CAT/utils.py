@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import torch, json, os, tempfile
 from typing import List, Optional, Any, Dict, Tuple
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -42,7 +43,7 @@ def load_JSON(PATH: str, name: Optional[str] = None) -> Any:
 def init_tokenmaps(PATH: str) -> List[str]:
     tokens = load_JSON(PATH, 'tokens')
     # tokens = load_JSONPICKLE(PATH, 'tokens')
-    # save_JSON(PATH, tokens, 'tokens')
+    save_JSON(PATH, tokens, 'tokens')
     # Insert special tokens if not present
     PAD_TOKEN = "<PAD>"
     MSK_TOKEN = "<MSK>"

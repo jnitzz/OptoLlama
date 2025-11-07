@@ -1,3 +1,15 @@
+# import argparse
+# #TODO default im config und cli überschreiben
+# def parse_arguments() -> argparse.Namespace:
+#     p = argparse.ArgumentParser()
+    
+#     p.add_argument('--notrain', action='store_true')
+#     p.add_argument("--config", type=str, required=True, help="Config module (e.g., config_MD58 or config_MD58.py)")
+#     p.add_argument("--validsim", type=str, default="TMM_FAST", help="TMM_FAST or NOSIM")
+#     p.add_argument("--ckpt", type=str, default=None, help="Path to checkpoint (overrides cfg.PATH_CHKPT)")
+#     p.add_argument("--mc-samples", type=int, default=None, help="Override cfg.MC_SAMPLES for Monte Carlo best-of-N")
+#     return p.parse_args()
+
 import argparse
 import importlib
 import importlib.util
@@ -19,7 +31,6 @@ def _import_config_module(config_arg: str):
     else:
         return importlib.import_module(config_arg)
 
-
 def _parse_kv(s: str) -> Tuple[str, Any]:
     if "=" not in s:
         raise ValueError(f"--set expects KEY=VALUE, got: {s}")
@@ -31,7 +42,6 @@ def _parse_kv(s: str) -> Tuple[str, Any]:
     except Exception:
         val = raw
     return key, val
-
 
 def _set_top_level(cfg: Any, key: str, value: Any):
     """
@@ -66,7 +76,6 @@ def parse_arguments() -> argparse.Namespace:
     p.add_argument("--target", type=str, default=None, 
                    help="Path to a JSON/CSV RAT file for interactive inference.")
     return p.parse_args()
-
 
 def load_config_with_overrides(args: argparse.Namespace):
     cfg = _import_config_module(args.config)
