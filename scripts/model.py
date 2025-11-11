@@ -19,9 +19,9 @@ def build_model(
     eos_idx: int,
     device: str,
 ):
-    mt = (model_type or "ol").lower()
+    mt = (model_type or "optollama").lower()
     
-    if mt == ("optogpt" or "og"):
+    if mt == "optogpt":
         return OriginalDecoderWrapper(
             vocab_size=vocab_size,
             d_model=d_model,
@@ -35,7 +35,7 @@ def build_model(
             eos_idx=eos_idx,
             spectrum_flat_dim=max(sample_spectrum.size())*min(sample_spectrum.size()),
         ).to(torch.float32).to(device)
-    elif mt == ("optollama" or "ol"):
+    elif mt == "optollama":
         return OptoLlama(
             spectra_dim=max(sample_spectrum.size()),
             vocab_size=vocab_size,

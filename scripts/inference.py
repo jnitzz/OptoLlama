@@ -3,7 +3,7 @@ import csv
 import math
 import numpy as np
 import torch
-from utils import ensure_3W, apply_noise, apply_smoothing, redistribute_mismatch
+from utils import apply_noise, apply_smoothing, redistribute_mismatch
 
 def normalize_rat_fill_crop(R, A, T, target=1.0):
     """

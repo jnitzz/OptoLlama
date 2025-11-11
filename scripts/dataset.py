@@ -1,9 +1,9 @@
 from pathlib import Path
-from typing import List, Optional, Tuple, Dataset
+from typing import List, Optional, Tuple
 import torch
-from torch.utils.data import DataLoader, DistributedSampler, Subset
-import safetensors
-from utils import unique_length_int_generator
+from torch.utils.data import DataLoader, DistributedSampler, Subset, Dataset
+from safetensors.torch import load_file
+from utils import unique_length_int_generator, apply_noise, apply_smoothing, redistribute_mismatch
 
 class SpectraDataset(torch.utils.data.Dataset):
     """
@@ -40,7 +40,7 @@ class SpectraDataset(torch.utils.data.Dataset):
 
         spectra_list, stacks_list = [], []
         for fp in files:
-            data = safetensors.torch.load_file(str(fp))
+            data = load_file(str(fp))
             if "spectra" not in data or "thin_films" not in data:
                 raise KeyError(f"{fp} must contain 'spectra' and \
                                'thin_films' tensors.")

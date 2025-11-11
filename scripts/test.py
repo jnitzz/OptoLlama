@@ -26,10 +26,10 @@ from typing import Any, Dict, Optional
 # Project imports (local files in the repo)
 import cli
 from utils import init_tokenmaps, load_as_json, load_checkpoint, apply_sampling_from_sources
-from inference import load_spectra_from_json_or_csv, make_single_spec_loader, make_repeated_spec_loader
+from inference import load_spectra_from_json_or_csv
 from evaluate import validate_model
 from runner import setup_run, _is_ddp
-from dataset import make_loader, SpectraDataset
+from dataset import make_loader, SpectraDataset, make_repeated_spec_loader
 from model import build_model
 from simulation_TMM_FAST import build_tmm_context
 
@@ -150,8 +150,8 @@ def run_inference(
                 batch_size=min(n_tar, getattr(cfg, "VALID_BATCH", 64)),
             )
         else:
-            _, loader, _ = make_single_spec_loader(base_spec, max_stack_depth=max_stack, pad_idx=pad_idx, batch_size=1)
-
+            raise ValueError(f'use n_tar > 0. Got {n_tar}')
+            
     # Optional TMM context
     tmm_ctx = None
     mode = (validsim or "NOSIM").upper()

@@ -303,7 +303,7 @@ if __name__ == "__main__":
         pass
 
     if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "config_MD63.py"])                             #TODO rename to better name
+        sys.argv.extend(["--config", "config_MD65.py"])                             #TODO rename to better name
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()
