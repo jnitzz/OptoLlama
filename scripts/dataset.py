@@ -1,20 +1,20 @@
-import torch
-from torch.utils.data import DataLoader, Subset, DistributedSampler
-from utils import unique_length_int_generator
 from pathlib import Path
-from typing import List, Tuple, Optional
-from safetensors.torch import load_file
+from typing import List, Optional, Tuple, Dataset
+import torch
+from torch.utils.data import DataLoader, DistributedSampler, Subset
+import safetensors
+from utils import unique_length_int_generator
 
-class SpectraDataset(torch.utils.data.Dataset): #TODO in separate dataset.py
+class SpectraDataset(torch.utils.data.Dataset):
     """
     Dataset for Hugging Face `.safetensors` shards.
 
     Each file must contain:
-      - 'spectra'     : Float tensor of shape [N, W, 3]
+      - 'spectra'     : Float tensor of shape [N, 3, W]
       - 'thin_films'  : Long tensor of shape [N, S]
 
     Returns from __getitem__:
-      (spectrum_[W,3] float32, stack_[S] long, index)
+      (spectrum_[3,W] float32, stack_[S] long, index)
     """
 
     def __init__(self, paths: List[str] | str):
@@ -24,7 +24,7 @@ class SpectraDataset(torch.utils.data.Dataset): #TODO in separate dataset.py
         if isinstance(paths, str):
             paths = [paths]
 
-        files: list[Path] = []
+        files = []
         for p in map(Path, paths):
             if p.is_dir():
                 files.extend(sorted(p.glob("*.safetensors")))
@@ -40,23 +40,24 @@ class SpectraDataset(torch.utils.data.Dataset): #TODO in separate dataset.py
 
         spectra_list, stacks_list = [], []
         for fp in files:
-            data = load_file(str(fp))
+            data = safetensors.torch.load_file(str(fp))
             if "spectra" not in data or "thin_films" not in data:
                 raise KeyError(f"{fp} must contain 'spectra' and \
                                'thin_films' tensors.")
             spectra_list.append(data["spectra"].to(torch.float32))
             stacks_list.append(data["thin_films"].long())
 
-        self.spectra = torch.cat(spectra_list, dim=0)  # [N, W, 3]
+        self.spectra = torch.cat(spectra_list, dim=0)  # [N, 3, W]
         self.stacks = torch.cat(stacks_list, dim=0)    # [N, S]
         self.maximum_depth = int(self.stacks.size(1))
-
+        self.length_dataset = int(self.spectra.size(0))
+        
         if self.spectra.size(0) != self.stacks.size(0):
             raise RuntimeError("Mismatched number of samples between spectra \
                                and thin_films.")
 
     def __len__(self) -> int:
-        return int(self.spectra.size(0))
+        return self.length_dataset
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
         return self.spectra[index], self.stacks[index], index
@@ -135,3 +136,67 @@ def make_loader(
     )
 
     return ds, loader, sampler
+
+# --- repeated-spec dataset for N targets with fresh noise each sample ---------
+class _RepeatedSpecDataset(Dataset):
+    """
+    Dataset that repeats a *base* [3,W] spectrum N times.
+    If NOISE.enabled=True, each item draws fresh noise (and smoothing).
+    """
+    def __init__(
+        self,
+        base_spec_3w: torch.Tensor,   # [3,W] before noise/smoothing
+        n_items: int,
+        max_stack_depth: int,
+        pad_idx: int,
+        *,
+        wavelengths,                  # np.ndarray [W] (used for wl masks)
+        noise_cfg: dict | None,
+        smooth_cfg: dict | None,
+        mismatch_order: str = "R>A>T",
+    ):
+        assert base_spec_3w.ndim == 2 and base_spec_3w.shape[0] == 3, "base_spec must be [3,W]"
+        self.base = base_spec_3w.detach().clone()     # untouched template
+        self.n = int(n_items)
+        self.maximum_depth = int(max_stack_depth)
+        self.pad_idx = int(pad_idx)
+        self.wavelengths = wavelengths
+        self.noise_cfg = noise_cfg or {"enabled": False}
+        self.smooth_cfg = smooth_cfg or {"enabled": False}
+        self.mismatch_order = mismatch_order
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        x = self.base.clone()  # [3,W]
+        # draw fresh noise per item (or keep identical if disabled)
+        x = apply_noise(x, self.noise_cfg, self.wavelengths)
+        x = apply_smoothing(x, self.smooth_cfg)
+        x = redistribute_mismatch(x, self.mismatch_order, target_sum=1.0)
+        stacks = torch.full((self.maximum_depth,), self.pad_idx)  # dummy; eval uses TMM
+        return x, stacks
+
+
+def make_repeated_spec_loader(
+    base_spec_3w: torch.Tensor,
+    n_items: int,
+    max_stack_depth: int,
+    pad_idx: int,
+    *,
+    wavelengths,
+    cfg=None,
+    batch_size: int = 1,
+):
+    # pull knobs from cfg (if present)
+    noise_cfg = getattr(cfg, "NOISE", None) if cfg is not None else None
+    smooth_cfg = getattr(cfg, "SMOOTH", None) if cfg is not None else None
+    mismatch_order = getattr(cfg, "MISMATCH_FILL_ORDER", "R>A>T") if cfg is not None else "R>A>T"
+
+    ds = _RepeatedSpecDataset(
+        base_spec_3w, n_items, max_stack_depth, pad_idx,
+        wavelengths=wavelengths,
+        noise_cfg=noise_cfg, smooth_cfg=smooth_cfg, mismatch_order=mismatch_order,
+    )
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    return ds, loader, None

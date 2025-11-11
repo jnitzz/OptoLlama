@@ -1,6 +1,6 @@
 import torch
-from model_OptoLlama import OptoLlama
-from model_OptoGPT import OriginalDecoderWrapper
+from optollama import OptoLlama
+from optogpt import OriginalDecoderWrapper
 
 def build_model(
     *,
@@ -19,9 +19,9 @@ def build_model(
     eos_idx: int,
     device: str,
 ):
-    mt = (model_type or "dit").lower()
+    mt = (model_type or "ol").lower()
     
-    if mt == "transformer":
+    if mt == ("optogpt" or "og"):
         return OriginalDecoderWrapper(
             vocab_size=vocab_size,
             d_model=d_model,
@@ -35,7 +35,7 @@ def build_model(
             eos_idx=eos_idx,
             spectrum_flat_dim=max(sample_spectrum.size())*min(sample_spectrum.size()),
         ).to(torch.float32).to(device)
-    elif mt == "dit":
+    elif mt == ("optollama" or "ol"):
         return OptoLlama(
             spectra_dim=max(sample_spectrum.size()),
             vocab_size=vocab_size,

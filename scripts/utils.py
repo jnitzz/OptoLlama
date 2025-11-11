@@ -1,53 +1,51 @@
-import torch, json, os, tempfile
+import json, os, tempfile
 from typing import List, Optional, Any, Dict, Tuple
+import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+PAD_TOKEN = "<PAD>"
+MSK_TOKEN = "<MSK>"
+EOS_TOKEN = "<EOS>"
 
-
-def save_JSON(PATH: str, pyobj: Any, name: Optional[str] = None) -> None:
+def save_as_json(path: str, pyobj: Any, name: Optional[str] = None) -> None:
     """
     Save a Python object (e.g., list of strings, dict, etc.) as a JSON file.
 
     Args:
         pyobj: The Python object to serialize.
-        PATH: Destination file path.
+        path: Destination file path.
         Optional: name: file name, ".json" will be added automatically
     """
     if name is not None:
-        path = f"{PATH}/{name}.json"
+        path = f"{path}/{name}.json"
     else:
-        path = PATH
+        path = path
     with open(path, "w", encoding="utf-8") as f:
         json.dump(pyobj, f, indent=2, ensure_ascii=False)
 
 
-def load_JSON(PATH: str, name: Optional[str] = None) -> Any:
+def load_as_json(path: str, name: Optional[str] = None) -> Any:
     """
     Load and return a Python object from a JSON file.
 
     Args:
-        PATH: Destination file path.
+        path: Destination file path.
         Optional: name: file name, ".json" will be added automatically
     Returns:
         Python object (e.g. list, dict).
     """
     if name == None:
-        with open(f'{PATH}', 'r', encoding="utf-8") as f:
+        with open(f'{path}', 'r', encoding="utf-8") as f:
             return json.load(f)
     else:
-        with open(f'{PATH}/{name}.json', 'r', encoding="utf-8") as f:
+        with open(f'{path}/{name}.json', 'r', encoding="utf-8") as f:
             return json.load(f)
 
 
-#TODO check bc functional tokens in tokens already
-def init_tokenmaps(PATH: str) -> List[str]:
-    tokens = load_JSON(PATH, 'tokens')
-    # tokens = load_JSONPICKLE(PATH, 'tokens')
-    # save_JSON(PATH, tokens, 'tokens')
+def init_tokenmaps(path: str) -> List[str]:
+    tokens = load_as_json(path, 'tokens')
     # Insert special tokens if not present
-    PAD_TOKEN = "<PAD>"
-    MSK_TOKEN = "<MSK>"
-    EOS_TOKEN = "<EOS>"
-    for special_tk in [EOS_TOKEN, PAD_TOKEN, MSK_TOKEN]:
+    for special_tk in (EOS_TOKEN, PAD_TOKEN, MSK_TOKEN):
         if special_tk not in tokens:
             tokens.append(special_tk)
     
@@ -56,6 +54,7 @@ def init_tokenmaps(PATH: str) -> List[str]:
     pad_idx = token_to_idx[PAD_TOKEN]
     msk_idx = token_to_idx[MSK_TOKEN]
     idx_to_token = {i: tk for i, tk in enumerate(token_to_idx)}
+    
     return tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx
 
 
@@ -74,6 +73,7 @@ def unique_length_int_generator(start: float, stop: float, amount: float):
         amount = amount+1
         subset_idx = torch.linspace(start, stop-1, amount, dtype=int).unique()
         len_unique = len(subset_idx)
+    
     return subset_idx
 
 
@@ -85,6 +85,7 @@ def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
         return state_dict
     if any(k.startswith("module.") for k in state_dict.keys()):
         return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    
     return state_dict
 
 @torch.no_grad()
@@ -205,3 +206,131 @@ def apply_sampling_from_sources(model, *, args=None, cfg=None, default_temp=0.0,
 
     # return for logging/saving if you like
     return {"temperature": temperature, "top_k": top_k, "top_p": top_p}
+
+
+def boxcar_kernel(win: int, device):
+    win = max(1, int(win))
+    if win % 2 == 0: win += 1
+    k = torch.ones(win, device=device, dtype=torch.float32) / float(win)
+    return k
+
+
+def gauss_kernel(win: int, sigma: float, device):
+    win = max(1, int(win))
+    if win % 2 == 0: win += 1
+    r = (win - 1) // 2
+    xs = torch.arange(-r, r+1, device=device, dtype=torch.float32)
+    k = torch.exp(-0.5 * (xs / max(1e-6, float(sigma)))**2)
+    k = k / k.sum().clamp_min(1e-6)
+    return k
+
+
+def smooth_1d(x_3w: torch.Tensor, method: str, win: int, sigma: float) -> torch.Tensor:
+    # x_3w: [...,3,W] -> do depthwise 1D conv along last dim
+    orig_dim = x_3w.dim()
+    if orig_dim == 2:
+        x_3w = x_3w.unsqueeze(0)  # [1,3,W]
+    _, C, W = x_3w.shape
+    device = x_3w.device
+    if method.lower() == "gaussian":
+        k = gauss_kernel(win, sigma, device)
+    else:
+        k = boxcar_kernel(win, device)
+    weight = k.view(1, 1, -1).repeat(C, 1, 1)  # [C,1,K]
+    x = F.pad(x_3w, (k.numel()//2, k.numel()//2), mode="reflect")
+    x = F.conv1d(x, weight, groups=C)
+    x = x[:, :, :W]
+    return x.squeeze(0) if orig_dim == 2 else x
+
+
+def parse_order(order_str: str):
+    order_str = (order_str or "R>A>T").upper()
+    mapping = {'R':0, 'A':1, 'T':2}
+    seq = [mapping[c.strip()] for c in order_str.split('>') if c.strip() in mapping]
+    rest = [i for i in (0,1,2) if i not in seq]
+    seq.extend(rest)
+    return tuple(seq[:3])
+
+
+def wl_mask(wavelengths, wl_min: float, wl_max: float, device):
+    if wavelengths is None:
+        return None
+    wl = torch.as_tensor(wavelengths, dtype=torch.float32, device=device)
+    return (wl >= float(wl_min)) & (wl <= float(wl_max))
+
+
+def redistribute_mismatch(x: torch.Tensor, order: str, target_sum: float = 1.0):
+    """
+    x: [...,3,W] with values in [0,1]. Enforce per-W sum≈target_sum
+    by distributing residual in the given priority order.
+    """
+    orig_dim = x.dim()
+    if orig_dim == 2:
+        x = x.unsqueeze(0)  # [1,3,W]
+    B, C, W = x.shape
+    pri = parse_order(order)
+    total = x.sum(dim=1, keepdim=True)                  # [B,1,W]
+    res = float(target_sum) - total                     # +: add, -: remove
+
+    for idx in pri:
+        ch = x[:, idx:idx+1, :]
+        if (res.abs() < 1e-12).all():
+            break
+        # add
+        add_capacity = (1.0 - ch).clamp_min(0.0)
+        add = torch.sign(res) * torch.minimum(res.clamp_min(0.0), add_capacity)
+        ch = ch + add
+        res = res - add
+        # remove
+        rem_capacity = ch.clamp_max(1.0)
+        rem = -torch.minimum((-res).clamp_min(0.0), rem_capacity)
+        ch = ch + rem
+        res = res - rem
+        x[:, idx:idx+1, :] = ch
+
+    x = x.clamp_(0.0, 1.0)
+    return x.squeeze(0) if orig_dim == 2 else x
+
+
+def apply_noise(x: torch.Tensor, noise_cfg: dict, wavelengths):
+    if not noise_cfg or not noise_cfg.get("enabled", False):
+        return x
+    orig_dim = x.dim()
+    if orig_dim == 2:
+        x = x.unsqueeze(0)  # [1,3,W]
+    B, C, W = x.shape
+    device = x.device
+
+    sigma_abs = float(noise_cfg.get("sigma_abs", 0.0))
+    sigma_rel = float(noise_cfg.get("sigma_rel", 0.0))
+    per_ch = noise_cfg.get("per_channel", [1.0, 1.0, 1.0])
+    per_ch = torch.tensor(per_ch, dtype=torch.float32, device=device).view(1, C, 1)
+
+    wl_min = noise_cfg.get("wl_min", None)
+    wl_max = noise_cfg.get("wl_max", None)
+    mask = None
+    if wl_min is not None and wl_max is not None:
+        mask = wl_mask(wavelengths, wl_min, wl_max, device) if wavelengths is not None else None
+
+    eps = torch.randn_like(x) * (sigma_abs + sigma_rel * x)
+    eps = eps * per_ch
+
+    if mask is not None:
+        m = mask.view(1, 1, W)
+        x = torch.where(m, x + eps, x)
+    else:
+        x = x + eps
+
+    if noise_cfg.get("clip_0_1", True):
+        x = x.clamp_(0.0, 1.0)
+
+    return x.squeeze(0) if orig_dim == 2 else x
+
+
+def apply_smoothing(x: torch.Tensor, smooth_cfg: dict):
+    if not smooth_cfg or not smooth_cfg.get("enabled", False):
+        return x
+    method = smooth_cfg.get("method", "gaussian")
+    win    = int(smooth_cfg.get("win", 5))
+    sigma  = float(smooth_cfg.get("sigma", 1.0))
+    return smooth_1d(x, method, win, sigma)

@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-def plot_samples(c, RAT_pred, RAT_tar, stack_pred, stack_tar, ACC, MSE, number, RAT_tar_mean = None):
+def plot_samples(c, RAT_pred, RAT_tar, stack_pred, stack_tar, ACC, number, RAT_tar_mean = None):
     def _strip(seq):
         return [t for t in seq if t not in ("<PAD>", "<SOS>", "<EOS>", "<MSK>")]
     stack_tar = _strip(stack_tar)

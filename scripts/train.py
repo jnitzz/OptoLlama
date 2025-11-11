@@ -6,7 +6,7 @@ import torch
 import tqdm
 
 import cli as cli
-from utils import apply_sampling_from_sources, save_JSON
+from utils import apply_sampling_from_sources, save_as_json
 from runner import setup_run, _is_ddp
 from dataset import make_loader, SpectraDataset
 from model import build_model
@@ -92,31 +92,8 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
     train_acc        = torch.zeros(E)
     valid_acc          = torch.zeros(E)
     valid_MAE          = torch.ones(E) * np.inf
-    # start_epoch = 0
 
     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
-    # best_valid_acc = 0.0
-    # best_valid_mae = np.inf
-
-    # if os.path.exists(checkpoint):
-    #     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    #     start_epoch = int(state.get("epoch", -1)) + 1
-    #     # The file stores {'model_state', 'optimizer_state', ...}; load back
-    #     if "model_state" in state:
-    #         model.load_state_dict(state["model_state"], strict=True)
-    #     if "optimizer_state" in state:
-    #         optimizer.load_state_dict(state["optimizer_state"])
-    #     if "train_losses" in state: train_losses = state["train_losses"]
-    #     if "train_acc" in state:    train_acc    = state["train_acc"]
-    #     if "valid_acc" in state:      valid_acc      = state["valid_acc"]
-    #     if "valid_MAE" in state:      valid_MAE      = state["valid_MAE"]
-    #     # robust bests
-    #     acc_arr = valid_acc.detach().cpu().numpy()
-    #     if np.any(np.isfinite(acc_arr)):
-    #         best_valid_acc = float(np.nanmax(acc_arr[np.isfinite(acc_arr)]))
-    #     mae_arr = valid_MAE.detach().cpu().numpy()
-    #     if np.any(np.isfinite(mae_arr)):
-    #         best_valid_mae = float(np.nanmin(mae_arr[np.isfinite(mae_arr)]))
     
     
     from utils import load_checkpoint, save_checkpoint
@@ -145,7 +122,6 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
             best_valid_mae = float(np.nanmin(mae_arr[np.isfinite(mae_arr)]))
     
     
-
     # ------------------------------ epochs ------------------------------
     for epoch in range(start_epoch, cfg.EPOCHS):
         # DDP epoch seeds
@@ -256,7 +232,7 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
         if rank == 0 and 'results' in val_out:
             os.makedirs(cfg.PATH_SAVED, exist_ok=True)
             out_name = f"results_{cfg.RUN_NAME}"
-            save_JSON(cfg.PATH_SAVED, val_out['results'], out_name)
+            save_as_json(cfg.PATH_SAVED, val_out['results'], out_name)
             print(f"💾 [rank 0] Saved {len(val_out['results'])} samples → …/{out_name}.json")
             if mode == "TMM_FAST":
                 print(f" min valid MAE: {float(torch.min(valid_MAE).item()) if torch.isfinite(valid_MAE).any() else valid_MAE[epoch]:.4f}")

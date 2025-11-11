@@ -5,10 +5,135 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ===== Original building blocks (unchanged) =====
-
+# code from https://github.com/taigaoma1997/optogpt/blob/cdedef9526bba02c58fa73181802dc7138fa3900/optogpt/core/models/transformer.py#L26
+# (optogpt/core/models/transformer.py)
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
+
+class Embeddings(nn.Module):
+    def __init__(self, d_model, vocab):
+        super().__init__()
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model
+    def forward(self, x):
+        return self.lut(x) * math.sqrt(self.d_model)
+
+
+class PositionalEncoding_Tf(nn.Module):
+    def __init__(self, d_model, dropout, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0., max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0., d_model, 2) * -(math.log(10000.0) / d_model))
+        pe_pos   = torch.mul(position, div_term)
+        pe[:, 0::2] = torch.sin(pe_pos)
+        pe[:, 1::2] = torch.cos(pe_pos)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+
+def attention(query, key, value, mask=None, dropout=None):
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+    p_attn = F.softmax(scores, dim=-1)
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    return torch.matmul(p_attn, value), p_attn
+
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        super().__init__()
+        assert d_model % h == 0
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+    def forward(self, query, key, value, mask=None):
+        if mask is not None:
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+                             for l, x in zip(self.linears, (query, key, value))]
+        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+
+class LayerNorm_Tf(nn.Module):
+    def __init__(self, features, eps=1e-6):
+        super().__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std  = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / torch.sqrt(std ** 2 + self.eps) + self.b_2
+
+
+class SublayerConnection(nn.Module):
+    def __init__(self, size, dropout):
+        super().__init__()
+        self.norm = LayerNorm_Tf(size)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x, sublayer):
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        return self.w_2(self.dropout(self.w_1(x)))
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+        super().__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn  = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+    def forward(self, x, memory, src_mask, tgt_mask):
+        m = memory
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
+
+
+class Decoder(nn.Module):
+    def __init__(self, layer, N):
+        super().__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm_Tf(layer.size)
+    def forward(self, x, memory, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
+
+
+class Generator(nn.Module):
+    def __init__(self, d_model, vocab):
+        super().__init__()
+        self.proj = nn.Linear(d_model, vocab)
+    def forward(self, x):
+        return F.log_softmax(self.proj(x), dim=-1)
+
+
+# ===== Helpers to interface with the OptoGPT =====
 def _filter_logits_topk_topp(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0, filter_value: float = -float('inf')):
     """
     logits: [B,V] -> mask tokens outside top-k / nucleus (top-p) by setting to -inf.
@@ -32,123 +157,10 @@ def _filter_logits_topk_topp(logits: torch.Tensor, top_k: int = 0, top_p: float 
 
     return logits
 
-class Embeddings(nn.Module):
-    def __init__(self, d_model, vocab):
-        super().__init__()
-        self.lut = nn.Embedding(vocab, d_model)
-        self.d_model = d_model
-    def forward(self, x):
-        return self.lut(x) * math.sqrt(self.d_model)
-
-class PositionalEncoding_Tf(nn.Module):
-    def __init__(self, d_model, dropout, max_len=5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0., max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0., d_model, 2) * -(math.log(10000.0) / d_model))
-        pe_pos   = torch.mul(position, div_term)
-        pe[:, 0::2] = torch.sin(pe_pos)
-        pe[:, 1::2] = torch.cos(pe_pos)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
-
-def attention(query, key, value, mask=None, dropout=None):
-    d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    p_attn = F.softmax(scores, dim=-1)
-    if dropout is not None:
-        p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
-
-class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
-        super().__init__()
-        assert d_model % h == 0
-        self.d_k = d_model // h
-        self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.attn = None
-        self.dropout = nn.Dropout(p=dropout)
-    def forward(self, query, key, value, mask=None):
-        if mask is not None:
-            mask = mask.unsqueeze(1)
-        nbatches = query.size(0)
-        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-                             for l, x in zip(self.linears, (query, key, value))]
-        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
-        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
-        return self.linears[-1](x)
-
-class LayerNorm_Tf(nn.Module):
-    def __init__(self, features, eps=1e-6):
-        super().__init__()
-        self.a_2 = nn.Parameter(torch.ones(features))
-        self.b_2 = nn.Parameter(torch.zeros(features))
-        self.eps = eps
-    def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std  = x.std(-1, keepdim=True)
-        return self.a_2 * (x - mean) / torch.sqrt(std ** 2 + self.eps) + self.b_2
-
-class SublayerConnection(nn.Module):
-    def __init__(self, size, dropout):
-        super().__init__()
-        self.norm = LayerNorm_Tf(size)
-        self.dropout = nn.Dropout(dropout)
-    def forward(self, x, sublayer):
-        return x + self.dropout(sublayer(self.norm(x)))
-
-class PositionwiseFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super().__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(dropout)
-    def forward(self, x):
-        return self.w_2(self.dropout(self.w_1(x)))
-
-class DecoderLayer(nn.Module):
-    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
-        super().__init__()
-        self.size = size
-        self.self_attn = self_attn
-        self.src_attn  = src_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
-    def forward(self, x, memory, src_mask, tgt_mask):
-        m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
-        return self.sublayer[2](x, self.feed_forward)
-
-class Decoder(nn.Module):
-    def __init__(self, layer, N):
-        super().__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm_Tf(layer.size)
-    def forward(self, x, memory, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
-
-class Generator(nn.Module):
-    def __init__(self, d_model, vocab):
-        super().__init__()
-        self.proj = nn.Linear(d_model, vocab)
-    def forward(self, x):
-        # NOTE: we will use raw logits in the wrapper, but keep this for completeness
-        return F.log_softmax(self.proj(x), dim=-1)
-
-# ===== Tiny helpers to interface with the repo =====
 
 def _subsequent_mask(sz: int, device: torch.device):
     return torch.triu(torch.ones(1, sz, sz, device=device, dtype=torch.bool), diagonal=1) == 0
+
 
 def _flatten_spectra(spectra: torch.Tensor) -> torch.Tensor:
     # [B,W,3] -> [B,3W]
@@ -158,6 +170,7 @@ def _flatten_spectra(spectra: torch.Tensor) -> torch.Tensor:
     elif spectra.dim() == 2:
         return spectra
     raise ValueError(f"Unexpected spectra shape {tuple(spectra.shape)}")
+
 
 class OriginalDecoderWrapper(nn.Module):
     """
@@ -219,10 +232,6 @@ class OriginalDecoderWrapper(nn.Module):
         logits_accum = []
         for t in range(self.max_len):
             logits_t = self._decode_logits(memory, out)   # [B,t+1,V]
-            # last = logits_t[:, -1:, :]                    # [B,1,V]
-            # logits_accum.append(last)
-            # next_id = last.argmax(dim=-1)                 # [B,1]
-            # out = torch.cat([out, next_id], dim=1)
             last = logits_t[:, -1, :]  # [B,V]
             
             # defaults from model if not provided

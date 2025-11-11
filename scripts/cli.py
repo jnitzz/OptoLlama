@@ -6,7 +6,7 @@ import sys
 import ast
 from typing import Any, Tuple
 
-def _import_config_module(config_arg: str):
+def import_config_module(config_arg: str):
     if config_arg.endswith(".py") or os.path.sep in config_arg:
         path = os.path.abspath(config_arg)
         spec = importlib.util.spec_from_file_location("user_cfg", path)
@@ -20,7 +20,7 @@ def _import_config_module(config_arg: str):
         return importlib.import_module(config_arg)
 
 
-def _parse_kv(s: str) -> Tuple[str, Any]:
+def parse_kv(s: str) -> Tuple[str, Any]:
     if "=" not in s:
         raise ValueError(f"--set expects KEY=VALUE, got: {s}")
     key, raw = s.split("=", 1)
@@ -33,7 +33,7 @@ def _parse_kv(s: str) -> Tuple[str, Any]:
     return key, val
 
 
-def _set_top_level(cfg: Any, key: str, value: Any):
+def set_top_level(cfg: Any, key: str, value: Any):
     """
     Only top-level keys. Supports attribute-style or dict-style configs.
     - If cfg is a dict, assign cfg[key] = value
@@ -69,19 +69,19 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def load_config_with_overrides(args: argparse.Namespace):
-    cfg = _import_config_module(args.config)
+    cfg = import_config_module(args.config)
 
     # Convenience flags
     if args.mc_samples is not None:
-        _set_top_level(cfg, "MC_SAMPLES", int(args.mc_samples))
+        set_top_level(cfg, "MC_SAMPLES", int(args.mc_samples))
     if args.ckpt is not None:
-        _set_top_level(cfg, "PATH_CHKPT", args.ckpt)
+        set_top_level(cfg, "PATH_CHKPT", args.ckpt)
     if args.validsim is not None:
-        _set_top_level(cfg, "VALIDSIM", args.validsim)
+        set_top_level(cfg, "VALIDSIM", args.validsim)
 
     # Generic top-level --set KEY=VALUE
     for s in args.sets:
-        key, val = _parse_kv(s)
-        _set_top_level(cfg, key, val)
+        key, val = parse_kv(s)
+        set_top_level(cfg, key, val)
 
     return cfg

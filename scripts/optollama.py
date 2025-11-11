@@ -74,7 +74,7 @@ class TimestepEmbedding(torch.nn.Module):
         half = self.frequency_embedding_size // 2
         
         frequencies = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, device=timesteps.device) / half)
-        sigmas = -torch.log(timesteps)
+        sigmas = -torch.log(timesteps)                                          #TODO check why here
         projected = sigmas.unsqueeze(-1) * frequencies.unsqueeze(0)
         
         return torch.cat([torch.cos(projected), torch.sin(projected)], dim=-1)

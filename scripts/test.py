@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional
 
 # Project imports (local files in the repo)
 import cli
-from utils import init_tokenmaps, save_JSON, load_checkpoint, apply_sampling_from_sources
+from utils import init_tokenmaps, load_as_json, load_checkpoint, apply_sampling_from_sources
 from inference import load_spectra_from_json_or_csv, make_single_spec_loader, make_repeated_spec_loader
 from evaluate import validate_model
 from runner import setup_run, _is_ddp
@@ -104,7 +104,7 @@ def run_inference(
         cfg,
         example_spectrum=example_spec_for_build,   # <— 👈 force [W,3]
         vocab_size=vocab_size,
-        max_stack_depth=max_stack,
+        max_stack_depth=5,#max_stack,
         token_meta={"idx_to_token": idx_to_token, "msk_idx": msk_idx, "pad_idx": pad_idx, "eos_idx": eos_idx},
         device=device
     )
@@ -185,7 +185,7 @@ def run_inference(
         try:
             base = getattr(cfg, 'RUN_NAME', 'infer')
             tag  = "target" if target else "valid"
-            save_JSON(cfg.PATH_SAVED, out.get("results", []), f"results_{base}_{tag}")
+            load_as_json(cfg.PATH_SAVED, out.get("results", []), f"results_{base}_{tag}")
             print(f"💾 Saved {len(out.get('results', []))} record(s) to {cfg.PATH_SAVED}")
         except Exception as e:
             print(f"⚠️  Could not save results JSON: {e}")
@@ -203,10 +203,10 @@ def run_inference(
 if __name__ == "__main__":
     if "--config" not in sys.argv:
         sys.argv.extend(["--config", "config_MD63.py"])                             #TODO rename to better name
-        sys.argv.extend(["--config", "config_MD64.py"])                             #TODO rename to better name
-    if "--target" not in sys.argv:
-        sys.argv.extend(["--target",
-        "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandpass.json"])
+        # sys.argv.extend(["--config", "config_MD64.py"])                             #TODO rename to better name
+    # if "--target" not in sys.argv:
+        # sys.argv.extend(["--target",
+        # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandpass.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandstop.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_gaussian_peak.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/testfile.csv"])
@@ -224,6 +224,7 @@ if __name__ == "__main__":
         target=args.target,
         n_targets=n_targets or getattr(cfg, "N_TARGETS", 1),
     )
-    from plots import plot_samples
-    valkey = min([[item['mae'],i] for i, item in enumerate(out['results'])])
-    plot_samples(cfg, out['results'][valkey[1]]['RAT_pred_flat'], out['results'][valkey[1]]['RAT_target_flat'], out['results'][valkey[1]]['stack_pred_tokens'], '', 0, 0, cfg.MC_SAMPLES, RAT_tar_mean = None)
+    # from plots import plot_samples
+    # valkey = min([[item['mae'],i] for i, item in enumerate(out['results'])])
+    # plot_samples(cfg, out['results'][valkey[1]]['RAT_pred_flat'], out['results'][valkey[1]]['RAT_target_flat'], out['results'][valkey[1]]['stack_pred_tokens'], '', 0, cfg.MC_SAMPLES, RAT_tar_mean = None)
+        
