@@ -19,7 +19,8 @@ Outputs:
 """
 from __future__ import annotations
 
-import os, sys, torch
+import os, sys
+import torch
 import importlib
 from typing import Any, Dict, Optional
 
@@ -32,31 +33,6 @@ from runner import setup_run, _is_ddp
 from dataset import make_loader, SpectraDataset, make_repeated_spec_loader
 from model import build_model
 from simulation_TMM_FAST import build_tmm_context
-
-# ----------------------------- helpers -----------------------------
-def _build_model_for_cfg(cfg, example_spectrum, vocab_size, max_stack_depth, token_meta, device: str) -> torch.nn.Module:
-    model = build_model(
-        model_type=getattr(cfg, "ARCH", getattr(cfg, "OL_MODEL", "dit")),
-        sample_spectrum=example_spectrum,
-        vocab_size=vocab_size,
-        max_stack_depth=max_stack_depth,
-        d_model=int(getattr(cfg, "D_MODEL", 1024)),
-        n_blocks=int(getattr(cfg, "N_BLOCKS", 6)),
-        n_heads=int(getattr(cfg, "N_HEADS", 8)),
-        timesteps=int(getattr(cfg, "STEPS", 500)),
-        dropout=float(getattr(cfg, "DROPOUT", 0.0)),
-        idx_to_token=token_meta["idx_to_token"],
-        mask_idx=token_meta["msk_idx"],
-        pad_idx=token_meta["pad_idx"],
-        eos_idx=token_meta["eos_idx"],
-        device=device,
-    )
-    # remove the local temp/top_k/top_p extraction and do:
-    apply_sampling_from_sources(model, args=None, cfg=cfg)
-    return model
-
-
-# ----------------------------- core API -----------------------------
 
 @torch.no_grad()
 def run_inference(
@@ -100,14 +76,25 @@ def run_inference(
     vocab_size = len(idx_to_token)
     max_stack  = valid_ds.maximum_depth if isinstance(valid_ds, SpectraDataset) else valid_ds.dataset.maximum_depth
     
-    model = _build_model_for_cfg(
-        cfg,
-        example_spectrum=example_spec_for_build,   # <— 👈 force [W,3]
+    model = build_model(
+        model_type=getattr(cfg, "ARCH", getattr(cfg, "OL_MODEL", "dit")),
+        sample_spectrum=example_spec_for_build,
         vocab_size=vocab_size,
-        max_stack_depth=5,#max_stack,
-        token_meta={"idx_to_token": idx_to_token, "msk_idx": msk_idx, "pad_idx": pad_idx, "eos_idx": eos_idx},
-        device=device
+        max_stack_depth=max_stack,
+        d_model=int(getattr(cfg, "D_MODEL", 1024)),
+        n_blocks=int(getattr(cfg, "N_BLOCKS", 6)),
+        n_heads=int(getattr(cfg, "N_HEADS", 8)),
+        timesteps=int(getattr(cfg, "STEPS", 500)),
+        dropout=float(getattr(cfg, "DROPOUT", 0.0)),
+        idx_to_token=idx_to_token,
+        mask_idx=msk_idx,
+        pad_idx=pad_idx,
+        eos_idx=eos_idx,
+        device=device,
     )
+    # remove the local temp/top_k/top_p extraction and do:
+    apply_sampling_from_sources(model, args=None, cfg=cfg)
+    
 
     # Load weights (ckpt argument wins; else try cfg.PATH_CHKPT)
     ckpt_path = ckpt or getattr(cfg, "PATH_CHKPT", None)
@@ -142,7 +129,7 @@ def run_inference(
             smooth_cfg={"enabled": False},
         ).to(device)
     
-        if n_tar > 1:
+        if n_tar > 0:
             _, loader, _ = make_repeated_spec_loader(
                 base_spec, n_tar, max_stack_depth=max_stack, pad_idx=pad_idx,
                 wavelengths=getattr(cfg, "WAVELENGTHS"),
@@ -204,11 +191,12 @@ if __name__ == "__main__":
     if "--config" not in sys.argv:
         sys.argv.extend(["--config", "config_MD63.py"])                             #TODO rename to better name
         # sys.argv.extend(["--config", "config_MD64.py"])                             #TODO rename to better name
-    # if "--target" not in sys.argv:
-        # sys.argv.extend(["--target",
+    if "--target" not in sys.argv:
+        sys.argv.extend(["--target",
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandpass.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_bandstop.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test_gaussian_peak.json"])
+        "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/test2.json"])
         # "d:/Profile/a3536/Eigene Dateien/GitHub/ColorAppearanceToolbox/Diffusion/data/TF_MA2_safetensors/testfile.csv"])
         
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
@@ -224,7 +212,7 @@ if __name__ == "__main__":
         target=args.target,
         n_targets=n_targets or getattr(cfg, "N_TARGETS", 1),
     )
-    # from plots import plot_samples
-    # valkey = min([[item['mae'],i] for i, item in enumerate(out['results'])])
-    # plot_samples(cfg, out['results'][valkey[1]]['RAT_pred_flat'], out['results'][valkey[1]]['RAT_target_flat'], out['results'][valkey[1]]['stack_pred_tokens'], '', 0, cfg.MC_SAMPLES, RAT_tar_mean = None)
+    from plots import plot_samples
+    valkey = min([[item['mae'],i] for i, item in enumerate(out['results'])])
+    plot_samples(cfg, out['results'][valkey[1]]['rat_pred_flat'], out['results'][valkey[1]]['rat_target_flat'], out['results'][valkey[1]]['stack_pred_tokens'], '', 0, cfg.MC_SAMPLES, RAT_tar_mean = None)
         

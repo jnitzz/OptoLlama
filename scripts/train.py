@@ -93,7 +93,7 @@ def train_loop(arguments: argparse.Namespace, device: str, rank: int, world_size
     valid_acc          = torch.zeros(E)
     valid_MAE          = torch.ones(E) * np.inf
 
-    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
+    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
     
     
     from utils import load_checkpoint, save_checkpoint

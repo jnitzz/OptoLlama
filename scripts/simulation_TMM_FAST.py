@@ -183,7 +183,7 @@ class TMMSpectrum(nn.Module): #TODO why tmm module?
         out = torch.cat([R, A, T], dim=1)
         return out #[B,3,W]
 
-def _build_tmm(incidence_angle, device, wavelengths, path_materials, idx_to_token):
+def build_tmm(incidence_angle, device, wavelengths, path_materials, idx_to_token):
     theta  = torch.tensor(incidence_angle * torch.pi / 180,
                           device=device, dtype=torch.complex128).unsqueeze(0)
     wl_tensor = torch.tensor(wavelengths, dtype=torch.complex128, device=device)
@@ -203,7 +203,7 @@ def build_tmm_context(*, cfg, idx_to_token, device) -> TMMContext:
     """
     Centralized TMM init, identical to how you do it in train/MC.
     """
-    tmm, wl_tensor, theta = _build_tmm(
+    tmm, wl_tensor, theta = build_tmm(
         incidence_angle=cfg.INCIDENCE_ANGLE,
         device=device,
         wavelengths=cfg.WAVELENGTHS,
