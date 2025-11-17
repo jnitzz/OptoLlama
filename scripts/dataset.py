@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import List, Optional, Tuple
+from types import ModuleType
+from typing import Any, List, Optional, Tuple, Union
+
 import torch
-from torch.utils.data import DataLoader, DistributedSampler, Subset, Dataset
 from safetensors.torch import load_file
-from utils import unique_length_int_generator, apply_noise, apply_smoothing, redistribute_mismatch
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
+from utils import apply_noise, apply_smoothing, redistribute_mismatch, unique_length_int_generator
+
 
 class SpectraDataset(torch.utils.data.Dataset):
     """
@@ -24,54 +29,60 @@ class SpectraDataset(torch.utils.data.Dataset):
         if isinstance(paths, str):
             paths = [paths]
 
-        files = []
+        files: list[Path] = []
         for p in map(Path, paths):
             if p.is_dir():
-                files.extend(sorted(p.glob("*.safetensors")))
+                files.extend(p.glob("*.safetensors"))
             elif p.suffix == ".safetensors":
                 files.append(p)
             else:
-                raise ValueError(f"Unsupported path \
-                                 (expect dir or .safetensors): {p}")
+                raise ValueError(
+                    f"Unsupported path \
+                                 (expect dir or .safetensors): {p}"
+                )
 
         if not files:
-            raise FileNotFoundError("No .safetensors files found \
-                                    in the provided paths.")
+            raise FileNotFoundError(
+                "No .safetensors files found \
+                                    in the provided paths."
+            )
 
         spectra_list, stacks_list = [], []
         for fp in files:
             data = load_file(str(fp))
             if "spectra" not in data or "thin_films" not in data:
-                raise KeyError(f"{fp} must contain 'spectra' and \
-                               'thin_films' tensors.")
+                raise KeyError(
+                    f"{fp} must contain 'spectra' and \
+                               'thin_films' tensors."
+                )
             spectra_list.append(data["spectra"].to(torch.float32))
             stacks_list.append(data["thin_films"].long())
 
         self.spectra = torch.cat(spectra_list, dim=0)  # [N, 3, W]
-        self.stacks = torch.cat(stacks_list, dim=0)    # [N, S]
+        self.stacks = torch.cat(stacks_list, dim=0)  # [N, S]
         self.maximum_depth = int(self.stacks.size(1))
         self.length_dataset = int(self.spectra.size(0))
-        
+
         if self.spectra.size(0) != self.stacks.size(0):
-            raise RuntimeError("Mismatched number of samples between spectra \
-                               and thin_films.")
+            raise RuntimeError(
+                "Mismatched number of samples between spectra \
+                               and thin_films."
+            )
 
     def __len__(self) -> int:
+        """Return the length of the dataset."""
         return self.length_dataset
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Return specra, stacks and index."""
         return self.spectra[index], self.stacks[index], index
 
 
 def make_loader(
-    cfg,
-    split: str,
-    subset_n: Optional[int] = None,
-    ddp: bool = False,
-):
+    cfg: ModuleType, split: str, subset_n: Optional[int] = None, ddp: bool = False
+) -> Tuple[Union[SpectraDataset, Subset[SpectraDataset]], DataLoader, Optional[DistributedSampler]]:
     """
-    Build dataset, optional subset, sampler, and DataLoader
-    for training or validation.
+    Build dataset, optional subset, sampler, and DataLoader in train/valid.
 
     Args:
         cfg: configuration module or object (must define dataset paths, batch size, etc.)
@@ -79,25 +90,27 @@ def make_loader(
         subset_n: optional number of samples to subset for quick runs
         ddp: whether to use DistributedSampler
 
-    Returns:
+    Returns
+    -------
         dataset, loader, sampler
     """
-    # --- select dataset path(s) ---
     split_lower = split.lower()
     if split_lower in ("train", "training"):
         try:
-            dataset_path = sorted([
-                getattr(cfg, k) for k in dir(cfg) if k.startswith("PATH_TRAIN")])
-        except:
-            raise ValueError("cfg must have at least one argument \
-                             staring with: 'PATH_TRAIN'")
+            dataset_path = sorted([getattr(cfg, k) for k in dir(cfg) if k.startswith("PATH_TRAIN")])
+        except ValueError:
+            raise ValueError(
+                "cfg must have at least one argument \
+                             staring with: 'PATH_TRAIN'"
+            )
     elif split_lower in ("valid", "validation", "test"):
         try:
-            dataset_path = sorted([
-                getattr(cfg, k) for k in dir(cfg) if k.startswith("PATH_VALID")])
-        except:
-            raise ValueError("cfg must have at least one argument \
-                             staring with: 'PATH_VALID'")
+            dataset_path = sorted([getattr(cfg, k) for k in dir(cfg) if k.startswith("PATH_VALID")])
+        except ValueError:
+            raise ValueError(
+                "cfg must have at least one argument \
+                             staring with: 'PATH_VALID'"
+            )
     else:
         raise ValueError(f"Unknown split '{split}' — must be 'train' or 'valid'.")
 
@@ -106,7 +119,7 @@ def make_loader(
 
     # --- optional subset for quick debugging ---
     if subset_n is not None and subset_n < len(ds):
-        idxs = unique_length_int_generator(0e0, len(ds)-1, subset_n)
+        idxs = unique_length_int_generator(0e0, len(ds) - 1, subset_n)
         ds = Subset(ds, idxs)
 
     # --- configure sampler and shuffling ---
@@ -137,26 +150,28 @@ def make_loader(
 
     return ds, loader, sampler
 
+
 # --- repeated-spec dataset for N targets with fresh noise each sample ---------
-class _RepeatedSpecDataset(Dataset):
+class RepeatedSpecDataset(Dataset):
     """
     Dataset that repeats a *base* [3,W] spectrum N times.
+
     If NOISE.enabled=True, each item draws fresh noise (and smoothing).
     """
+
     def __init__(
         self,
-        base_spec_3w: torch.Tensor,   # [3,W] before noise/smoothing
+        base_spec_3w: torch.Tensor,  # [3,W] before noise/smoothing
         n_items: int,
         max_stack_depth: int,
         pad_idx: int,
-        *,
-        wavelengths,                  # np.ndarray [W] (used for wl masks)
+        wavelengths: Any,  # np.ndarray [W] (used for wl masks)
         noise_cfg: dict | None,
         smooth_cfg: dict | None,
         mismatch_order: str = "R>A>T",
     ):
         assert base_spec_3w.ndim == 2 and base_spec_3w.shape[0] == 3, "base_spec must be [3,W]"
-        self.base = base_spec_3w.detach().clone()     # untouched template
+        self.base = base_spec_3w.detach().clone()  # untouched template
         self.n = int(n_items)
         self.maximum_depth = int(max_stack_depth)
         self.pad_idx = int(pad_idx)
@@ -165,17 +180,22 @@ class _RepeatedSpecDataset(Dataset):
         self.smooth_cfg = smooth_cfg or {"enabled": False}
         self.mismatch_order = mismatch_order
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the length of the dataset."""
         return self.n
 
-    def __getitem__(self, idx):
-        x = self.base.clone()  # [3,W]
-        # draw fresh noise per item (or keep identical if disabled)
-        x = apply_noise(x, self.noise_cfg, self.wavelengths)
-        x = apply_smoothing(x, self.smooth_cfg)
-        x = redistribute_mismatch(x, self.mismatch_order, target_sum=1.0)
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return specraand stacks."""
         stacks = torch.full((self.maximum_depth,), self.pad_idx)  # dummy; eval uses TMM
-        return x, stacks
+        specs = self.base.clone()  # [3,W]
+        if index == 0:
+            return specs, stacks
+        else:
+            # draw fresh noise per item (or keep identical if disabled)
+            specs = apply_noise(specs, self.noise_cfg, self.wavelengths)
+            specs = apply_smoothing(specs, self.smooth_cfg)
+            specs = redistribute_mismatch(specs, self.mismatch_order, target_sum=1.0)
+            return specs, stacks
 
 
 def make_repeated_spec_loader(
@@ -183,20 +203,39 @@ def make_repeated_spec_loader(
     n_items: int,
     max_stack_depth: int,
     pad_idx: int,
-    *,
-    wavelengths,
-    cfg=None,
+    wavelengths: Any,
+    cfg: None = None,
     batch_size: int = 1,
-):
-    # pull knobs from cfg (if present)
+) -> Tuple[Union[SpectraDataset, Subset[SpectraDataset]], DataLoader, None]:
+    """
+    Build dataset, sampler, and DataLoader for inference.
+
+    Args:
+        base_spec_3w: base spectrum target (3,W)
+        n_items: number of noise variations for the base spectrum
+        max_stack_depth: maximum stack depth allowed
+        pad_idx: token <PAD> to fill voide
+        wavelengths: to apply noise in the correct format
+        cfg: config
+        batch_size: batch_size
+
+    Returns
+    -------
+        dataset, loader, sampler
+    """
     noise_cfg = getattr(cfg, "NOISE", None) if cfg is not None else None
     smooth_cfg = getattr(cfg, "SMOOTH", None) if cfg is not None else None
     mismatch_order = getattr(cfg, "MISMATCH_FILL_ORDER", "R>A>T") if cfg is not None else "R>A>T"
 
-    ds = _RepeatedSpecDataset(
-        base_spec_3w, n_items, max_stack_depth, pad_idx,
+    ds = RepeatedSpecDataset(
+        base_spec_3w,
+        n_items,
+        max_stack_depth,
+        pad_idx,
         wavelengths=wavelengths,
-        noise_cfg=noise_cfg, smooth_cfg=smooth_cfg, mismatch_order=mismatch_order,
+        noise_cfg=noise_cfg,
+        smooth_cfg=smooth_cfg,
+        mismatch_order=mismatch_order,
     )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
     return ds, loader, None
