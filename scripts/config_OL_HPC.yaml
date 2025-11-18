@@ -56,11 +56,11 @@ WAVELENGTH_STEPS: 10
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 10
-N_TARGETS: 1
+MC_SAMPLES: 3
+N_TARGETS: 3
 
 NOISE:
-  enabled: false
+  enabled: True
   sigma_abs: 0.03
   sigma_rel: 0.00
   per_channel: [1.0, 1.0, 1.0]
@@ -69,7 +69,7 @@ NOISE:
   clip_0_1: true
 
 SMOOTH:
-  enabled: false
+  enabled: True
   method: "gaussian"
   win: 15
   sigma: 2.5
