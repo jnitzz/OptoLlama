@@ -1,29 +1,49 @@
 import argparse
 import ast
-import importlib
-import importlib.util
+import json
 import os
-import sys
+from types import SimpleNamespace
 from typing import Any, Tuple
 
+import torch
 
-def import_config_module(config_arg: str) -> Any:
-    """
-    Return the imported module (treated as Any for flexibility).
+try:
+    import yaml  # type: ignore[import]
+except Exception:
+    yaml = None
 
-    Import a config either from a module name (e.g. 'config_MD60')
-    or from a Python file path (e.g. 'path/to/config_MD60.py').
+
+def load_config_file(config_arg: str) -> Any:
     """
-    if config_arg.endswith(".py") or os.path.sep in config_arg:
-        path = os.path.abspath(config_arg)
-        spec = importlib.util.spec_from_file_location("user_cfg", path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load config from path: {config_arg}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["user_cfg"] = module
-        spec.loader.exec_module(module)  # type: ignore[attr-defined]
-        return module
-    return importlib.import_module(config_arg)
+    Load config from a JSON/YAML file.
+
+    Supports:
+      - *.json
+      - *.yaml / *.yml
+
+    Returns a SimpleNamespace with attributes mapped from the file.
+    """
+    path = os.path.abspath(config_arg)
+    lower = path.lower()
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    if lower.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    elif lower.endswith(".yaml") or lower.endswith(".yml"):
+        if yaml is None:
+            raise ImportError("PyYAML is required to load YAML configs, but it is not installed.")
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    else:
+        raise ValueError(f"Config must be a .json or .yaml/.yml file (got: {config_arg})")
+
+    if not isinstance(raw, dict):
+        raise TypeError(f"Config file {path} must contain a top-level object/dict, got {type(raw).__name__}.")
+
+    return SimpleNamespace(**raw)
 
 
 def parse_kv(s: str) -> Tuple[str, Any]:
@@ -59,12 +79,16 @@ def set_top_level(cfg: Any, key: str, value: Any) -> None:
 def parse_arguments() -> argparse.Namespace:
     """Parse namespace arguments."""
     p = argparse.ArgumentParser()
-    p.add_argument("--notrain", action="store_true", help="Sets if training should not be called.")
+    p.add_argument(
+        "--notrain",
+        action="store_true",
+        help="Sets if training should not be called.",
+    )
     p.add_argument(
         "--config",
         type=str,
         required=True,
-        help="Config module or file (e.g., config_MD60 or path/to/config_MD60.py)",
+        help=("Config file (.json or .yaml/.yml), e.g. configs/config_[OL/OG]_[LOCAL/HPC].yaml"),
     )
     p.add_argument(
         "--validsim",
@@ -72,7 +96,12 @@ def parse_arguments() -> argparse.Namespace:
         default="TMM_FAST",
         help="Override validation simulator (TMM_FAST or NOSIM)",
     )
-    p.add_argument("--ckpt", type=str, default=None, help="Override PATH_CHKPT")
+    p.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="Override PATH_CHKPT",
+    )
     p.add_argument(
         "--mc-samples",
         type=int,
@@ -102,13 +131,8 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def load_config_with_overrides(args: argparse.Namespace) -> Any:
-    """
-    Return the cfg object (usually a module, but typed as Any).
-
-    Load the config module/file specified in args.config and apply
-    CLI overrides (mc_samples, ckpt, validsim, and --set KEY=VALUE).
-    """
-    cfg = import_config_module(args.config)
+    """Load config from JSON/YAML and apply CLI overrides."""
+    cfg = load_config_file(args.config)
 
     # Convenience flags
     if args.mc_samples is not None:
@@ -122,5 +146,18 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
     for s in args.sets:
         key, val = parse_kv(s)
         set_top_level(cfg, key, val)
+
+    if not hasattr(cfg, "WAVELENGTHS"):
+        if hasattr(cfg, "WAVELENGTH_MIN") and hasattr(cfg, "WAVELENGTH_MAX") and hasattr(cfg, "WAVELENGTH_STEPS"):
+            wl_min = int(cfg.WAVELENGTH_MIN)
+            wl_max = int(cfg.WAVELENGTH_MAX)
+            wl_step = int(cfg.WAVELENGTH_STEPS)
+
+            # compute the array, inclusive of max:
+            wl = torch.arange(wl_min, wl_max + 1, wl_step).to(int)
+
+            setattr(cfg, "WAVELENGTHS", wl)
+        else:
+            raise ValueError("Config must define either WAVELENGTHS or (WAVELENGTH_MIN, WAVELENGTH_MAX, WAVELENGTH_STEPS)")
 
     return cfg
