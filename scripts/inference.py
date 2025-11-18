@@ -1,11 +1,13 @@
-import json
 import csv
+import json
 import math
-import numpy as np
-import torch
-from utils import apply_noise, apply_smoothing, redistribute_mismatch
+from typing import Any, Dict, Literal, Optional, Union
 
-def normalize_rat_fill_crop(R, A, T, target=1.0):
+import torch
+from utils import apply_noise, apply_smoothing, ensure_3w, redistribute_mismatch
+
+
+def normalize_rat_fill_crop(r: torch.Tensor, a: torch.Tensor, t: torch.Tensor, target: float = 1.0) -> torch.Tensor:
     """
     Non-negative RAT with T as the filler and primary crop source.
 
@@ -17,77 +19,163 @@ def normalize_rat_fill_crop(R, A, T, target=1.0):
 
     Returns R, A, T as float arrays.
     """
-    R = np.maximum(np.asarray(R, dtype=float), 0.0)
-    A = np.maximum(np.asarray(A, dtype=float), 0.0)
-    T = np.maximum(np.asarray(T, dtype=float), 0.0)
+    r = torch.clamp(torch.as_tensor(r), min=0.0)
+    a = torch.clamp(torch.as_tensor(a), min=0.0)
+    t = torch.clamp(torch.as_tensor(t), min=0.0)
 
-    total = R + A + T
+    total = r + a + t
     # case 1: fill deficit into T
     deficit = target - total
     need = deficit > 0
-    T[need] += deficit[need]   # safe since deficit>0 only at 'need'
+    t[need] += deficit[need]  # safe since deficit>0 only at 'need'
 
     # case 2: crop excess from T, then A, then R
-    excess = (R + A + T) - target
-    over = np.maximum(excess, 0.0)
+    excess = (r + a + t) - target
+    over = torch.clamp(excess, 0.0)
     has_over = over > 0
 
-    if np.any(has_over):
+    if torch.any(has_over):
         # crop from T
-        cut = np.minimum(T[has_over], over[has_over])
-        T[has_over] -= cut
+        cut = torch.minimum(t[has_over], over[has_over])
+        t[has_over] -= cut
         over[has_over] -= cut
-        
+
         # crop from A
         still = over > 0
-        if np.any(still):
-            cut = np.minimum(A[still], over[still])
-            A[still] -= cut
+        if torch.any(still):
+            cut = torch.minimum(a[still], over[still])
+            a[still] -= cut
             over[still] -= cut
             # By construction, over should now be 0
-        
+
         # crop from R
         still = over > 0
-        if np.any(still):
-            cut = np.minimum(R[still], over[still])
-            R[still] -= cut
+        if torch.any(still):
+            cut = torch.minimum(r[still], over[still])
+            r[still] -= cut
             over[still] -= cut
-        
-    return R.astype(np.float32), A.astype(np.float32), T.astype(np.float32)
+
+    return r.to(torch.float32), a.to(torch.float32), t.to(torch.float32)
 
 
-def fwhm_to_sigma(fwhm):
+def fwhm_to_sigma(fwhm: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
+    """Convert Full Width at Half Maximum (FWHM) to sigma for Gaussian functions.
+
+    Args:
+        fwhm: Full Width at Half Maximum.
+
+    Returns
+    -------
+        Sigma value.
+    """
     return float(fwhm) / (2.0 * math.sqrt(2.0 * math.log(2.0)))
 
 
-def gaussian(x, center, fwhm, amplitude):
+def gaussian(
+    x: torch.Tensor,
+    center: Union[float, torch.Tensor],
+    fwhm: Union[float, torch.Tensor],
+    amplitude: Union[float, torch.Tensor],
+) -> torch.Tensor:
+    """Compute a Gaussian function.
+
+    Args:
+        x: Input tensor.
+        center: Center of the Gaussian.
+        fwhm: Full Width at Half Maximum.
+        amplitude: Amplitude of the Gaussian.
+
+    Returns
+    -------
+        Gaussian function evaluated at x.
+    """
     sigma = fwhm_to_sigma(fwhm)
-    return float(amplitude) * np.exp(-0.5 * ((x - float(center)) / sigma) ** 2)
+    return float(amplitude) * torch.exp(-0.5 * ((x - float(center)) / sigma) ** 2)
 
 
-def lorentzian(x, center, fwhm, amplitude):
+def lorentzian(
+    x: torch.Tensor,
+    center: Union[float, torch.Tensor],
+    fwhm: Union[float, torch.Tensor],
+    amplitude: Union[float, torch.Tensor],
+) -> torch.Tensor:
+    """Compute a Lorentzian function.
+
+    Args:
+        x: Input tensor.
+        center: Center of the Lorentzian.
+        fwhm: Full Width at Half Maximum.
+        amplitude: Amplitude of the Lorentzian.
+
+    Returns
+    -------
+        Lorentzian function evaluated at x.
+    """
     gamma = float(fwhm) / 2.0
-    return float(amplitude) * (gamma**2) / ((x - float(center))**2 + gamma**2)
+    return float(amplitude) * (gamma**2) / ((x - float(center)) ** 2 + gamma**2)
 
 
-def supergaussian(x, center, fwhm, amplitude, order=4):
-    # supergaussian: exp(-0.5 * ((x-c)/sigma)^(2*order))
+def supergaussian(
+    x: torch.Tensor,
+    center: Union[float, torch.Tensor],
+    fwhm: Union[float, torch.Tensor],
+    amplitude: Union[float, torch.Tensor],
+    order: int = 4,
+) -> torch.Tensor:
+    """Compute a super-Gaussian function.
+
+    Args:
+        x: Input tensor.
+        center: Center of the super-Gaussian.
+        fwhm: Full Width at Half Maximum.
+        amplitude: Amplitude of the super-Gaussian.
+        order: Order of the super-Gaussian (default: 4).
+
+    Returns
+    -------
+        Super-Gaussian function evaluated at x.
+    """
     sigma = fwhm_to_sigma(fwhm)
-    return float(amplitude) * np.exp(-0.5 * np.abs((x - float(center)) / sigma) ** (2 * int(order)))
+    return float(amplitude) * torch.exp(-0.5 * torch.abs((x - float(center)) / sigma) ** (2 * int(order)))
 
 
-def box(x, lo, hi, value):
+def box(x: torch.Tensor, lo: float, hi: float, value: float) -> torch.Tensor:
+    """Compute a box (step) function.
+
+    Args:
+        x: Input tensor.
+        lo: Lower bound of the box.
+        hi: Upper bound of the box.
+        value: Value of the box.
+
+    Returns
+    -------
+        Box function evaluated at x.
+    """
     lo, hi = float(lo), float(hi)
-    y = np.zeros_like(x, dtype=float)
+    y = torch.zeros_like(x, dtype=torch.float32)
     mask = (x >= lo) & (x <= hi)
     y[mask] = float(value)
     return y
 
 
-def linear_ramp(x, lo, hi, start, end):
+def linear_ramp(x: torch.Tensor, lo: float, hi: float, start: float, end: float) -> torch.Tensor:
+    """Compute a linear ramp function.
+
+    Args:
+        x: Input tensor.
+        lo: Lower bound of the ramp.
+        hi: Upper bound of the ramp.
+        start: Value at the start of the ramp.
+        end: Value at the end of the ramp.
+
+    Returns
+    -------
+        Linear ramp function evaluated at x.
+    """
+    y = torch.zeros_like(x, dtype=torch.float32)
     lo, hi = float(lo), float(hi)
     start, end = float(start), float(end)
-    y = np.zeros_like(x, dtype=float)
     m = (x >= lo) & (x <= hi)
     if hi > lo:
         t = (x[m] - lo) / (hi - lo)
@@ -95,14 +183,15 @@ def linear_ramp(x, lo, hi, start, end):
     return y
 
 
-def apply_combine(dst, src, how="overwrite"):
+def apply_combine(dst: torch.Tensor, src: torch.Tensor, how: str = "overwrite") -> torch.Tensor:
+    """Combine following the method defined in 'how'."""
     how = (how or "overwrite").lower()
     if how == "overwrite":
         return src
     if how == "max":
-        return np.maximum(dst, src)
+        return torch.maximum(dst, src)
     if how == "min":
-        return np.minimum(dst, src)
+        return torch.minimum(dst, src)
     if how == "add":
         return dst + src
     if how == "multiply":
@@ -110,11 +199,9 @@ def apply_combine(dst, src, how="overwrite"):
     raise ValueError(f"Unknown combine policy: {how}")
 
 
-def apply_json_edit(wl, arr, edit, combine="overwrite"):
-    """
-    Returns a new array after applying one edit to an existing target array.
-    """
-    edit = dict(edit)  # shallow copy
+def apply_json_edit(wl: torch.Tensor, arr: torch.Tensor, edit: Dict, combine: str = "overwrite") -> torch.Tensor:
+    """Return a new array after applying one edit to an existing target array."""
+    edit = dict(edit)
     typ = edit.get("type")
     # Optional wavelength mask
     rng = edit.get("range", None)
@@ -122,15 +209,15 @@ def apply_json_edit(wl, arr, edit, combine="overwrite"):
         lo, hi = float(rng[0]), float(rng[1])
         mask = (wl >= lo) & (wl <= hi)
     else:
-        mask = np.ones_like(wl, dtype=bool)
-        
+        mask = torch.ones_like(wl, dtype=bool)
+
     if "at" in edit and "value" in edit and typ is None:
         # point assignment
         x = float(edit["at"])
         v = float(edit["value"])
-        out = arr.copy()
+        out = arr.clone()
         # find nearest grid index
-        i = int(np.argmin(np.abs(wl - x)))
+        i = int(torch.argmin(torch.abs(wl - x)))
         # overwrite policy only makes sense at a point; treat others as overwrite here
         out[i] = v
         return out
@@ -142,7 +229,7 @@ def apply_json_edit(wl, arr, edit, combine="overwrite"):
         return apply_combine(arr, src, combine)
 
     # procedural shapes
-    tgt = np.zeros_like(arr, dtype=float)
+    tgt = torch.zeros_like(arr, dtype=float)
     if typ == "gaussian_peak":
         tgt = gaussian(wl, edit["center"], edit["fwhm"], edit["amplitude"])
     elif typ == "lorentzian_peak":
@@ -159,7 +246,7 @@ def apply_json_edit(wl, arr, edit, combine="overwrite"):
         raise ValueError(f"Unsupported edit type: {typ}")
 
     # Apply combine, but only inside mask; outside keep original
-    out = arr.copy()
+    out = arr.clone()
     combined = apply_combine(arr, tgt, combine)
     out[mask] = combined[mask]
     return out
@@ -168,114 +255,122 @@ def apply_json_edit(wl, arr, edit, combine="overwrite"):
 def load_spectra_from_json_or_csv(
     path: str,
     *,
-    expect_shape="3xW",
-    cfg=None,
-    wavelengths_override=None,
-    noise_cfg=None,
-    smooth_cfg=None,
-    mismatch_order=None,
-):
+    expect_shape: Literal["3xW", "Wx3", "chw", "hwc"] = "3xW",
+    cfg: Optional[object] = None,
+    wavelengths_override: Optional[torch.Tensor] = None,
+    noise_cfg: Optional[Dict[str, Any]] = None,
+    smooth_cfg: Optional[Dict[str, Any]] = None,
+    mismatch_order: Optional[str] = None,
+) -> torch.Tensor:
+    """Load spectra from a JSON or CSV file, with optional noise, smoothing, and normalization.
 
-    # figure out wavelengths (needed for sizing and range masks)
-    wl = None
-    if wavelengths_override is not None:
-        wl = wavelengths_override
-    elif cfg is not None and hasattr(cfg, "WAVELENGTHS"):
-        wl = getattr(cfg, "WAVELENGTHS")
+    Args:
+        path: Path to the JSON or CSV file.
+        expect_shape: Output shape format ("3xW" or "Wx3").
+        cfg: Configuration object (optional).
+        wavelengths_override: Override wavelengths (optional).
+        noise_cfg: Noise configuration (optional).
+        smooth_cfg: Smoothing configuration (optional).
+        mismatch_order: Order for redistributing mismatch (optional).
+
+    Returns
+    -------
+        Spectra tensor in the specified shape.
+
+    Raises
+    ------
+        ValueError: If wavelengths are not provided.
+    """
+    # --- Determine wavelengths
+    wl = (
+        wavelengths_override
+        if wavelengths_override is not None
+        else (getattr(cfg, "WAVELENGTHS", None) if cfg is not None else None)
+    )
     if wl is None:
         raise ValueError("WAVELENGTHS are required (provide cfg.WAVELENGTHS or wavelengths_override).")
-    wl = np.asarray(wl, dtype=np.float32)
-    W = int(wl.shape[0])
+    wl = torch.as_tensor(wl, dtype=torch.float32)
+    w = wl.shape[0]
 
+    # --- Load noise and smoothing configs
     ncfg = noise_cfg if noise_cfg is not None else (getattr(cfg, "NOISE", None) if cfg is not None else None)
     scfg = smooth_cfg if smooth_cfg is not None else (getattr(cfg, "SMOOTH", None) if cfg is not None else None)
-    morder = mismatch_order if mismatch_order is not None else (getattr(cfg, "MISMATCH_FILL_ORDER", "R>A>T") if cfg is not None else "R>A>T")
+    morder = (
+        mismatch_order
+        if mismatch_order is not None
+        else (getattr(cfg, "MISMATCH_FILL_ORDER", "R>A>T") if cfg is not None else "R>A>T")
+    )
 
-    # --- load
+    # --- Load data
     if path.lower().endswith(".json"):
         with open(path, "r") as f:
             data = json.load(f)
-
-        # Support your example format with defaults/edits/normalize_to
-        # If "spectra" key exists, we fall back to the old path.
         if "spectra" in data:
-            arr = np.asarray(data["spectra"], dtype=np.float32)
-            x = torch.from_numpy(arr)
-            x, _ = ensure_3W(x)
+            x = torch.as_tensor(data["spectra"], dtype=torch.float32)
+            x, _ = ensure_3w(x)
         else:
-            # --- build from defaults
+            # --- Build from defaults
             defaults = data.get("defaults", {})
-            R0 = float(defaults.get("R", 0.0))
-            A0 = float(defaults.get("A", 0.0))
-            T0 = float(defaults.get("T", 1.0))
-            base = np.stack([np.full(W, R0, np.float32),
-                             np.full(W, A0, np.float32),
-                             np.full(W, T0, np.float32)], axis=0)  # [3,W]
-
-            file_combine = (data.get("combine_policy")
-                            or data.get("combine")
-                            or "overwrite")
-            for e in data.get("edits", []):
-                if not isinstance(e, dict):
+            r0, a0, t0 = (
+                float(defaults.get("R", 0.0)),
+                float(defaults.get("A", 0.0)),
+                float(defaults.get("T", 1.0)),
+            )
+            base = torch.stack(
+                [
+                    torch.full((w,), r0, dtype=torch.float32),
+                    torch.full((w,), a0, dtype=torch.float32),
+                    torch.full((w,), t0, dtype=torch.float32),
+                ],
+                dim=0,
+            )  # shape: [3, W]
+            file_combine = data.get("combine_policy") or data.get("combine") or "overwrite"
+            for edit in data.get("edits", []):
+                if not isinstance(edit, dict):
                     continue
-                # Scalar channel edits (R/A/T, +R, *R etc.)
-                did_scalar = False
-                rng = e.get("range", None)
-                if rng and len(rng) == 2:
-                    lo, hi = float(rng[0]), float(rng[1])
-                    mask = (wl >= lo) & (wl <= hi)
-                else:
-                    mask = np.ones(W, dtype=bool)
-                for ch_name, idx in (("R",0), ("A",1), ("T",2)):
-                    if ch_name in e:
-                        base[idx, mask] = float(e[ch_name]); did_scalar = True
-                    if ("+"+ch_name) in e:
-                        base[idx, mask] = base[idx, mask] + float(e["+"+ch_name]); did_scalar = True
-                    if ("*"+ch_name) in e:
-                        base[idx, mask] = base[idx, mask] * float(e["*"+ch_name]); did_scalar = True
-
-                # Procedural edit (type/target)
-                if (not did_scalar) and ("type" in e):
-                    # allow single string or list for target(s)
-                    targets = e.get("target", "R")
-                    if isinstance(targets, str):
-                        targets = [targets]
-                    combine_policy = e.get("combine", file_combine) or "overwrite"
+                # Scalar channel edits
+                rng = edit.get("range")
+                mask = (wl >= float(rng[0])) & (wl <= float(rng[1])) if rng and len(rng) == 2 else torch.ones(w, dtype=bool)
+                for ch_name, idx in (("R", 0), ("A", 1), ("T", 2)):
+                    for op in ("", "+", "*"):
+                        key = f"{op}{ch_name}"
+                        if key in edit:
+                            val = float(edit[key])
+                            if op == "":
+                                base[idx, mask] = val
+                            elif op == "+":
+                                base[idx, mask] += val
+                            elif op == "*":
+                                base[idx, mask] *= val
+                # Procedural edits
+                if "type" in edit and not any(ch in edit for ch in ("R", "A", "T")):
+                    targets = edit.get("target", ["R"])
+                    targets = [targets] if isinstance(targets, str) else targets
+                    combine_policy = edit.get("combine", file_combine) or "overwrite"
                     for tname in targets:
                         tname = tname.upper()
-                        if tname not in ("R","A","T"):
-                            continue
-                        idx = {"R":0,"A":1,"T":2}[tname]
-                        base[idx] = apply_json_edit(wl, base[idx], e, combine=combine_policy)
-
-            x = torch.from_numpy(base)  # [3,W]
-
-            # Normalize using fill-crop (fill deficits into T, crop excess from T then A then R)
-            target_sum = float(data.get("normalize_to", 1.0))
-            Rn, An, Tn = normalize_rat_fill_crop(base[0], base[1], base[2], target=target_sum)
-            x = torch.from_numpy(np.stack([Rn, An, Tn], axis=0).astype(np.float32))
-
+                        if tname in ("R", "A", "T"):
+                            idx = {"R": 0, "A": 1, "T": 2}[tname]
+                            base[idx] = apply_json_edit(wl, base[idx], edit, combine=combine_policy)
+            # Normalize
+            rn, an, tn = normalize_rat_fill_crop(base[0], base[1], base[2], target=float(data.get("normalize_to", 1.0)))
+            x = torch.stack([rn, an, tn], dim=0)
     else:
-        # CSV path unchanged; adapt to your CSV layout as you already had
+        # --- Load from CSV
         with open(path, "r", newline="") as f:
-            reader = csv.reader(f)
-            rows = [[float(x) for x in r] for r in reader if len(r) > 0]
-        arr = np.asarray(rows, dtype=np.float32).T  # if rows=W, cols=3
-        x = torch.from_numpy(arr)
-        x, _ = ensure_3W(x)
+            rows = [[float(x) for x in row] for row in csv.reader(f) if row]
+        x = torch.tensor(rows, dtype=torch.float32).T  # shape: [3, W]
+        x, _ = ensure_3w(x)
 
-    # --- final processing: noise -> smoothing -> enforce sum to 1 with order
+    # --- Final processing
     x = apply_noise(x, ncfg, wl)
     x = apply_smoothing(x, scfg)
-    # Keep a small final correction, but DO NOT re-create a zero-baseline fill into R
-    # If you want to be extra safe, prefer filling into T by default:
-    #   (set cfg.MISMATCH_FILL_ORDER = "T>A>R")
     x = redistribute_mismatch(x, morder, target_sum=1.0)
-    x = x.to(torch.float32)
-    # --- output shape
+
+    # --- Return in expected shape
     if expect_shape.lower() in ("3xw", "chw"):
-        return x  # [3,W]
+        return x
     elif expect_shape.lower() in ("wx3", "hwc"):
-        return x.permute(1, 0).contiguous()  # [W,3]
+        return x.permute(1, 0).contiguous()
     else:
         return x
