@@ -350,7 +350,7 @@ def redistribute_mismatch(tar_spec: torch.Tensor, order: str, target_sum: float 
     return tar_spec.squeeze(0) if orig_dim == 2 else tar_spec
 
 
-def apply_noise(tar_spec: torch.Tensor, noise_cfg: dict, wavelengths: Any) -> torch.Tensor:
+def apply_noise(tar_spec: torch.Tensor, noise_cfg: Optional[Dict[str, Any]], wavelengths: Any) -> torch.Tensor:
     """Apply noise to the target spectrum following the noise config."""
     if not noise_cfg or not noise_cfg.get("enabled", False):
         return tar_spec
@@ -386,7 +386,7 @@ def apply_noise(tar_spec: torch.Tensor, noise_cfg: dict, wavelengths: Any) -> to
     return tar_spec.squeeze(0) if orig_dim == 2 else tar_spec
 
 
-def apply_smoothing(tar_spec: torch.Tensor, smooth_cfg: dict) -> torch.Tensor:
+def apply_smoothing(tar_spec: torch.Tensor, smooth_cfg: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Smooth the target spectrum following the window and sigma in the dict."""
     if not smooth_cfg or not smooth_cfg.get("enabled", False):
         return tar_spec
