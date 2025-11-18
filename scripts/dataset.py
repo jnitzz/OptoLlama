@@ -118,8 +118,8 @@ def make_loader(
     ds = SpectraDataset(dataset_path)
 
     # --- optional subset for quick debugging ---
-    if subset_n is not None and subset_n < len(ds):
-        idxs = unique_length_int_generator(0e0, len(ds) - 1, subset_n)
+    if subset_n is not None and subset_n < ds.length_dataset:
+        idxs = unique_length_int_generator(0e0, ds.length_dataset - 1, subset_n)
         ds = Subset(ds, idxs)
 
     # --- configure sampler and shuffling ---
