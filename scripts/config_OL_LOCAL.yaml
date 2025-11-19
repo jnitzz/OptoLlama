@@ -1,4 +1,4 @@
-RUN_NAME: "MD65"
+RUN_NAME: "MD66"
 DATA_DIR: "TF_safetensors"
 OL_MODEL: "optollama"
 
@@ -6,7 +6,7 @@ OL_MODEL: "optollama"
 # Adjust this root if necessary:
 PATH: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama"
 
-PATH_RUN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD65"
+PATH_RUN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD66"
 PATH_DATA: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors"
 PATH_MATERIALS: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/NK"
 
@@ -15,8 +15,8 @@ PATH_TRAIN_0: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetens
 PATH_TOKEN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/tokens.json"
 PATH_VALID: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/test.safetensors"
 
-PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD65/results"
-PATH_CHKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD65/results/ol3l-checkpoint_best.pt"
+PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD66/results"
+PATH_CHKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD66/results/ol3l-checkpoint_best.pt"
 
 # --- training / model hyperparameters (same as HPC) ---
 NUM_WORKERS: 4
@@ -49,8 +49,10 @@ INCIDENCE_ANGLE: 0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 20
-N_TARGETS: 5
+MC_SAMPLES: 2
+N_TARGETS: 1
+
+VALIDSIM: TMM_FAST
 
 NOISE:
   enabled: false
