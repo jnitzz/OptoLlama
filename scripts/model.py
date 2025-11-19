@@ -1,11 +1,13 @@
 import torch
-from optollama import OptoLlama
+import torch.nn as nn
 from optogpt import OriginalDecoderWrapper
+from optollama import OptoLlama
+
 
 def build_model(
     *,
     model_type: str,
-    sample_spectrum: torch.Tensor,   # provide a [1,3,W] example
+    sample_spectrum: torch.Tensor,  # provide a [1,3,W] example
     vocab_size: int,
     max_stack_depth: int,
     d_model: int,
@@ -18,37 +20,55 @@ def build_model(
     pad_idx: int,
     eos_idx: int,
     device: str,
-):
+    temperature: float = 0.0,
+    top_k: int = 0,
+    top_p: float = 0.0,
+) -> nn.Module:
+    """Build and return the configured sequence model (OptoGPT or OptoLlama)."""
     mt = (model_type or "optollama").lower()
-    
+
     if mt == "optogpt":
-        return OriginalDecoderWrapper(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            n_layers=n_blocks,
-            n_heads=n_heads,
-            d_ff=4*d_model,
-            dropout=dropout,
-            max_len=max_stack_depth,
-            mask_idx=mask_idx,
-            pad_idx=pad_idx,
-            eos_idx=eos_idx,
-            spectrum_flat_dim=max(sample_spectrum.size())*min(sample_spectrum.size()),
-        ).to(torch.float32).to(device)
+        return (
+            OriginalDecoderWrapper(
+                vocab_size=vocab_size,
+                d_model=d_model,
+                n_layers=n_blocks,
+                n_heads=n_heads,
+                d_ff=4 * d_model,
+                dropout=dropout,
+                max_len=max_stack_depth,
+                mask_idx=mask_idx,
+                pad_idx=pad_idx,
+                eos_idx=eos_idx,
+                spectrum_flat_dim=max(sample_spectrum.size()) * min(sample_spectrum.size()),
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            .to(torch.float32)
+            .to(device)
+        )
     elif mt == "optollama":
-        return OptoLlama(
-            spectra_dim=max(sample_spectrum.size()),
-            vocab_size=vocab_size,
-            timesteps=timesteps,
-            max_stack_depth=max_stack_depth,
-            eos_idx=eos_idx,
-            mask_idx=mask_idx,
-            pad_idx=pad_idx,
-            d_model=d_model,
-            n_blocks=n_blocks,
-            n_heads=n_heads,
-            dropout=dropout,
-            idx_to_token=idx_to_token,
-        ).to(torch.float32).to(device)
+        return (
+            OptoLlama(
+                spectra_dim=max(sample_spectrum.size()),
+                vocab_size=vocab_size,
+                timesteps=timesteps,
+                max_stack_depth=max_stack_depth,
+                eos_idx=eos_idx,
+                mask_idx=mask_idx,
+                pad_idx=pad_idx,
+                d_model=d_model,
+                n_blocks=n_blocks,
+                n_heads=n_heads,
+                dropout=dropout,
+                idx_to_token=idx_to_token,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            .to(torch.float32)
+            .to(device)
+        )
     else:
         raise ValueError(f"Unsupported model key: {mt}")
