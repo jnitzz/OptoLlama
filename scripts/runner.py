@@ -1,20 +1,23 @@
-import os
 import datetime
+import os
 import random
+from typing import Any, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.distributed as dist
-import numpy as np
-from typing import Optional, Tuple
+
 
 def init_distributed(
-    *,
-    force_backend: Optional[str] = None,   # "nccl" | "gloo" | "mpi" | "auto" | None
-    prefer_slurm_addr: bool = True,        # use SLURM_LAUNCH_NODE_IPADDR if present
-    prefer_tcp: bool = False,              # set NCCL_IB_DISABLE=1 (+ optional P2P off)
+    force_backend: Optional[str] = None,  # "nccl" | "gloo" | "mpi" | "auto" | None
+    prefer_slurm_addr: bool = True,  # use SLURM_LAUNCH_NODE_IPADDR if present
+    prefer_tcp: bool = False,  # set NCCL_IB_DISABLE=1 (+ optional P2P off)
     timeout_minutes: float = 10.0,
     log_env: bool = False,
 ) -> Tuple[str, int, int, int]:
     """
+    Init torch.distributed if plausible.
+
     Initialize (or skip) torch.distributed with sensible defaults for:
       - SLURM multi-node (srun)
       - torchrun / launch
@@ -24,8 +27,8 @@ def init_distributed(
     """
     # Fast path: already initialized (e.g., inside a library re-entry)
     if dist.is_available() and dist.is_initialized():
-        rank      = dist.get_rank()
-        world_sz  = dist.get_world_size()
+        rank = dist.get_rank()
+        world_sz = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
         # print(rank,world_sz,local_rank)
         if torch.cuda.is_available():
@@ -37,7 +40,7 @@ def init_distributed(
 
     # Infer basic topology from env
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
-    rank       = int(os.environ.get("RANK",       os.environ.get("SLURM_PROCID", "0")))
+    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
     local_rank_env = os.environ.get("LOCAL_RANK")
     local_rank = int(local_rank_env) if local_rank_env is not None else int(os.environ.get("SLURM_LOCALID", "0"))
 
@@ -77,7 +80,7 @@ def init_distributed(
         except Exception:
             nccl_ok = False
         backend = "nccl" if (torch.cuda.is_available() and nccl_ok) else "gloo"
-    
+
     # Initialize the process group
     dist.init_process_group(
         backend=backend,
@@ -97,12 +100,12 @@ def init_distributed(
         device_str = f"cuda:{local_rank}"
     else:
         device_str = "cpu"
-    
+
     if log_env and rank == 0:
         print(
             f"[DDP] backend={backend} world={world_size} rank={rank} "
             f"local_rank={local_rank} master={os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')} "
-            f"cuda={torch.cuda.is_available()} ib_disabled={os.environ.get('NCCL_IB_DISABLE','0')}"
+            f"cuda={torch.cuda.is_available()} ib_disabled={os.environ.get('NCCL_IB_DISABLE', '0')}"
         )
 
     return device_str, local_rank, rank, world_size
@@ -113,6 +116,7 @@ def _is_ddp() -> bool:
 
 
 def set_all_seeds(seed: int = 42) -> None:
+    """Set numpy, random, torch and cuda seed."""
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
@@ -120,16 +124,18 @@ def set_all_seeds(seed: int = 42) -> None:
 
 
 def set_torch_options() -> None:
+    """Set basic torch options."""
     torch._C._jit_set_profiling_mode(False)
     torch._C._jit_set_profiling_executor(False)
     torch._C._jit_override_can_fuse_on_cpu(True)
     torch._C._jit_override_can_fuse_on_gpu(True)
-    
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_printoptions(threshold=int(1e10))
 
 
-def setup_run(cfg, make_dirs=False):
+def setup_run(cfg: Any, make_dirs: bool = False) -> Tuple[str, int, int, int]:
+    """Run init_distributed, set the seeds and create dirs."""
     device, local_rank, rank, world_size = init_distributed()
     seed = getattr(cfg, "SEED", random.randint(1, int(1e6)))
     set_all_seeds(seed)
