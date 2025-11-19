@@ -93,7 +93,7 @@ def parse_arguments() -> argparse.Namespace:
     p.add_argument(
         "--validsim",
         type=str,
-        default="TMM_FAST",
+        default=None,
         help="Override validation simulator (TMM_FAST or NOSIM)",
     )
     p.add_argument(
@@ -127,6 +127,44 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Path to a JSON/CSV RAT file for interactive inference.",
     )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Override TEMPERATURE (sampling temperature)",
+    )
+    p.add_argument(
+        "--top-k",
+        dest="top_k",
+        type=int,
+        default=None,
+        help="Override TOP_K (top-k sampling)",
+    )
+    p.add_argument(
+        "--top-p",
+        dest="top_p",
+        type=float,
+        default=None,
+        help="Override TOP_P (top-p / nucleus sampling)",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Global default batch size (fallback for train/valid batches).",
+    )
+    p.add_argument(
+        "--train-batch",
+        type=int,
+        default=None,
+        help="Training batch size (overrides BATCH_SIZE for train).",
+    )
+    p.add_argument(
+        "--valid-batch",
+        type=int,
+        default=None,
+        help="Validation batch size (overrides BATCH_SIZE for valid).",
+    )
     return p.parse_args()
 
 
@@ -134,30 +172,66 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
     """Load config from JSON/YAML and apply CLI overrides."""
     cfg = load_config_file(args.config)
 
-    # Convenience flags
+    # --- convenience flags (CLI wins) ---
     if args.mc_samples is not None:
-        set_top_level(cfg, "MC_SAMPLES", int(args.mc_samples))
+        set_top_level(cfg, "MC_SAMPLES", args.mc_samples)
     if args.ckpt is not None:
         set_top_level(cfg, "PATH_CHKPT", args.ckpt)
     if args.validsim is not None:
         set_top_level(cfg, "VALIDSIM", args.validsim)
 
-    # Generic top-level --set KEY=VALUE
+    # --- generic top-level --set KEY=VALUE (config-level overrides) ---
     for s in args.sets:
         key, val = parse_kv(s)
         set_top_level(cfg, key, val)
 
+    # apply CLI overrides into cfg
+    if args.batch_size is not None:
+        set_top_level(cfg, "BATCH_SIZE", args.batch_size)
+    if args.train_batch is not None:
+        set_top_level(cfg, "TRAIN_BATCH", args.train_batch)
+    if args.valid_batch is not None:
+        set_top_level(cfg, "VALID_BATCH", args.valid_batch)
+
+    #  derive TRAIN_BATCH / VALID_BATCH with fallbacks
+    #  precedence: explicit TRAIN/VALID -> BATCH_SIZE -> hardcoded default
+    train_batch = int(getattr(cfg, "TRAIN_BATCH", getattr(cfg, "BATCH_SIZE", 256)))
+
+    valid_batch = int(getattr(cfg, "VALID_BATCH", getattr(cfg, "BATCH_SIZE", 64)))
+    set_top_level(cfg, "TRAIN_BATCH", train_batch)
+    set_top_level(cfg, "VALID_BATCH", valid_batch)
+
+    # (optional) if you want, also normalize BATCH_SIZE itself:
+    if not hasattr(cfg, "BATCH_SIZE"):
+        set_top_level(cfg, "BATCH_SIZE", train_batch)
+
+    # --- fill VALIDSIM default if still missing ---
+    if not hasattr(cfg, "VALIDSIM"):
+        set_top_level(cfg, "VALIDSIM", "TMM_FAST")
+
+    # --- build WAVELENGTHS if needed ---
     if not hasattr(cfg, "WAVELENGTHS"):
         if hasattr(cfg, "WAVELENGTH_MIN") and hasattr(cfg, "WAVELENGTH_MAX") and hasattr(cfg, "WAVELENGTH_STEPS"):
             wl_min = int(cfg.WAVELENGTH_MIN)
             wl_max = int(cfg.WAVELENGTH_MAX)
             wl_step = int(cfg.WAVELENGTH_STEPS)
-
-            # compute the array, inclusive of max:
             wl = torch.arange(wl_min, wl_max + 1, wl_step).to(int)
-
             setattr(cfg, "WAVELENGTHS", wl)
         else:
             raise ValueError("Config must define either WAVELENGTHS or (WAVELENGTH_MIN, WAVELENGTH_MAX, WAVELENGTH_STEPS)")
+
+    # precedence: CLI flags > config values > hardcoded default
+    temperature = args.temperature if args.temperature is not None else float(getattr(cfg, "TEMPERATURE", 0.0))
+    top_k = args.top_k if args.top_k is not None else int(getattr(cfg, "TOP_K", 0))
+    top_p = args.top_p if args.top_p is not None else float(getattr(cfg, "TOP_P", 0.0))
+
+    # normalize
+    temperature = float(temperature or 0.0)
+    top_k = int(top_k or 0)
+    top_p = float(top_p or 0.0)
+
+    set_top_level(cfg, "TEMPERATURE", temperature)
+    set_top_level(cfg, "TOP_K", top_k)
+    set_top_level(cfg, "TOP_P", top_p)
 
     return cfg
