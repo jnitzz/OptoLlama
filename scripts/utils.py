@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as f
 from safetensors.torch import load_file, save_file
-from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 PAD_TOKEN = "<PAD>"
@@ -219,45 +218,6 @@ def load_checkpoint(
         start_epoch = int(blob["epoch"]) + 1  # resume on next epoch
 
     return start_epoch, blob
-
-
-def apply_sampling_from_sources(
-    model: nn.Module,
-    *,
-    args: Optional[Any] = None,
-    cfg: Optional[Any] = None,
-    default_temp: float = 0.0,
-    default_top_k: int = 0,
-    default_top_p: float = 0.0,
-) -> Dict[str, float]:
-    """
-    Configure sampling parameters (temperature, top_k, top_p) on a model.
-
-    Precedence: CLI args (if present) > cfg attributes > defaults.
-    Returns a dict of the effective values for logging.
-    """
-    # precedence: CLI args (if present) > cfg attributes > defaults
-    temperature = getattr(args, "temperature", None)
-    top_k = getattr(args, "top_k", None)
-    top_p = getattr(args, "top_p", None)
-
-    if temperature is None:
-        temperature = float(getattr(cfg, "TEMPERATURE", default_temp)) if cfg else default_temp
-    if top_k is None:
-        top_k = int(getattr(cfg, "TOP_K", default_top_k)) if cfg else default_top_k
-    if top_p is None:
-        top_p = float(getattr(cfg, "TOP_P", default_top_p)) if cfg else default_top_p
-
-    # normalize bad/disabled values
-    temperature = float(temperature or 0.0)
-    top_k = int(top_k or 0)
-    top_p = float(top_p or 0.0)
-
-    if hasattr(model, "set_sampling"):
-        model.set_sampling(temperature=temperature, top_k=top_k, top_p=top_p)
-
-    # return for logging/saving if you like
-    return {"temperature": temperature, "top_k": top_k, "top_p": top_p}
 
 
 def boxcar_kernel(win: int, device: str) -> torch.Tensor:
