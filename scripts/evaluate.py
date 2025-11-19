@@ -1,28 +1,32 @@
-import torch
 from typing import Any, Dict, List, Literal, Optional
+
+import torch
 from metrics import masked_mae, token_accuracy
 from simulation_TMM_FAST import TMMContext
 
-def _simulate_spectra_ids(
-    ids: torch.Tensor, tmm_ctx: TMMContext, *, eos: int, pad: int, msk: int
-) -> torch.Tensor:
+
+def simulate_spectra_ids(ids: torch.Tensor, tmm_ctx: TMMContext, *, eos: int, pad: int, msk: int) -> torch.Tensor:
     """
+    Simulate the RAT spectra from the token ids.
+
     ids: [B, S] int tokens
     returns: [B, W, 3] float32   (R, A, T along the last dim)
     """
     tmm, wl, theta = tmm_ctx
     out = tmm(ids, wl, theta, eos=eos, pad=pad, msk=msk)  # typically [B, 3, W]
-    
+
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
 
 
 @torch.no_grad()
 def validate_model(
     model: torch.nn.Module,
-    loader,
+    loader: Any,
     *,
-    mode: Literal['NOSIM', 'TMM_FAST'],
-    eos: int, pad: int, msk: int,
+    mode: Literal["NOSIM", "TMM_FAST"],
+    eos: int,
+    pad: int,
+    msk: int,
     device: torch.device,
     idx_to_token: Dict[int, str],
     tmm_ctx: Optional[TMMContext] = None,
@@ -39,10 +43,13 @@ def validate_model(
       - 'mean_mae' (float | None)  # only for TMM_FAST
       - 'results'  (list of per-example dicts)  # Present only on rank 0
     """
-    is_ddp = (world_size > 1)
+    is_ddp = world_size > 1
     model.eval()
 
-    do_sim = (mode.upper() == 'TMM_FAST')
+    do_sim = mode.upper() == "TMM_FAST"
+    if do_sim and tmm_ctx is None:
+        raise ValueError("tmm_ctx must be provided when mode='TMM_FAST'")
+
     results: List[Dict[str, Any]] = []
 
     sum_acc = 0.0
@@ -61,12 +68,12 @@ def validate_model(
             running_idx += stacks.size(0)
 
         spectra = spectra.to(device, non_blocking=True)  # [B,3,W]
-        stacks  = stacks.to(device, non_blocking=True)   # [B,S]
-        B = spectra.size(0)
+        stacks = stacks.to(device, non_blocking=True)  # [B,S]
+        b = spectra.size(0)
 
-        best_mae = torch.full((B,), float('inf'), device=device)
-        best_pred_spectra = None
-        best_pred_ids = None
+        best_mae = torch.full((b,), float("inf"), device=device)
+        best_pred_spectra: Optional[torch.Tensor] = None
+        best_pred_ids: Optional[torch.Tensor] = None
 
         # ---- MC loop ----
         for s in range(max(1, int(mc_samples))):
@@ -74,37 +81,44 @@ def validate_model(
             ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
 
             if do_sim:
-                pred = _simulate_spectra_ids(ids, tmm_ctx, eos=eos, pad=pad, msk=msk)  # [B,W,3]
+                assert tmm_ctx is not None
+                pred = simulate_spectra_ids(ids, tmm_ctx, eos=eos, pad=pad, msk=msk)  # [B,3,W]
                 mae_s = masked_mae(spectra, pred)  # [B]
             else:
                 pred = None
-                mae_s = torch.zeros(B, device=device)
+                mae_s = torch.zeros(b, device=device)
 
             # update best
             take_mae = mae_s < best_mae
             take = take_mae
             best_mae = torch.where(take, mae_s, best_mae)
+
             if best_pred_spectra is None:
-                best_pred_spectra = pred if pred is not None else None
+                if pred is not None:
+                    best_pred_spectra = pred
                 best_pred_ids = ids
             else:
-                if pred is not None:
-                    best_pred_spectra = torch.where(take.view(B, 1, 1), pred, best_pred_spectra)
-                best_pred_ids = torch.where(take.view(B, 1), ids, best_pred_ids)
+                if pred is not None and best_pred_spectra is not None:
+                    best_pred_spectra = torch.where(take.view(b, 1, 1), pred, best_pred_spectra)
+                if best_pred_ids is None:
+                    best_pred_ids = ids
+                else:
+                    best_pred_ids = torch.where(take.view(b, 1), ids, best_pred_ids)
 
         # Metrics on best
-        L = min(stacks.size(1), best_pred_ids.size(1))
-        stacks_aligned = stacks[:, :L]
-        ids_aligned = best_pred_ids[:, :L]
+        assert best_pred_ids is not None, "MC loop did not produce any predictions"
+        len_seq = min(stacks.size(1), best_pred_ids.size(1))
+        stacks_aligned = stacks[:, :len_seq]
+        ids_aligned = best_pred_ids[:, :len_seq]
 
         acc_g, acc_vec = token_accuracy(stacks_aligned, ids_aligned, eos, pad, msk)
-        sum_acc += float(acc_g)                                         #TODO check if to use .item() here instead
+        sum_acc += float(acc_g)  # TODO check if to use .item() here instead
         if do_sim and best_pred_spectra is not None:
             sum_mae += float(masked_mae(spectra, best_pred_spectra).mean().item())
         n_batches += 1
 
         # per-example records
-        for i in range(B):
+        for i in range(b):
             tgt_ids = stacks_aligned[i].tolist()
             try:
                 tgt_len = tgt_ids.index(eos)
@@ -127,18 +141,20 @@ def validate_model(
                 "stack_pred_tokens": pred_tokens,
             }
             if do_sim and best_pred_spectra is not None:
-                rec.update({
-                    "mae": float(best_mae[i].item()),
-                    "rat_target_flat": spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
-                    "rat_pred_flat":   best_pred_spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
-                    "rat_target": spectra[i].detach().cpu().numpy().tolist(),
-                    "rat_pred":   best_pred_spectra[i].detach().cpu().numpy().tolist(),
-                })
+                rec.update(
+                    {
+                        "mae": float(best_mae[i].item()),
+                        "rat_target_flat": spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
+                        "rat_pred_flat": best_pred_spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
+                        "rat_target": spectra[i].detach().cpu().numpy().tolist(),
+                        "rat_pred": best_pred_spectra[i].detach().cpu().numpy().tolist(),
+                    }
+                )
             results.append(rec)
 
     # DDP gather results
     if gather and is_ddp:
-        gathered_lists = [None for _ in range(world_size)]
+        gathered_lists: List[List[Dict[str, Any]]] = [[] for _ in range(world_size)]
         torch.distributed.all_gather_object(gathered_lists, results)
         if rank == 0:
             merged: List[Dict[str, Any]] = []
@@ -152,5 +168,5 @@ def validate_model(
     }
     if (not is_ddp) or rank == 0:
         out["results"] = results
-        
+
     return out
