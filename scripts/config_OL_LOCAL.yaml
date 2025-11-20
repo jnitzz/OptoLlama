@@ -1,12 +1,12 @@
-RUN_NAME: "MD66"
+RUN_NAME: "MD65"
 DATA_DIR: "TF_safetensors"
-OL_MODEL: "optollama"
+MODEL_KEY: "optollama"
 
 # --- LOCAL machine paths (Windows) ---
 # Adjust this root if necessary:
 PATH: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama"
 
-PATH_RUN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD66"
+PATH_RUN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD65"
 PATH_DATA: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors"
 PATH_MATERIALS: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/NK"
 
@@ -15,8 +15,8 @@ PATH_TRAIN_0: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetens
 PATH_TOKEN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/tokens.json"
 PATH_VALID: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/test.safetensors"
 
-PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD66/results"
-PATH_CHKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD66/results/ol3l-checkpoint_best.pt"
+PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD65/results"
+PATH_CKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD65/results/ol3l-checkpoint_best.pt"
 
 # --- training / model hyperparameters (same as HPC) ---
 NUM_WORKERS: 4
@@ -49,14 +49,22 @@ INCIDENCE_ANGLE: 0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 2
-N_TARGETS: 1
+MC_SAMPLES: 0
+N_TARGETS: 0
 
 VALIDSIM: TMM_FAST
 
+TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandpass.json"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandstop.json"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_gaussian_peak.json"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_flat_absorber.json"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_thermal_reflector.json",
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/morpho.csv",
+
+
 NOISE:
-  enabled: false
-  sigma_abs: 0.03
+  enabled: true
+  sigma_abs: 0.1
   sigma_rel: 0.00
   per_channel: [1.0, 1.0, 1.0]
   wl_min: 300
@@ -64,9 +72,9 @@ NOISE:
   clip_0_1: true
 
 SMOOTH:
-  enabled: false
+  enabled: true
   method: "gaussian"
-  win: 15
-  sigma: 2.5
+  win: 10
+  sigma: 2.0
 
 MISMATCH_FILL_ORDER: "R>T>A"
