@@ -187,6 +187,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
         set_top_level(cfg, "VALIDSIM", args.validsim)
     if args.n_targets is not None:
         set_top_level(cfg, "N_TARGETS", int(args.n_targets))
+    if args.target is not None:
+        set_top_level(cfg, "TARGET", str(args.target))
 
     # --- generic top-level --set KEY=VALUE (config-level overrides) ---
     for s in args.sets:
