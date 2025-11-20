@@ -189,6 +189,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
         set_top_level(cfg, "N_TARGETS", int(args.n_targets))
     if args.target is not None:
         set_top_level(cfg, "TARGET", str(args.target))
+    if getattr(args, "notrain", False):
+        set_top_level(cfg, "NOTRAIN", True)
 
     # --- generic top-level --set KEY=VALUE (config-level overrides) ---
     for s in args.sets:
