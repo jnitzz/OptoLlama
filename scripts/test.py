@@ -20,7 +20,6 @@ from utils import init_tokenmaps, load_checkpoint, save_as_json
 @torch.no_grad()
 def run_inference(
     cfg: Any,
-    validsim: Optional[str] = "TMM_FAST",
     ckpt: Optional[str] = None,
     mc_samples: Optional[int] = None,
     target: Optional[str] = None,
@@ -41,10 +40,6 @@ def run_inference(
         ``MODEL_KEY``, ``D_MODEL``, ``N_BLOCKS``, ``N_HEADS``,
         ``STEPS``, ``DROPOUT``, ``MC_SAMPLES``, ``N_TARGETS``,
         ``NUM_SAMPLES_VALID``, ``VALID_BATCH``, ``MISMATCH_FILL_ORDER``, etc.
-    validsim:
-        Name of the simulator mode used inside validation. Typical values are
-        ``"TMM_FAST"`` (full optical simulation) or ``"NOSIM"`` (token metrics
-        only). If ``None``, defaults to ``"TMM_FAST"``.
     ckpt:
         Optional checkpoint path overriding ``cfg.PATH_CKPT``. If provided and
         the file (or its ``*_best`` variant) exists, the model weights are
@@ -170,8 +165,7 @@ def run_inference(
 
     # Optional TMM context
     tmm_ctx = None
-    mode = (validsim or "NOSIM").upper()
-    if mode == "TMM_FAST":
+    if cfg.VALIDSIM == "TMM_FAST":
         try:
             tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
         except Exception as e:
@@ -228,7 +222,6 @@ if __name__ == "__main__":
 
     out = run_inference(
         cfg=cfg,
-        validsim=cfg.VALIDSIM,
         ckpt=cfg.PATH_CKPT,
         mc_samples=cfg.MC_SAMPLES,
         target=cfg.TARGET,
