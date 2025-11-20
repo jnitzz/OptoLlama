@@ -175,7 +175,7 @@ def run_inference(
         try:
             tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
         except Exception as e:
-            print(f"⚠️  Could not initialize TMM context, falling back to NOSIM: {e}")
+            print(f"Could not initialize TMM context, falling back to NOSIM: {e}")
             mode = "NOSIM"
 
     # Run validate_model — for a single item, it will still return the generated stack(s)
@@ -206,7 +206,7 @@ def run_inference(
             save_as_json(cfg.PATH_SAVED, out.get("results", []), f"results_{base}_{tag}")
             print(f"💾 Saved {len(out.get('results', []))} record(s) to {cfg.PATH_SAVED}")
         except Exception as e:
-            print(f"⚠️  Could not save results JSON: {e}")
+            print(f"Could not save results JSON: {e}")
 
     # Summary (accuracy/MAE may be None for single target without ground-truth)
     if out.get("mean_acc") is not None:
