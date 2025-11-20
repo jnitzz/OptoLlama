@@ -97,10 +97,10 @@ def parse_arguments() -> argparse.Namespace:
         help="Override validation simulator (TMM_FAST or NOSIM)",
     )
     p.add_argument(
-        "--ckpt",
+        "--path-ckpt",
         type=str,
         default=None,
-        help="Override PATH_CHKPT",
+        help="Override PATH_CKPT",
     )
     p.add_argument(
         "--mc-samples",
@@ -181,8 +181,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
     # --- convenience flags (CLI wins) ---
     if args.mc_samples is not None:
         set_top_level(cfg, "MC_SAMPLES", args.mc_samples)
-    if args.ckpt is not None:
-        set_top_level(cfg, "PATH_CHKPT", args.ckpt)
+    if args.path_ckpt is not None:
+        set_top_level(cfg, "PATH_CKPT", args.path_ckpt)
     if args.validsim is not None:
         set_top_level(cfg, "VALIDSIM", args.validsim)
     if args.n_targets is not None:
