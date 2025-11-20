@@ -128,6 +128,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Path to a JSON/CSV RAT file for interactive inference.",
     )
     p.add_argument(
+        "--n-targets",
+        type=int,
+        default=None,
+        help="Override N_TARGETS from the config (number of design targets / repeated runs).",
+    )
+    p.add_argument(
         "--temperature",
         type=float,
         default=None,
@@ -179,6 +185,8 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
         set_top_level(cfg, "PATH_CHKPT", args.ckpt)
     if args.validsim is not None:
         set_top_level(cfg, "VALIDSIM", args.validsim)
+    if args.n_targets is not None:
+        set_top_level(cfg, "N_TARGETS", int(args.n_targets))
 
     # --- generic top-level --set KEY=VALUE (config-level overrides) ---
     for s in args.sets:
