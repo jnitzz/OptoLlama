@@ -113,12 +113,10 @@ def train(cfg: Any) -> None:
         valid_mae = blob.get("valid_mae", valid_mae)
 
         # robust bests
-        acc_arr = valid_acc.detach().cpu().numpy()
-        if torch.any(torch.isfinite(acc_arr)):
-            best_valid_acc = float(torch.nanmax(acc_arr[torch.isfinite(acc_arr)]))
-        mae_arr = valid_mae.detach().cpu().numpy()
-        if torch.any(torch.isfinite(mae_arr)):
-            best_valid_mae = float(torch.nanmin(mae_arr[torch.isfinite(mae_arr)]))
+        if torch.any(torch.isfinite(valid_acc)):
+            best_valid_acc = float(torch.max(valid_acc[torch.isfinite(valid_acc)]))
+        if torch.any(torch.isfinite(valid_mae)):
+            best_valid_mae = float(torch.min(valid_mae[torch.isfinite(valid_mae)]))
 
     # ------------------------------ epochs ------------------------------
     for epoch in range(start_epoch, cfg.EPOCHS):

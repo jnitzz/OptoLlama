@@ -7,7 +7,7 @@ from optollama import OptoLlama
 def build_model(
     *,
     model_type: str,
-    sample_spectrum: torch.Tensor,  # provide a [1,3,W] example
+    sample_spectrum: torch.Tensor,  # provide a [(1),3,W] example
     vocab_size: int,
     max_stack_depth: int,
     d_model: int,

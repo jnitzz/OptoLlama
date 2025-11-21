@@ -106,7 +106,7 @@ def run_inference(
 
     model = build_model(
         model_type=getattr(cfg, "MODEL_KEY"),
-        sample_spectrum=example_spec_for_build,
+        sample_spectrum=example_spec_for_build,  # [3,W]
         vocab_size=vocab_size,
         max_stack_depth=max_stack,
         d_model=getattr(cfg, "D_MODEL"),
@@ -170,13 +170,13 @@ def run_inference(
             tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
         except Exception as e:
             print(f"Could not initialize TMM context, falling back to NOSIM: {e}")
-            mode = "NOSIM"
+            cfg.VALIDSIM = "NOSIM"
 
     # Run validate_model — for a single item, it will still return the generated stack(s)
     out = validate_model(
         model,
         loader,
-        mode=mode,
+        mode=cfg.VALIDSIM,
         eos=eos_idx,
         pad=pad_idx,
         msk=msk_idx,
