@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import ModuleType
 from typing import Any, List, Optional, Tuple, Union
@@ -46,6 +47,15 @@ class SpectraDataset(torch.utils.data.Dataset):
                 "No .safetensors files found \
                                     in the provided paths."
             )
+
+        def shard_sort_key(path: Path) -> Tuple[str, Union[int, float]]:
+            m = re.match(r"^(.*?)(\d+)$", path.stem.lower())
+            if m:
+                prefix, num = m.groups()
+                return (prefix, int(num))
+            return (path.stem.lower(), float("inf"))
+
+        files = sorted(files, key=shard_sort_key)
 
         spectra_list, stacks_list = [], []
         for fp in files:
