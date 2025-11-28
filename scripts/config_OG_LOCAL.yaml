@@ -53,6 +53,7 @@ MC_SAMPLES: 10
 N_TARGETS: 10
 
 VALIDSIM: TMM_FAST
+TRACK_STEP_MAE: false
 
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandpass.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandstop.json"
