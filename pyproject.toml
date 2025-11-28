@@ -7,7 +7,9 @@ name = "optollama"
 version = "0.9.0"
 description = "AI model for inverse stack thin film layer design "
 authors = [
-    {name = "Schaible, Jonas", email="jonas.schaible@helmholtz-berlin.de"}
+    {name = "Schaible, Jonas", email="jonas.schaible@helmholtz-berlin.de"},
+    {name = "Götz, Markus", email="markus.goetz@kit.edu"},
+    {name = "Özdemir, Asena", email="asena.oezdemir@kit.edu"}
 ]
 maintainers = [
     {name = "Schaible, Jonas", email="jonas.schaible@helmholtz-berlin.de"}
@@ -56,12 +58,9 @@ Issues = "https://github.com/jnitzz/OptoLlama/issues"
 
 [tool.mypy]
 python_version = "3.9"
-modules = ["propulate"]
+modules = ["optollama"]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
-files = [
-    "tutorials/"
-]
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
