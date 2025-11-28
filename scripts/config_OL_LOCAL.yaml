@@ -32,7 +32,7 @@ NOTRAIN: false
 NUM_WORKERS: 4
 EPOCHS: 10000
 NUM_SAMPLES_TRAIN: 3000
-NUM_SAMPLES_VALID: 4
+NUM_SAMPLES_VALID: 2
 TRAIN_BATCH: 256
 VAL_BATCH: 64
 STEPS: 500
@@ -58,11 +58,11 @@ INCIDENCE_ANGLE: 0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 10
+MC_SAMPLES: 2
 N_TARGETS: 1
 
 VALIDSIM: TMM_FAST
-TRACK_STEP_MAE: false
+TRACK_STEP_MAE: true
 
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandpass.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandstop.json"
