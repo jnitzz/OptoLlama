@@ -34,6 +34,7 @@ def validate_model(
     rank: int = 0,
     world_size: int = 1,
     gather: bool = True,
+    track_step_mae: bool = False,
 ) -> Dict[str, Any]:
     """
     Reusable validation w/ optional Monte-Carlo best-of-N and DDP gathering.
@@ -49,6 +50,14 @@ def validate_model(
     do_sim = mode.upper() == "TMM_FAST"
     if do_sim and tmm_ctx is None:
         raise ValueError("tmm_ctx must be provided when mode='TMM_FAST'")
+
+    if track_step_mae and not do_sim:
+        raise ValueError("track_step_mae requires mode='TMM_FAST'")
+
+    # If the underlying model knows how to track step-wise MAE, enable it
+    inner = model.module if hasattr(model, "module") else model
+    if track_step_mae and hasattr(inner, "enable_step_mae"):
+        inner.enable_step_mae(tmm_ctx)
 
     results: List[Dict[str, Any]] = []
 
@@ -74,10 +83,12 @@ def validate_model(
         best_mae = torch.full((b,), float("inf"), device=device)
         best_pred_spectra: Optional[torch.Tensor] = None
         best_pred_ids: Optional[torch.Tensor] = None
+        best_step_mae_traj: Optional[torch.Tensor] = None
 
         # ---- MC loop ----
         for s in range(max(1, int(mc_samples))):
-            logits_or_ids, _ = model(spectra)
+            logits_or_ids, mae_traj_s = model(spectra)
+
             ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
 
             if do_sim:
@@ -104,6 +115,18 @@ def validate_model(
                     best_pred_ids = ids
                 else:
                     best_pred_ids = torch.where(take.view(b, 1), ids, best_pred_ids)
+
+            # best step-wise MAE trajectory
+            if mae_traj_s is not None:
+                if best_step_mae_traj is None:
+                    best_step_mae_traj = mae_traj_s
+                else:
+                    # keep the trajectory from the MC sample that wins for each element in the batch
+                    best_step_mae_traj = torch.where(
+                        take.view(b, 1),  # [B,1] broadcast over steps
+                        mae_traj_s,  # [B,steps] from current MC sample
+                        best_step_mae_traj,  # [B,steps] from previous best
+                    )
 
         # Metrics on best
         assert best_pred_ids is not None, "MC loop did not produce any predictions"
@@ -150,6 +173,8 @@ def validate_model(
                         "rat_pred": best_pred_spectra[i].detach().cpu().numpy().tolist(),
                     }
                 )
+            if best_step_mae_traj is not None:
+                rec["mae_traj"] = best_step_mae_traj[i].detach().cpu().tolist()
             results.append(rec)
 
     # DDP gather results

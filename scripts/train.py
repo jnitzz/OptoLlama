@@ -48,11 +48,7 @@ def train(cfg: Any) -> None:
     # TMM context
     tmm_ctx = None
     if cfg.VALIDSIM == "TMM_FAST":
-        try:
-            tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
-        except Exception as e:
-            print(f"Could not initialize TMM context, falling back to NOSIM: {e}")
-            mode = "NOSIM"
+        tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
 
     # --- model ---
     vocab_size = len(idx_to_token)
@@ -113,12 +109,10 @@ def train(cfg: Any) -> None:
         valid_mae = blob.get("valid_mae", valid_mae)
 
         # robust bests
-        acc_arr = valid_acc.detach().cpu().numpy()
-        if torch.any(torch.isfinite(acc_arr)):
-            best_valid_acc = float(torch.nanmax(acc_arr[torch.isfinite(acc_arr)]))
-        mae_arr = valid_mae.detach().cpu().numpy()
-        if torch.any(torch.isfinite(mae_arr)):
-            best_valid_mae = float(torch.nanmin(mae_arr[torch.isfinite(mae_arr)]))
+        if torch.any(torch.isfinite(valid_acc)):
+            best_valid_acc = float(torch.max(valid_acc[torch.isfinite(valid_acc)]))
+        if torch.any(torch.isfinite(valid_mae)):
+            best_valid_mae = float(torch.min(valid_mae[torch.isfinite(valid_mae)]))
 
     # ------------------------------ epochs ------------------------------
     for epoch in range(start_epoch, cfg.EPOCHS):
@@ -171,8 +165,7 @@ def train(cfg: Any) -> None:
                 with torch.no_grad():
                     log_ce = loss_CE.detach().clone()
                     if is_ddp:
-                        for t in log_ce:
-                            torch.distributed.all_reduce(t)
+                        torch.distributed.all_reduce(log_ce)
                         log_ce /= world_size
 
                     train_losses_CE[epoch] += log_ce.item()
@@ -191,28 +184,26 @@ def train(cfg: Any) -> None:
                 pbar.close()
 
         # ------------------------------ validation ------------------------------
-        mc_samples = cfg.MC_SAMPLES
-        mode = cfg.VALIDSIM.upper()
-
         val_out = validate_model(
             model,
             valid_loader,
-            mode=mode,
+            mode=cfg.VALIDSIM,
             eos=eos_idx,
             pad=pad_idx,
             msk=msk_idx,
             device=device,
             idx_to_token=idx_to_token,
             tmm_ctx=tmm_ctx,
-            mc_samples=mc_samples,
+            mc_samples=cfg.MC_SAMPLES,
             rank=rank,
             world_size=world_size,
             gather=True,
+            track_step_mae=False,
         )
 
         # update trackers
         valid_acc[epoch] = float(val_out["mean_acc"])
-        if mode == "TMM_FAST":
+        if cfg.VALIDSIM == "TMM_FAST":
             valid_mae[epoch] = float(val_out["mean_mae"])
 
         # save per-example results (rank 0 only)
@@ -221,7 +212,7 @@ def train(cfg: Any) -> None:
             out_name = f"results_{cfg.RUN_NAME}"
             save_as_json(cfg.PATH_SAVED, val_out["results"], out_name)
             print(f"[rank 0] Saved {len(val_out['results'])} samples → …/{out_name}.json")
-            if mode == "TMM_FAST":
+            if cfg.VALIDSIM == "TMM_FAST":
                 print(
                     f" min valid MAE: {float(torch.min(valid_mae).item()) if torch.isfinite(valid_mae).any() else valid_mae[epoch]:.4f}"
                 )
@@ -234,7 +225,7 @@ def train(cfg: Any) -> None:
 
         # ------------------------------ checkpointing ------------------------------
         if not cfg.NOTRAIN and rank == 0:
-            if mode != "TMM_FAST":
+            if cfg.VALIDSIM != "TMM_FAST":
                 # accuracy-based checkpointing
                 new_acc = float(valid_acc[epoch].item())
                 if new_acc > (best_valid_acc + 1e-7):
@@ -282,7 +273,8 @@ if __name__ == "__main__":
         pass
 
     if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
+        # sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
+        sys.argv.extend(["--config", "OptoLlama/scripts/config_OL_HPCZ1.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()

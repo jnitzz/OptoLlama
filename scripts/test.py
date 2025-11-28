@@ -106,7 +106,7 @@ def run_inference(
 
     model = build_model(
         model_type=getattr(cfg, "MODEL_KEY"),
-        sample_spectrum=example_spec_for_build,
+        sample_spectrum=example_spec_for_build,  # [3,W]
         vocab_size=vocab_size,
         max_stack_depth=max_stack,
         d_model=getattr(cfg, "D_MODEL"),
@@ -170,13 +170,13 @@ def run_inference(
             tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
         except Exception as e:
             print(f"Could not initialize TMM context, falling back to NOSIM: {e}")
-            mode = "NOSIM"
+            cfg.VALIDSIM = "NOSIM"
 
     # Run validate_model — for a single item, it will still return the generated stack(s)
     out = validate_model(
         model,
         loader,
-        mode=mode,
+        mode=cfg.VALIDSIM,
         eos=eos_idx,
         pad=pad_idx,
         msk=msk_idx,
@@ -187,6 +187,7 @@ def run_inference(
         rank=rank,
         world_size=world_size,
         gather=True,
+        track_step_mae=cfg.TRACK_STEP_MAE,
     )
 
     # Persist results on rank 0 (or single-process)
@@ -214,6 +215,7 @@ def run_inference(
 # ----------------------------- CLI entry -----------------------------
 if __name__ == "__main__":
     if "--config" not in sys.argv:
+        sys.argv.extend(["--config", "config_OG_LOCAL.yaml"])
         sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
@@ -224,22 +226,6 @@ if __name__ == "__main__":
         cfg=cfg,
         ckpt=cfg.PATH_CKPT,
         mc_samples=cfg.MC_SAMPLES,
-        target=cfg.TARGET,
+        target=getattr(cfg, "TARGET", None),
         n_targets=cfg.N_TARGETS,
     )
-    # from evaluate import masked_mae
-    # from plots import plot_samples
-
-    # tar = torch.tensor([out["results"][0]["rat_target"]])
-    # valkey = min([[masked_mae(torch.tensor([out["results"][i]["rat_pred"]]), tar), i] for i, item in enumerate(out["results"])])
-    # for key in range(len(out["results"])):
-    #     plot_samples(
-    #         cfg,
-    #         out["results"][key]["rat_pred_flat"],
-    #         out["results"][key]["rat_target_flat"],
-    #         out["results"][key]["stack_pred_tokens"],
-    #         "",
-    #         0,
-    #         cfg.MC_SAMPLES,
-    #         RAT_tar_mean=None,
-    #     )

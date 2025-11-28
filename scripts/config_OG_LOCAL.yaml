@@ -1,40 +1,31 @@
-RUN_NAME: "MD67"
+RUN_NAME: "MD64"
 DATA_DIR: "TF_safetensors"
-MODEL_KEY: "optollama"
+MODEL_KEY: "optogpt"
 
 # --- LOCAL machine paths (Windows) ---
 # Adjust this root if necessary:
 PATH: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama"
 
-PATH_RUN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD67"
+PATH_RUN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD64"
 PATH_DATA: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors"
 PATH_MATERIALS: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/NK"
 
 PATH_TRAIN_0: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-0.safetensors"
-PATH_TRAIN_1: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-1.safetensors"
-PATH_TRAIN_2: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-2.safetensors"
-PATH_TRAIN_3: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-3.safetensors"
-PATH_TRAIN_4: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-4.safetensors"
-PATH_TRAIN_5: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-5.safetensors"
-PATH_TRAIN_6: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-6.safetensors"
-PATH_TRAIN_7: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-7.safetensors"
-PATH_TRAIN_8: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-8.safetensors"
-PATH_TRAIN_9: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/train-9.safetensors"
 
 PATH_TOKEN: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors"
 PATH_VALID: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/test.safetensors"
 
-PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD67/results"
-PATH_CKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD67/results/ol3l-checkpoint_best.pt"
+PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD64/results"
+PATH_CKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD64/results/ol3l-checkpoint_best.pt"
 
 # --- training / model hyperparameters (same as HPC) ---
 NOTRAIN: false
 NUM_WORKERS: 4
 EPOCHS: 10000
-NUM_SAMPLES_TRAIN: 3000
-NUM_SAMPLES_VALID: 2
+NUM_SAMPLES_TRAIN: 10000
+NUM_SAMPLES_VALID: 16
 TRAIN_BATCH: 256
-VAL_BATCH: 64
+VAL_BATCH: 16
 STEPS: 500
 D_MODEL: 1024
 N_BLOCKS: 6
@@ -59,7 +50,7 @@ TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
 MC_SAMPLES: 10
-N_TARGETS: 1
+N_TARGETS: 10
 
 VALIDSIM: TMM_FAST
 TRACK_STEP_MAE: false
@@ -67,7 +58,7 @@ TRACK_STEP_MAE: false
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandpass.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandstop.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_gaussian_peak.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_flat_absorber.json"
+TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_flat_absorber.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_thermal_reflector.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/morpho.csv"
 
