@@ -58,11 +58,11 @@ INCIDENCE_ANGLE: 0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 2
+MC_SAMPLES: 10
 N_TARGETS: 1
 
 VALIDSIM: TMM_FAST
-TRACK_STEP_MAE: true
+TRACK_STEP_MAE: false
 
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandpass.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/TF_safetensors/test_bandstop.json"
