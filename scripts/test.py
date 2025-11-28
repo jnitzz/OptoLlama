@@ -187,6 +187,7 @@ def run_inference(
         rank=rank,
         world_size=world_size,
         gather=True,
+        track_step_mae=cfg.TRACK_STEP_MAE,
     )
 
     # Persist results on rank 0 (or single-process)
@@ -214,6 +215,7 @@ def run_inference(
 # ----------------------------- CLI entry -----------------------------
 if __name__ == "__main__":
     if "--config" not in sys.argv:
+        sys.argv.extend(["--config", "config_OG_LOCAL.yaml"])
         sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
@@ -224,22 +226,6 @@ if __name__ == "__main__":
         cfg=cfg,
         ckpt=cfg.PATH_CKPT,
         mc_samples=cfg.MC_SAMPLES,
-        target=cfg.TARGET,
+        target=getattr(cfg, "TARGET", None),
         n_targets=cfg.N_TARGETS,
     )
-    # from evaluate import masked_mae
-    # from plots import plot_samples
-
-    # tar = torch.tensor([out["results"][0]["rat_target"]])
-    # valkey = min([[masked_mae(torch.tensor([out["results"][i]["rat_pred"]]), tar), i] for i, item in enumerate(out["results"])])
-    # for key in range(len(out["results"])):
-    #     plot_samples(
-    #         cfg,
-    #         out["results"][key]["rat_pred_flat"],
-    #         out["results"][key]["rat_target_flat"],
-    #         out["results"][key]["stack_pred_tokens"],
-    #         "",
-    #         0,
-    #         cfg.MC_SAMPLES,
-    #         RAT_tar_mean=None,
-    #     )
