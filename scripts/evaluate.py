@@ -89,12 +89,6 @@ def validate_model(
         for s in range(max(1, int(mc_samples))):
             logits_or_ids, mae_traj_s = model(spectra)
 
-            # # Unified handling: train models may return tensor, sampling models a (tensor, aux)
-            # if isinstance(out, tuple) and len(out) == 2:
-            #     logits_or_ids, mae_traj_s = out
-            # else:
-            #     logits_or_ids, mae_traj_s = out, None
-
             ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
 
             if do_sim:
