@@ -1,7 +1,10 @@
 import math
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
+from evaluate import simulate_spectra_ids
+from metrics import masked_mae
+from simulation_TMM_FAST import TMMContext
 
 # ruff: noqa: D102, D105, D107
 
@@ -203,7 +206,8 @@ class Block(torch.nn.Module):
 
         self.cross_attn = torch.nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
         self.self_attn = torch.nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
-        self.ff = torch.nn.Linear(d_model, d_model)
+        self.ff1 = torch.nn.Linear(d_model, 4 * d_model)
+        self.ff2 = torch.nn.Linear(4 * d_model, d_model)
 
         self.norm1 = AdaLayerNormGaussian(d_model, cond_dim)
         self.norm2 = AdaLayerNormGaussian(d_model, cond_dim)
@@ -241,11 +245,13 @@ class Block(torch.nn.Module):
 
         # feedforward
         predicted_stack = self.norm3(predicted_stack, cond)
-        predicted_stack = self.ff(predicted_stack)
+        # predicted_stack = self.ff(predicted_stack)
+        predicted_stack = self.ff1(predicted_stack)
         predicted_stack = torch.nn.functional.silu(predicted_stack)
+        predicted_stack = self.ff2(predicted_stack)
 
         predicted_stack = self.dropout(predicted_stack)
-
+        predicted_stack = predicted_stack + residual
         return predicted_stack
 
 
@@ -323,6 +329,10 @@ class OptoLlama(torch.nn.Module):
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+
+        # Optional: per-step MAE tracking during sampling
+        self._step_mae_enabled: bool = False
+        self._step_mae_ctx: Optional[TMMContext] = None
 
     def _sample_t(self, batch: torch.Tensor, sampling_eps: float = 1e-3) -> torch.Tensor:
         """
@@ -443,6 +453,18 @@ class OptoLlama(torch.nn.Module):
 
         return logits
 
+    def enable_step_mae(self, tmm_ctx: Optional[TMMContext]) -> None:
+        """
+        Enable/disable per-step MAE tracking during sampling.
+
+        If `tmm_ctx` is not None and mode='TMM_FAST', `_sample` will:
+          - simulate spectra at every denoising step
+          - compute masked_mae against the conditioning spectra
+          - return a [B, steps] trajectory as the second output.
+        """
+        self._step_mae_ctx = tmm_ctx
+        self._step_mae_enabled = tmm_ctx is not None
+
     def _sample_logits(
         self,
         logits: torch.Tensor,
@@ -488,7 +510,9 @@ class OptoLlama(torch.nn.Module):
         probs = torch.nan_to_num(probs, nan=0.0)
         return torch.multinomial(probs, num_samples=1)  # [B,1]
 
-    def _sample(self, spectra: torch.Tensor, eps: float = 1e-3, remask_prob: float = 0.1) -> torch.Tensor:
+    def _sample(
+        self, spectra: torch.Tensor, eps: float = 1e-3, remask_prob: float = 0.1
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Perform iterative diffusion sampling to generate a token stack.
 
@@ -496,45 +520,73 @@ class OptoLlama(torch.nn.Module):
         stack, applying the learned denoising model at each timestep.
 
         Args:
-            spectra: Conditioning spectra, shape [B, D_spec].
+            spectra: Conditioning spectra, shape [B, 3, W] (or flattened; the
+                     embedding already handles your current convention).
             eps: Minimum timestep value used for final denoising steps.
-            remask_prob: Probability of re-masking tokens between updates.
+            remask_prob: Base probability of re-masking tokens between updates.
 
         Returns
         -------
-            A tuple:
-                stacks: Final sampled stack, shape [B, S].
-                None: Placeholder for compatibility with training signature.
+        stacks:
+            Final sampled stack, shape [B, S].
+        step_mae:
+            If `self._step_mae_enabled` and `self._step_mae_ctx` are set,
+            tensor of shape [B, steps] with per-step MAE.
+            Otherwise `None`.
         """
         timesteps = torch.linspace(1.0, eps, self.steps, device=spectra.device)
+
         stacks = torch.full(
-            (
-                spectra.shape[0],
-                self.max_stack_depth,
-            ),
+            (spectra.shape[0], self.max_stack_depth),
             self.mask,
             dtype=torch.long,
             device=spectra.device,
         )
+
         beta_sched = self.noise(timesteps)
+
+        # Decide whether we track MAE this run
+        track_mae = bool(self._step_mae_enabled and (self._step_mae_ctx is not None))
+        mae_per_step: List[torch.Tensor] = []
 
         for i in range(self.steps):
             t = torch.full((spectra.shape[0],), timesteps[i], device=spectra.device)
-            predicted_stacks = self._model(spectra, stacks, t)  # [B,S,V]
+            predicted_stacks = self._model(spectra, stacks, t)  # [B, S, V]
 
             b, s, v = predicted_stacks.shape
             logits = predicted_stacks.view(b * s, v)
-            samples = self._sample_logits(logits)  # [B*S,1]
+            samples = self._sample_logits(logits)  # [B*S, 1]
             sampled_stacks = samples.view(b, s)
 
             if i < self.steps - 1:
+                # overwrite remask_prob with noise schedule
                 remask_prob = beta_sched[i].item()
                 remask = (torch.rand_like(stacks, dtype=spectra.dtype) < remask_prob).bool()
                 stacks = torch.where(remask, self.mask, sampled_stacks)
             else:
                 stacks = sampled_stacks
 
-        return stacks, None
+            # ---- optional per-step MAE tracking ----
+            if track_mae:
+                assert self._step_mae_ctx is not None
+                pred_spec = simulate_spectra_ids(
+                    stacks,
+                    self._step_mae_ctx,
+                    eos=self.eos,
+                    pad=self.pad,
+                    msk=self.mask,
+                )  # [B, 3, W]
+                step_mae = masked_mae(spectra, pred_spec)  # [B]
+                mae_per_step.append(step_mae)
+
+        step_mae_traj: Optional[torch.Tensor]
+        if track_mae and mae_per_step:
+            # mae_per_step: list of [B] → [steps, B] → [B, steps]
+            step_mae_traj = torch.stack(mae_per_step, dim=0).transpose(0, 1).contiguous()
+        else:
+            step_mae_traj = None
+
+        return stacks, step_mae_traj
 
     def forward(self, spectra: torch.Tensor, stacks: torch.Tensor = None) -> torch.Tensor:
         """
