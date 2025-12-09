@@ -237,7 +237,6 @@ class Block(torch.nn.Module):
         # self-attention
         predicted_stack = self.norm2(predicted_stack, cond)
         predicted_stack, _ = self.self_attn(query=predicted_stack, key=predicted_stack, value=predicted_stack)
-
         alpha2 = 1 + self.to_alpha2(cond).unsqueeze(1)  # shape [B,1,H]
         predicted_stack = predicted_stack * alpha2
         predicted_stack += residual
@@ -374,11 +373,11 @@ class OptoLlama(torch.nn.Module):
         -------
             Predicted logits over tokens, shape [B, S, vocab_size].
         """
-        embedded_spectra = self.spectrum_embedding(spectra)
+        embedded_spectra = self.spectrum_embedding(spectra)  # [B, 3, d_model]
         embedded_spectra += self.positional_encoding(embedded_spectra)
         predicted_stacks = self.stack_embedding(noised_stacks)
         predicted_stacks += self.positional_encoding(predicted_stacks)
-        predicted_stacks += self.time_embedding(timesteps)
+        predicted_stacks += self.time_embedding(timesteps)  # [B, S, d_model]
         cond = self.time_embedding(timesteps)  # [B, 1, 1024]
         cond = cond.squeeze(1)  # [B, 1024]
 
