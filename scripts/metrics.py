@@ -92,3 +92,45 @@ def masked_mae(
     den = valid.sum(dim=1).sum(dim=1).clamp_min(1)
 
     return num / den
+
+
+def masked_mae_roi(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    wl_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Compute Mean Absolute Error over finite predictions and wavelength range.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Ground-truth spectra, shape [B, C, W].
+    y : torch.Tensor
+        Predicted spectra, same shape. Non-finite entries are ignored.
+    wl_mask : torch.Tensor
+        Crop to Region of Interest (ROI)
+
+    Returns
+    -------
+    mae : torch.Tensor
+        Tensor of shape [B] containing per-sample masked MAE.
+    """
+    # x,y: [B,3,W]
+    # wl_mask: [W] bool, True = included in MAE
+
+    # finite-mask logic
+    finite_mask = torch.isfinite(y).all(dim=-1, keepdim=True)  # [B,3,1]
+    valid = finite_mask.expand_as(y)  # [B,3,W]
+
+    if wl_mask is not None:
+        wl_mask = wl_mask.view(1, 1, -1)  # [1,1,W]
+        valid = valid & wl_mask  # [B,3,W]
+
+    abs_err = torch.abs(x - torch.nan_to_num(y))
+    masked_err = abs_err.where(valid, torch.zeros_like(abs_err))
+
+    num = masked_err.sum(dim=1).sum(dim=1)
+    den = valid.sum(dim=1).sum(dim=1).clamp_min(1)
+
+    return num / den
