@@ -170,3 +170,4 @@ cython_debug/
 *.csv
 config*.py
 
+*.pdf
