@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Literal, Optional
 
 import torch
-from metrics import masked_mae, token_accuracy
+from metrics import masked_mae_roi, token_accuracy
 from simulation_TMM_FAST import TMMContext
 
 
@@ -35,6 +35,7 @@ def validate_model(
     world_size: int = 1,
     gather: bool = True,
     track_step_mae: bool = False,
+    roi_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     """
     Reusable validation w/ optional Monte-Carlo best-of-N and DDP gathering.
@@ -94,7 +95,7 @@ def validate_model(
             if do_sim:
                 assert tmm_ctx is not None
                 pred = simulate_spectra_ids(ids, tmm_ctx, eos=eos, pad=pad, msk=msk)  # [B,3,W]
-                mae_s = masked_mae(spectra, pred)  # [B]
+                mae_s = masked_mae_roi(spectra, pred, wl_mask=roi_mask)  # [B]
             else:
                 pred = None
                 mae_s = torch.zeros(b, device=device)
@@ -137,7 +138,7 @@ def validate_model(
         acc_g, acc_vec = token_accuracy(stacks_aligned, ids_aligned, eos, pad, msk)
         sum_acc += float(acc_g)  # TODO check if to use .item() here instead
         if do_sim and best_pred_spectra is not None:
-            sum_mae += float(masked_mae(spectra, best_pred_spectra).mean().item())
+            sum_mae += float(masked_mae_roi(spectra, best_pred_spectra, wl_mask=roi_mask).mean().item())
         n_batches += 1
 
         # per-example records
@@ -167,8 +168,6 @@ def validate_model(
                 rec.update(
                     {
                         "mae": float(best_mae[i].item()),
-                        "rat_target_flat": spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
-                        "rat_pred_flat": best_pred_spectra[i].reshape(-1).detach().cpu().numpy().tolist(),
                         "rat_target": spectra[i].detach().cpu().numpy().tolist(),
                         "rat_pred": best_pred_spectra[i].detach().cpu().numpy().tolist(),
                     }
