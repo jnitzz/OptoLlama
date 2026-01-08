@@ -4,58 +4,9 @@ import math
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
-from utils import apply_noise, apply_smoothing, ensure_3w, redistribute_mismatch
+from utils import apply_noise, apply_smoothing, ensure_3w, normalize_rat_fill_crop, redistribute_mismatch
 
-
-def normalize_rat_fill_crop(r: torch.Tensor, a: torch.Tensor, t: torch.Tensor, target: float = 1.0) -> torch.Tensor:
-    """
-    Non-negative RAT with T as the filler and primary crop source.
-
-    Steps per wavelength:
-      1) Clamp R,A,T >= 0
-      2) If sum < target: add (target - sum) to T
-      3) If sum > target: reduce T first; if still > target, reduce A; then R
-         (never below 0). This guarantees sum == target afterward.
-
-    Returns R, A, T as float arrays.
-    """
-    r = torch.clamp(torch.as_tensor(r), min=0.0)
-    a = torch.clamp(torch.as_tensor(a), min=0.0)
-    t = torch.clamp(torch.as_tensor(t), min=0.0)
-
-    total = r + a + t
-    # case 1: fill deficit into T
-    deficit = target - total
-    need = deficit > 0
-    t[need] += deficit[need]  # safe since deficit>0 only at 'need'
-
-    # case 2: crop excess from T, then A, then R
-    excess = (r + a + t) - target
-    over = torch.clamp(excess, 0.0)
-    has_over = over > 0
-
-    if torch.any(has_over):
-        # crop from T
-        cut = torch.minimum(t[has_over], over[has_over])
-        t[has_over] -= cut
-        over[has_over] -= cut
-
-        # crop from A
-        still = over > 0
-        if torch.any(still):
-            cut = torch.minimum(a[still], over[still])
-            a[still] -= cut
-            over[still] -= cut
-            # By construction, over should now be 0
-
-        # crop from R
-        still = over > 0
-        if torch.any(still):
-            cut = torch.minimum(r[still], over[still])
-            r[still] -= cut
-            over[still] -= cut
-
-    return r.to(torch.float32), a.to(torch.float32), t.to(torch.float32)
+# ruff: noqa: E731
 
 
 def fwhm_to_sigma(fwhm: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
@@ -352,6 +303,7 @@ def load_spectra_from_json_or_csv(
                         if tname in ("R", "A", "T"):
                             idx = {"R": 0, "A": 1, "T": 2}[tname]
                             base[idx] = apply_json_edit(wl, base[idx], edit, combine=combine_policy)
+
             # Normalize
             rn, an, tn = normalize_rat_fill_crop(base[0], base[1], base[2], target=float(data.get("normalize_to", 1.0)))
             x = torch.stack([rn, an, tn], dim=0)

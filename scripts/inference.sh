@@ -47,13 +47,4 @@ export NCCL_P2P_DISABLE=1
 
 # one rank ↔ one GPU
 # srun --gpu-bind=closest python -u Diffusion/scripts/optollama.py
-srun --gpu-bind=closest python -u analyze_inference_MC.py \
-  --config config_MD49 \
-  --checkpoint auto \
-  --batch 128 \
-  --tau -1 \
-  --limit 10 \
-  --mc_samples 3 \
-  --sample_temperature 1 \
-  --top_k 5 \
-  --top_p 0.0
+srun --gpu-bind=closest python -u OptoLlama/scripts/test.py --config OptoLlama/scripts/config_OG_HPCZ1.yaml
