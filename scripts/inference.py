@@ -4,60 +4,9 @@ import math
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
-from utils import apply_noise, apply_smoothing, ensure_3w, redistribute_mismatch
+from utils import apply_noise, apply_smoothing, ensure_3w, normalize_rat_fill_crop, redistribute_mismatch
 
 # ruff: noqa: E731
-
-
-def normalize_rat_fill_crop(r: torch.Tensor, a: torch.Tensor, t: torch.Tensor, target: float = 1.0) -> torch.Tensor:
-    """
-    Non-negative RAT with T as the filler and primary crop source.
-
-    Steps per wavelength:
-      1) Clamp R,A,T >= 0
-      2) If sum < target: add (target - sum) to T
-      3) If sum > target: reduce T first; if still > target, reduce A; then R
-         (never below 0). This guarantees sum == target afterward.
-
-    Returns R, A, T as float arrays.
-    """
-    r = torch.clamp(torch.as_tensor(r), min=0.0)
-    a = torch.clamp(torch.as_tensor(a), min=0.0)
-    t = torch.clamp(torch.as_tensor(t), min=0.0)
-
-    total = r + a + t
-    # case 1: fill deficit into T
-    deficit = target - total
-    need = deficit > 0
-    t[need] += deficit[need]  # safe since deficit>0 only at 'need'
-
-    # case 2: crop excess from T, then A, then R
-    excess = (r + a + t) - target
-    over = torch.clamp(excess, 0.0)
-    has_over = over > 0
-
-    if torch.any(has_over):
-        # crop from T
-        cut = torch.minimum(t[has_over], over[has_over])
-        t[has_over] -= cut
-        over[has_over] -= cut
-
-        # crop from A
-        still = over > 0
-        if torch.any(still):
-            cut = torch.minimum(a[still], over[still])
-            a[still] -= cut
-            over[still] -= cut
-            # By construction, over should now be 0
-
-        # crop from R
-        still = over > 0
-        if torch.any(still):
-            cut = torch.minimum(r[still], over[still])
-            r[still] -= cut
-            over[still] -= cut
-
-    return r.to(torch.float32), a.to(torch.float32), t.to(torch.float32)
 
 
 def fwhm_to_sigma(fwhm: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
@@ -199,102 +148,6 @@ def apply_combine(dst: torch.Tensor, src: torch.Tensor, how: str = "overwrite") 
     if how == "multiply":
         return dst * src
     raise ValueError(f"Unknown combine policy: {how}")
-
-
-def smooth_1d_reflect(v: torch.Tensor, kernel_size: int = 15) -> torch.Tensor:
-    """Smooth 1D moving-average with reflect padding."""
-    if kernel_size <= 1:
-        return v
-    pad = kernel_size // 2
-    kernel = torch.ones(kernel_size, device=v.device, dtype=v.dtype) / kernel_size
-    v_pad = torch.nn.functional.pad(v[None, None, :], (pad, pad), mode="reflect")
-    k = kernel[None, None, :]
-    return torch.nn.functional.conv1d(v_pad, k)[0, 0, : v.shape.numel()]
-
-
-def apply_stochastic_filler(base: torch.Tensor, wl: torch.Tensor, data: dict) -> torch.Tensor:
-    """
-    Modify `base` outside a given ROI according to `data['stochastic_filler']`.
-
-    - ROI stays untouched.
-    - Outside ROI is overwritten / perturbed depending on mode.
-    """
-    stoch = data.get("stochastic_filler")
-    if not stoch:
-        return base
-
-    roi = stoch.get("roi") or stoch.get("ROI")
-    if not roi or len(roi) != 2:
-        raise ValueError("stochastic_filler.roi must be a 2-element list [lo, hi].")
-
-    lo, hi = float(roi[0]), float(roi[1])
-    roi_mask = (wl >= lo) & (wl <= hi)
-    outside = ~roi_mask
-    if not torch.any(outside):
-        # ROI covers all wavelengths; nothing to fill
-        return base
-
-    mode = str(stoch.get("mode", "smooth_random")).lower()
-    strength = float(stoch.get("strength", 0.3))
-    kernel_size = int(stoch.get("kernel_size", 15))
-    seed = stoch.get("seed", None)
-
-    # Local random helpers (optional reproducibility)
-    if seed is not None:
-        g = torch.Generator(device=base.device)
-        g.manual_seed(int(seed))
-        rand = lambda shape: torch.rand(shape, generator=g, device=base.device)
-        randn = lambda shape: torch.randn(shape, generator=g, device=base.device)
-    else:
-        rand = lambda shape: torch.rand(shape, device=base.device)
-        randn = lambda shape: torch.randn(shape, device=base.device)
-
-    r, a, t = base[0], base[1], base[2]
-
-    if mode == "flat_random":
-        # Constant R/A outside ROI
-        r0 = rand(()) * strength
-        a0 = rand(()) * strength
-        r[outside] = r0
-        a[outside] = a0
-
-    elif mode == "tilted_random":
-        # Linear tilt of R/A over wavelength
-        x = (wl - wl.min()) / (wl.max() - wl.min() + 1e-8)
-        slope_r = (rand(()) * 2.0 - 1.0) * strength
-        offset_r = rand(()) * strength
-        slope_a = (rand(()) * 2.0 - 1.0) * strength
-        offset_a = rand(()) * strength
-
-        r_fill = torch.clamp(offset_r + slope_r * x, 0.0, 1.0)
-        a_fill = torch.clamp(offset_a + slope_a * x, 0.0, 1.0)
-
-        r[outside] = r_fill[outside]
-        a[outside] = a_fill[outside]
-
-    elif mode in ("smooth_random", "prior_plus_noise"):
-        # Smooth random fields for R/A
-        noise_r = randn(r.shape) * strength
-        noise_a = randn(a.shape) * strength
-
-        noise_r = smooth_1d_reflect(noise_r, kernel_size=kernel_size)
-        noise_a = smooth_1d_reflect(noise_a, kernel_size=kernel_size)
-
-        if mode == "smooth_random":
-            r_fill = torch.clamp(noise_r, 0.0, 1.0)
-            a_fill = torch.clamp(noise_a, 0.0, 1.0)
-            r[outside] = r_fill[outside]
-            a[outside] = a_fill[outside]
-        else:  # prior_plus_noise
-            r[outside] = torch.clamp(r[outside] + noise_r[outside], 0.0, 1.0)
-            a[outside] = torch.clamp(a[outside] + noise_a[outside], 0.0, 1.0)
-
-    else:
-        raise ValueError(f"Unknown stochastic_filler.mode: {mode}")
-
-    # Normalize to a physical RAT spectrum
-    rn, an, tn = normalize_rat_fill_crop(r, a, t, target=1.0)
-    return torch.stack([rn, an, tn], dim=0)
 
 
 def apply_json_edit(wl: torch.Tensor, arr: torch.Tensor, edit: Dict, combine: str = "overwrite") -> torch.Tensor:
@@ -450,8 +303,6 @@ def load_spectra_from_json_or_csv(
                         if tname in ("R", "A", "T"):
                             idx = {"R": 0, "A": 1, "T": 2}[tname]
                             base[idx] = apply_json_edit(wl, base[idx], edit, combine=combine_policy)
-
-            base = apply_stochastic_filler(base, wl, data)
 
             # Normalize
             rn, an, tn = normalize_rat_fill_crop(base[0], base[1], base[2], target=float(data.get("normalize_to", 1.0)))
