@@ -273,8 +273,8 @@ if __name__ == "__main__":
         pass
 
     if "--config" not in sys.argv:
-        # sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
-        sys.argv.extend(["--config", "OptoLlama/scripts/config_OL_HPCZ1.yaml"])
+        sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
+        # sys.argv.extend(["--config", "OptoLlama/scripts/config_OL_HPCZ1.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()
