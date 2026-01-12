@@ -2,6 +2,9 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["optollama"]
+
 [project]
 name = "optollama"
 version = "0.9.0"
