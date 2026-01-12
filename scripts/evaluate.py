@@ -108,7 +108,7 @@ def validate_model(
 
             if do_sim:
                 assert tmm_ctx is not None
-                pred = simulate_spectra_ids(ids, tmm_ctx, eos=eos, pad=pad, msk=msk)  # [B,3,W]
+                pred = simulate_spectra_ids(ids, tmm_ctx, eos=eos, pad=pad, msk=msk, device=device)  # [B,3,W]
                 mae_s = masked_mae_roi(spectra, pred, wl_mask=roi_mask)  # [B]
             else:
                 pred = None
