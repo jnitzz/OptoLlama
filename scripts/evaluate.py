@@ -5,16 +5,26 @@ from metrics import masked_mae_roi, token_accuracy
 from simulation_TMM_FAST import TMMContext
 
 
-def simulate_spectra_ids(ids: torch.Tensor, tmm_ctx: TMMContext, *, eos: int, pad: int, msk: int) -> torch.Tensor:
+def simulate_spectra_ids(ids: torch.Tensor, tmm_ctx: TMMContext, *, eos: int, pad: int, msk: int, device) -> torch.Tensor:
     """
     Simulate the RAT spectra from the token ids.
 
     ids: [B, S] int tokens
     returns: [B, W, 3] float32   (R, A, T along the last dim)
     """
+    #print(torch.__version__)
     tmm, wl, theta = tmm_ctx
-    out = tmm(ids, wl, theta, eos=eos, pad=pad, msk=msk)  # typically [B, 3, W]
+    tmm_cpu = tmm.cpu()
+    ids_cpu = ids.cpu()
+    wl_cpu = wl.cpu()
+    theta_cpu = theta.cpu()
+    out_cpu = tmm_cpu(ids_cpu, wl_cpu, theta_cpu, eos=eos, pad=pad, msk=msk)  # typically [B, 3, W]
+    out = out_cpu.to(device)
 
+    #wl_64 = wl.type(torch.complex64)
+    #theta_64 = theta.type(torch.complex64)
+    #out = tmm(ids, wl, theta, eos=eos, pad=pad, msk=msk)  # typically [B, 3, W]
+    #print("It works!!")
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
 
 
@@ -86,11 +96,15 @@ def validate_model(
         best_pred_ids: Optional[torch.Tensor] = None
         best_step_mae_traj: Optional[torch.Tensor] = None
 
+        saved_samples = []
+        saved_maes = []
+
         # ---- MC loop ----
         for s in range(max(1, int(mc_samples))):
             logits_or_ids, mae_traj_s = model(spectra)
 
             ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
+            saved_samples.append(ids)
 
             if do_sim:
                 assert tmm_ctx is not None
@@ -99,6 +113,8 @@ def validate_model(
             else:
                 pred = None
                 mae_s = torch.zeros(b, device=device)
+
+            saved_maes.append(mae_s)
 
             # update best
             take_mae = mae_s < best_mae
@@ -128,6 +144,10 @@ def validate_model(
                         mae_traj_s,  # [B,steps] from current MC sample
                         best_step_mae_traj,  # [B,steps] from previous best
                     )
+        saved_samples = torch.stack(saved_samples) 
+        saved_samples = saved_samples.transpose(0, 1)
+        saved_maes = torch.stack(saved_maes) 
+        saved_maes = saved_maes.transpose(0, 1)
 
         # Metrics on best
         assert best_pred_ids is not None, "MC loop did not produce any predictions"
@@ -158,11 +178,15 @@ def validate_model(
                 pred_len = len(pred_ids_i)
             pred_tokens = [idx_to_token[int(t)] for t in pred_ids_i[:pred_len] if int(t) not in (pad, msk, eos)]
 
+            all_ids = saved_samples[i].tolist()
+            all_maes = saved_maes[i].tolist()
             rec: Dict[str, Any] = {
                 "dataset_index": int(idxs[i].item()),
                 "acc": float(acc_vec[i].item()),
                 "stack_target_tokens": tgt_tokens,
                 "stack_pred_tokens": pred_tokens,
+                "stack_all_mc_ids": all_ids,
+                "stack_all_maes": all_maes,
             }
             if do_sim and best_pred_spectra is not None:
                 rec.update(

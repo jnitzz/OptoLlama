@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --partition=booster
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4               # 1 GPU per task  (total 4 on the node)
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1               # 1 GPU per task  (total 4 on the node)
 #SBATCH --cpus-per-task=10          # (optional) keep 32 logical CPUs overall
-#SBATCH --time=3:00:00
+#SBATCH --time=01:00:00
 #SBATCH --mem=0                 # grab all the node’s RAM instead of a fixed 500 G
 #SBATCH --job-name=OptoLlama
 #SBATCH --account=hai_1044
@@ -26,7 +26,6 @@ echo "MASTER_ADDR="$MASTER_ADDR
 
 # one rank ↔ one GPU
 # srun --gpu-bind=closest python -u Diffusion/scripts/optollama.py
-srun --gpu-bind=closest python -u /p/project1/hai_1044/oezdemir/optollama_new/OptoLlama/scripts/test.py \
-  --config scripts/config_OL_ASENA.yaml \
+srun --gpu-bind=closest python -u /p/project1/hai_1044/oezdemir/optollama_new/OptoLlama/scripts/variability_analysis.py \
 #srun python -u /p/project1/hai_1044/oezdemir/optollama_new/OptoLlama/scripts/minimal_example.py
 
