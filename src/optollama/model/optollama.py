@@ -2,9 +2,9 @@ import math
 from typing import List, Optional, Tuple
 
 import torch
-from evaluate import simulate_spectra_ids
-from metrics import masked_mae
-from simulation_TMM_FAST import TMMContext
+from optollama.scripts.evaluate import simulate_spectra_ids
+from optollama.evaluation.metrics import masked_mae
+from optollama.utils.simulation_TMM_FAST import TMMContext
 
 # ruff: noqa: D102, D105, D107
 

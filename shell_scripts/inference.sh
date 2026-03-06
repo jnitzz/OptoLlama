@@ -47,4 +47,4 @@ export NCCL_P2P_DISABLE=1
 
 # one rank ↔ one GPU
 # srun --gpu-bind=closest python -u Diffusion/scripts/optollama.py
-srun --gpu-bind=closest python -u OptoLlama/scripts/test.py --config OptoLlama/scripts/config_OG_HPCZ1.yaml
+srun --gpu-bind=closest python -u OptoLlama/scripts/test.py --config OptoLlama/configs/config_OG_HPCZ1.yaml

@@ -5,10 +5,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import tqdm
-from dataset import SpectraDataset
-from metrics import masked_mae_roi
+from optollama.dataloader.dataset import SpectraDataset
+from optollama.evaluation.metrics import masked_mae_roi
 from safetensors.torch import load_file
-from utils import ensure_3w, save_as_json
+from optollama.utils.utils import ensure_3w, save_as_json
 
 
 def load_train_sample_by_global_id(

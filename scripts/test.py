@@ -4,15 +4,15 @@ import os
 import sys
 from typing import Any, Dict, Optional, Tuple
 
-import cli
+import optollama.scripts.cli as cli
 import torch
-from dataset import SpectraDataset, make_loader, make_repeated_spec_loader
-from evaluate import validate_model
-from inference import load_spectra_from_json_or_csv
-from model import build_model
-from runner import _is_ddp, setup_run
-from simulation_TMM_FAST import build_tmm_context
-from utils import init_tokenmaps, load_checkpoint, save_as_json, wl_mask
+from optollama.dataloader.dataset import SpectraDataset, make_loader, make_repeated_spec_loader
+from optollama.scripts.evaluate import validate_model
+from optollama.scripts.inference import load_spectra_from_json_or_csv
+from optollama.model.model import build_model
+from optollama.scripts.runner import _is_ddp, setup_run
+from optollama.utils.simulation_TMM_FAST import build_tmm_context
+from optollama.utils.utils import init_tokenmaps, load_checkpoint, save_as_json, wl_mask
 
 # ruff: noqa: N806
 
@@ -219,8 +219,8 @@ def run_inference(
 # ----------------------------- CLI entry -----------------------------
 if __name__ == "__main__":
     if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "config_OG_LOCAL.yaml"])
-        sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
+        sys.argv.extend(["--config", "./configs/config_OG_LOCAL.yaml"])
+        sys.argv.extend(["--config", "./configs/config_OL_LOCAL.yaml"])
         # sys.argv.extend(["--config", "./OptoLlama/scripts/config_OL_HPCZ1.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
