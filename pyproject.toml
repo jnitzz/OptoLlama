@@ -41,7 +41,8 @@ dependencies = [
   "torch",
   "safetensors",
   "tmm_fast",
-  "tqdm"
+  "tqdm",
+  "pyyaml",
 ]
 
 [project.optional-dependencies]

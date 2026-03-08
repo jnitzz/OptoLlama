@@ -13,6 +13,9 @@ from optollama.model.model import build_model
 from optollama.scripts.runner import _is_ddp, setup_run
 from optollama.utils.simulation_TMM_FAST import build_tmm_context
 from optollama.utils.utils import init_tokenmaps, load_checkpoint, save_as_json, wl_mask
+from optollama.evaluation.metrics import masked_mae_roi
+from optollama.evaluation.match_test_to_train import find_best_train_for_target, load_train_sample_by_global_id
+from optollama.evaluation.plots import plot_samples_clean_NN
 
 # ruff: noqa: N806
 
@@ -236,7 +239,6 @@ if __name__ == "__main__":
     )
 
     # %%
-    from metrics import masked_mae_roi
 
     tar = torch.tensor([out["results"][0]["rat_target"]])
     valkey = min(
@@ -257,7 +259,6 @@ if __name__ == "__main__":
     target_spec = torch.tensor(out["results"][key]["rat_target"])
     train_paths = sorted([getattr(cfg, k) for k in dir(cfg) if k.startswith("PATH_TRAIN")])
 
-    from match_test_to_train import find_best_train_for_target, load_train_sample_by_global_id
 
     result = find_best_train_for_target(
         target_spec,
@@ -271,7 +272,6 @@ if __name__ == "__main__":
     )
     nn_sequence = [idx_to_token[int(t)] for t in nn_seq_ids[: cfg.MAX_SEQ_LEN] if int(t) not in (eos_idx, pad_idx, msk_idx)]
 
-    from plots import plot_samples_clean_NN
 
     plot_samples_clean_NN(
         cfg,
