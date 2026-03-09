@@ -1,8 +1,8 @@
 from typing import Any, Dict, List, Literal, Optional
 
 import torch
-from metrics import masked_mae_roi, token_accuracy
-from simulation_TMM_FAST import TMMContext
+from optollama.evaluation.metrics import masked_mae_roi, token_accuracy
+from optollama.utils.simulation_TMM_FAST import TMMContext
 
 
 def simulate_spectra_ids(ids: torch.Tensor, tmm_ctx: TMMContext, *, eos: int, pad: int, msk: int) -> torch.Tensor:

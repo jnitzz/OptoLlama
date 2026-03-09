@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from optogpt import OriginalDecoderWrapper
-from optollama import OptoLlama
+from optollama.model.optogpt import OriginalDecoderWrapper
+from optollama.model.optollama import OptoLlama
 
 
 def build_model(

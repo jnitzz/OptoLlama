@@ -2,15 +2,15 @@ import os
 import sys
 from typing import Any
 
-import cli as cli
+import optollama.scripts.cli as cli
 import torch
 import tqdm
-from dataset import SpectraDataset, make_loader
-from evaluate import token_accuracy, validate_model
-from model import build_model
-from runner import _is_ddp, setup_run
-from simulation_TMM_FAST import build_tmm_context
-from utils import init_tokenmaps, load_checkpoint, save_as_json, save_checkpoint
+from optollama.dataloader.dataset import SpectraDataset, make_loader
+from optollama.scripts.evaluate import token_accuracy, validate_model
+from optollama.model.model import build_model
+from optollama.scripts.runner import _is_ddp, setup_run
+from optollama.utils.simulation_TMM_FAST import build_tmm_context
+from optollama.utils.utils import init_tokenmaps, load_checkpoint, save_as_json, save_checkpoint
 
 # ruff: noqa: N806
 
@@ -273,7 +273,7 @@ if __name__ == "__main__":
         pass
 
     if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
+        sys.argv.extend(["--config", "./configs/config_OL_LOCAL.yaml"])
         # sys.argv.extend(["--config", "OptoLlama/scripts/config_OL_HPCZ1.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)

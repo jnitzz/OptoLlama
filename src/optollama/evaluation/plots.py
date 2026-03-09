@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch  # if not already imported
-from metrics import masked_mae_roi
-from utils import save_as_json, wl_mask
+from optollama.evaluation.metrics import masked_mae_roi
+from optollama.utils.utils import save_as_json, wl_mask
 
 # ruff: noqa: N802, N803, N806
 

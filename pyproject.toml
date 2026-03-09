@@ -41,7 +41,8 @@ dependencies = [
   "torch",
   "safetensors",
   "tmm_fast",
-  "tqdm"
+  "tqdm",
+  "pyyaml",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +56,9 @@ dev = [
 Homepage = "https://www.helmholtz-berlin.de/forschung/oe/se/solarenergieoptik/index_en.html"
 Repository = "https://github.com/jnitzz/OptoLlama"
 Issues = "https://github.com/jnitzz/OptoLlama/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/optollama"]
 
 [tool.mypy]
 python_version = "3.9"

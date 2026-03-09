@@ -8,7 +8,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
-from utils import apply_noise, apply_smoothing, normalize_rat_fill_crop, redistribute_mismatch, unique_length_int_generator
+from optollama.utils.utils import apply_noise, apply_smoothing, normalize_rat_fill_crop, redistribute_mismatch, unique_length_int_generator
 
 # ruff: noqa: E731
 

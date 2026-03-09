@@ -4,7 +4,7 @@ import math
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
-from utils import apply_noise, apply_smoothing, ensure_3w, normalize_rat_fill_crop, redistribute_mismatch
+from optollama.utils.utils import apply_noise, apply_smoothing, ensure_3w, normalize_rat_fill_crop, redistribute_mismatch
 
 # ruff: noqa: E731
 
