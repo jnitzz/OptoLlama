@@ -2,9 +2,11 @@ import math
 from typing import List, Optional, Tuple
 
 import torch
-from optollama.scripts.evaluate import simulate_spectra_ids
+
 from optollama.evaluation.metrics import masked_mae
+from optollama.scripts.evaluate import simulate_spectra_ids
 from optollama.utils.simulation_TMM_FAST import TMMContext
+from optollama.utils.utils import top_k_top_p_filtering
 
 # ruff: noqa: D102, D105, D107
 
@@ -329,9 +331,85 @@ class OptoLlama(torch.nn.Module):
         self.top_k = top_k
         self.top_p = top_p
 
+        # Inference-time constraint: force solutions to terminate by this length.
+        # If set to max_len:
+        #   - position max_len-1 is forced to EOS
+        #   - positions >= max_len are forced to PAD
+        # This does not affect training and does not change model weights.
+        self.max_emit_len: Optional[int] = None
+
+        # Optional token constraints for sampling (inference-time only):
+        # a boolean mask over vocabulary; False entries cannot be sampled.
+        # Default: allow everything.
+        self.register_buffer("allowed_vocab_mask", torch.ones(vocab_size, dtype=torch.bool))
+        # self.allowed_vocab_mask: Optional[torch.Tensor] = torch.ones(vocab_size, dtype=torch.bool, device=)
+
+        # By default we do not want to *emit* the diffusion mask token as a final output.
+        # The diffusion process still uses `self.mask` internally via remasking.
+        if 0 <= int(self.mask) < int(vocab_size):
+            self.allowed_vocab_mask[int(self.mask)] = False
+
         # Optional: per-step MAE tracking during sampling
         self._step_mae_enabled: bool = False
         self._step_mae_ctx: Optional[TMMContext] = None
+
+    def set_max_emit_len(self, max_len: Optional[int]) -> None:
+        """Set a hard maximum emitted sequence length (in tokens, incl. EOS position).
+
+        If max_len is None: disable constraint.
+        If max_len <= 0: treated as 1 (immediate EOS at position 0).
+        """
+        if max_len is None:
+            self.max_emit_len = None
+            return
+        ml = int(max_len)
+        if ml <= 0:
+            ml = 1
+        # Can't exceed model capacity
+        self.max_emit_len = min(ml, int(self.max_stack_depth))
+
+    def set_token_constraints(
+        self,
+        *,
+        allow_ids: Optional[torch.Tensor] = None,
+        exclude_ids: Optional[torch.Tensor] = None,
+        allow_eos_pad: bool = True,
+        allow_msk: bool = False,
+    ) -> None:
+        """Set inference-time sampling constraints.
+
+        This does **not** change model weights; it only changes which tokens
+        can be sampled during `_sample_logits`.
+
+        Args:
+            allow_ids: If provided, only these token ids are allowed (plus
+                optionally EOS/PAD).
+            exclude_ids: If provided, these token ids are forbidden.
+            allow_eos_pad: If True, always allow EOS and PAD even in allowlist mode.
+            allow_msk: If True, allow emitting <MSK> as a sampled output token.
+        """
+        mask = torch.zeros((self.vocab_size,), dtype=torch.bool, device=self.allowed_vocab_mask.device)
+        if allow_ids is None:
+            mask[:] = True
+        else:
+            allow_ids = allow_ids.to(device=mask.device, dtype=torch.long)
+            mask[allow_ids] = True
+
+        if allow_eos_pad:
+            if 0 <= int(self.eos) < int(self.vocab_size):
+                mask[int(self.eos)] = True
+            if 0 <= int(self.pad) < int(self.vocab_size):
+                mask[int(self.pad)] = True
+
+        if exclude_ids is not None and exclude_ids.numel() > 0:
+            exclude_ids = exclude_ids.to(device=mask.device, dtype=torch.long)
+            mask[exclude_ids] = False
+
+        # Control whether <MSK> can ever be sampled as an emitted token.
+        if not allow_msk and 0 <= int(self.mask) < int(self.vocab_size):
+            mask[int(self.mask)] = False
+
+        self.allowed_vocab_mask.copy_(mask)
 
     def _sample_t(self, batch: torch.Tensor, sampling_eps: float = 1e-3) -> torch.Tensor:
         """
@@ -421,36 +499,8 @@ class OptoLlama(torch.nn.Module):
     def _top_k_top_p_filtering(
         self, logits: torch.Tensor, top_k: int, top_p: float, filter_value: float = -float("inf")
     ) -> torch.Tensor:
-        """
-        Apply combined top-k / top-p (nucleus) filtering to logits.
-
-        Args:
-            logits: Logits of shape [B, V].
-            top_k: Keep only the k highest-probability tokens.
-            top_p: Keep smallest prefix whose cumulative probability ≥ p.
-            filter_value: Value used to mask filtered logits.
-
-        Returns
-        -------
-            Filtered logits of shape [B, V].
-        """
-        logits = torch.nan_to_num(logits, neginf=-1e9, posinf=1e9)  # guard
-
-        if top_k > 0:
-            top_k = min(top_k, self.vocab_size)
-            kth_values = torch.topk(logits, top_k, dim=-1)[0][:, -1].unsqueeze(-1)
-            logits = torch.where(logits < kth_values, torch.full_like(logits, filter_value), logits)
-
-        if top_p > 0.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits = logits.masked_fill(indices_to_remove, filter_value)
-
-        return logits
+        """Backward-compatible wrapper around :func:`utils.top_k_top_p_filtering`."""
+        return top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0), filter_value=filter_value)
 
     def enable_step_mae(self, tmm_ctx: Optional[TMMContext]) -> None:
         """
@@ -485,6 +535,17 @@ class OptoLlama(torch.nn.Module):
         -------
             Sampled token ids of shape [B*S, 1].
         """
+        # Apply vocabulary constraints (if any). This is inference-time only and does not
+        # affect training/weights — it just zeroes probability mass for forbidden tokens.
+        if hasattr(self, "allowed_vocab_mask") and self.allowed_vocab_mask is not None:
+            mask = self.allowed_vocab_mask
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            # If any token is forbidden, mask them out.
+            if (~mask).any():
+                # Use a very negative number instead of -inf to avoid NaNs in some kernels.
+                logits = logits.masked_fill(~mask.unsqueeze(0), -1e9)
+
         # defaults from model if not provided
         if top_k is None:
             top_k = getattr(self, "top_k", 0)
@@ -503,7 +564,7 @@ class OptoLlama(torch.nn.Module):
             logits = logits / temperature
 
         # apply top-k / top-p if requested
-        logits = self._top_k_top_p_filtering(logits, top_k=top_k or 0, top_p=top_p or 0.0)
+        logits = top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0))
 
         probs = torch.softmax(logits, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0)
@@ -557,10 +618,29 @@ class OptoLlama(torch.nn.Module):
             samples = self._sample_logits(logits)  # [B*S, 1]
             sampled_stacks = samples.view(b, s)
 
+            # --- enforce max emitted length (inference-time constraint) ---
+            # Force EOS at position max_len -1 and PAD after, if enabled.
+            if self.max_emit_len is not None:
+                max_len = int(self.max_emit_len)
+                # position L-1 forced to EOS
+                eos_pos = max_len - 1
+                if 0 <= eos_pos < s:
+                    sampled_stacks[:, eos_pos] = int(self.eos)
+                # positions >= max_len forced to PAD
+                if max_len < s:
+                    sampled_stacks[:, max_len:] = int(self.pad)
+
             if i < self.steps - 1:
                 # overwrite remask_prob with noise schedule
                 remask_prob = beta_sched[i].item()
                 remask = (torch.rand_like(stacks, dtype=spectra.dtype) < remask_prob).bool()
+
+                # Don't allow remasking of forced EOS/PAD positions
+                if self.max_emit_len is not None:
+                    max_len = int(self.max_emit_len)
+                    if 0 < max_len <= s:
+                        remask[:, max_len - 1 :] = False
+
                 stacks = torch.where(remask, self.mask, sampled_stacks)
             else:
                 stacks = sampled_stacks

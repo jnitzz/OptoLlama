@@ -41,10 +41,10 @@ def load_as_json(path: str, name: Optional[str] = None) -> Any:
         Python object (e.g. list, dict).
     """
     if name is None:
-        with open(f"{path}", "r", encoding="utf-8") as f:
+        with open(rf"{path}", "r", encoding="utf-8") as f:
             return json.load(f)
     else:
-        with open(f"{path}/{name}.json", "r", encoding="utf-8") as f:
+        with open(rf"{path}/{name}.json", "r", encoding="utf-8") as f:
             return json.load(f)
 
 
@@ -66,12 +66,9 @@ def unique_length_int_generator(start: float, stop: float, amount: float) -> tor
     stop = int(stop)
     amount = int(amount)
     if not (-1 < start < stop) or not (0 < amount <= stop):
-        print(
-            f"Your start, stop, amount is: {start}, {stop}, {amount}. \
-              amount must be (-1 < start < stop) and (0 < amount <= stop)."
+        raise ValueError(
+            f"Invalid arguments: start={start}, stop={stop}, amount={amount}. Require (-1 < start < stop) and (0 < amount <= stop)."
         )
-        return ValueError
-
     len_unique = -1
     amount = amount - 1
     while len_unique < amount:
@@ -202,6 +199,9 @@ def load_checkpoint(
 
     # always load into the core module; strip 'module.' if present
     core = model.module if isinstance(model, DistributedDataParallel) else model
+    # Backward compat: allow new buffers not present in old checkpoints
+    if "allowed_vocab_mask" not in sd and hasattr(core, "allowed_vocab_mask"):
+        sd["allowed_vocab_mask"] = core.allowed_vocab_mask.detach().clone()
     sd = _strip_module_prefix(sd)
     core.load_state_dict(sd, strict=strict)
 
@@ -218,6 +218,46 @@ def load_checkpoint(
         start_epoch = int(blob["epoch"]) + 1  # resume on next epoch
 
     return start_epoch, blob
+
+
+def top_k_top_p_filtering(
+    logits: torch.Tensor,
+    *,
+    top_k: int = 0,
+    top_p: float = 0.0,
+    filter_value: float = -float("inf"),
+) -> torch.Tensor:
+    """Apply combined top-k and top-p (nucleus) filtering to logits.
+
+    Expects logits of shape [..., V] and filters along the last dimension.
+
+    Notes
+    -----
+      - Uses a large negative number for NaNs/Infs to keep kernels stable.
+      - If both `top_k` and `top_p` are disabled, returns logits unchanged.
+    """
+    logits = torch.nan_to_num(logits, neginf=-1e9, posinf=1e9)
+
+    v = logits.size(-1)
+
+    if top_k and top_k > 0:
+        k = min(int(top_k), v)
+        kth = torch.topk(logits, k, dim=-1).values[..., -1].unsqueeze(-1)
+        logits = torch.where(logits < kth, torch.full_like(logits, filter_value), logits)
+
+    if top_p and top_p > 0.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumprobs = torch.cumsum(probs, dim=-1)
+
+        remove = cumprobs > float(top_p)
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+
+        mask = torch.zeros_like(remove, dtype=torch.bool).scatter(-1, sorted_idx, remove)
+        logits = logits.masked_fill(mask, filter_value)
+
+    return logits
 
 
 def boxcar_kernel(win: int, device: str) -> torch.Tensor:
@@ -269,7 +309,7 @@ def parse_order(order_str: str) -> Tuple[int, ...]:
     return tuple(seq[:3])
 
 
-def wl_mask(wavelengths: Any, wl_min: float, wl_max: float, device: str) -> torch.Tensor:
+def wl_mask(wavelengths: Any, wl_min: float, wl_max: float, device: str) -> Optional[torch.Tensor]:
     """Mask wavelength regions with True withing the boundary, else False."""
     if wavelengths is None:
         return None
@@ -356,8 +396,8 @@ def apply_smoothing(tar_spec: torch.Tensor, smooth_cfg: Optional[Dict[str, Any]]
     return smooth_1d(tar_spec, method, win, sigma)
 
 
-def ensure_3w(tar_spec: torch.Tensor) -> torch.Tensor:
-    """Accept [(B,)3,W], [(B,)W,3]; return (tar_spec_[...,3,W])."""
+def ensure_3w(tar_spec: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+    """Accept [(B,)3,W] or [(B,)W,3]; return (tar_spec_[...,3,W], was_transposed)."""
     if tar_spec.dim() == 2:
         if tar_spec.size(0) == 513:
             tar_spec = tar_spec.reshape(3, 171)

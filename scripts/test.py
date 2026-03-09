@@ -4,20 +4,106 @@ import os
 import sys
 from typing import Any, Dict, Optional, Tuple
 
-import optollama.scripts.cli as cli
 import torch
+
+import optollama.scripts.cli as cli
 from optollama.dataloader.dataset import SpectraDataset, make_loader, make_repeated_spec_loader
+from optollama.model.model import build_model
 from optollama.scripts.evaluate import validate_model
 from optollama.scripts.inference import load_spectra_from_json_or_csv
-from optollama.model.model import build_model
 from optollama.scripts.runner import _is_ddp, setup_run
 from optollama.utils.simulation_TMM_FAST import build_tmm_context
 from optollama.utils.utils import init_tokenmaps, load_checkpoint, save_as_json, wl_mask
-from optollama.evaluation.metrics import masked_mae_roi
-from optollama.evaluation.match_test_to_train import find_best_train_for_target, load_train_sample_by_global_id
-from optollama.evaluation.plots import plot_samples_clean_NN
 
 # ruff: noqa: N806
+
+# --- Material group helpers (keywords -> token ids) ---
+
+
+def base_material_name(token: str) -> str:
+    """Extract a base material name from a token string.
+
+    Robust to common formats where thickness/parameters are appended, e.g.
+    "SiO2_120", "TiN(30nm)", etc. Adjust regex if your token format differs.
+    """
+    return token.split("_", 1)[0]
+
+
+def build_base_to_ids(token_to_idx: dict[str, int], special: set[str]) -> dict[str, list[int]]:
+    """Build a base material index."""
+    base_to_ids: dict[str, list[int]] = {}
+    for tok, tid in token_to_idx.items():
+        if tok in special:
+            continue
+        base = base_material_name(tok)
+        base_to_ids.setdefault(base, []).append(int(tid))
+    return base_to_ids
+
+
+def expand_material_or_token_to_ids(items: list, token_to_idx: dict[str, int], base_to_ids: dict[str, list[int]]) -> torch.Tensor:
+    """Expand filtered materials or tokens to ids.
+
+    - int -> token id
+    - str -> exact token if exists (e.g. "SiO2_120")
+           -> otherwise base material (e.g. "SiO2" expands to all SiO2_*)
+    """
+    ids: list[int] = []
+    for x in items:
+        if isinstance(x, int):
+            ids.append(int(x))
+        elif isinstance(x, str):
+            s = x.strip()
+            if s in token_to_idx:
+                ids.append(int(token_to_idx[s]))
+            elif s in base_to_ids:
+                ids.extend(base_to_ids[s])
+            else:
+                raise ValueError(
+                    f"Unknown token/material in filter list: {s!r}. Use exact token like 'SiO2_120' or base material like 'SiO2'."
+                )
+        else:
+            raise TypeError(f"Filter entries must be int or str, got: {type(x)}")
+
+    if not ids:
+        return torch.empty((0,), dtype=torch.long)
+    return torch.unique(torch.tensor(ids, dtype=torch.long))
+
+
+def build_group_token_ids(tokens: list[str], token_to_idx: dict[str, int]) -> dict[str, torch.Tensor]:
+    """Build predefined material-group id sets.
+
+    Groups:
+      - metals: Ag, Al, TiN
+      - semiconductors: Ge, ITO, Si, ZnO, ZnS, ZnSe
+      - dielectrics: remaining non-special tokens
+    """
+    metals = {"Ag", "Al", "TiN"}
+    semis = {"Ge", "ITO", "Si", "ZnO", "ZnS", "ZnSe"}
+    special = {"<PAD>", "<MSK>", "<EOS>"}
+
+    metal_toks: list[str] = []
+    semi_toks: list[str] = []
+    other_toks: list[str] = []
+
+    for t in tokens:
+        if t in special:
+            continue
+        b = base_material_name(t)
+        if b in metals:
+            metal_toks.append(t)
+        elif b in semis:
+            semi_toks.append(t)
+        else:
+            other_toks.append(t)
+
+    def _ids(xs: list[str]) -> torch.Tensor:
+        return torch.tensor([int(token_to_idx[x]) for x in xs], dtype=torch.long)
+
+    return {
+        "metals": _ids(metal_toks),
+        "semiconductors": _ids(semi_toks),
+        "dielectrics": _ids(other_toks),
+    }
 
 
 @torch.no_grad()
@@ -90,6 +176,9 @@ def run_inference(
     # Tokens
     tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = init_tokenmaps(cfg.PATH_DATA)
 
+    special = {EOS_TOKEN, PAD_TOKEN, MSK_TOKEN}
+    base_to_ids = build_base_to_ids(token_to_idx, special)
+
     # --- always build model from a dataset sample to lock dims like training ---
     valid_subset_n = getattr(cfg, "NUM_SAMPLES_VALID")
     valid_ds, valid_loader, _ = make_loader(cfg, split="valid", subset_n=valid_subset_n, ddp=is_ddp)
@@ -134,6 +223,70 @@ def run_inference(
         _, _ = load_checkpoint(ckpt_path, model, map_location="cpu", strict=True)
     else:
         print("No valid ckpt path set")
+
+    # ---------------- Token/material constraints (target-spectrum relevant) ----------------
+    # In the "target spectrum" branch, stacks in the dataset are dummy PADs, so dataset filtering
+    # does not apply. Instead, we constrain what the model can *emit* during sampling by masking
+    # logits inside OptoLlama._sample_logits.
+    if bool(getattr(cfg, "TOKEN_FILTER_ENABLED", False)):
+        mode = str(getattr(cfg, "TOKEN_FILTER_MODE", "exclude")).lower().strip()
+        groups = list(getattr(cfg, "TOKEN_FILTER_GROUPS", []) or [])
+        allow_toks = list(getattr(cfg, "TOKEN_FILTER_ALLOW_TOKENS", []) or [])
+        exclude_toks = list(getattr(cfg, "TOKEN_FILTER_EXCLUDE_TOKENS", []) or [])
+        allow_msk = bool(getattr(cfg, "TOKEN_FILTER_ALLOW_MSK", False))
+        allow_eos_pad = bool(getattr(cfg, "TOKEN_FILTER_ALLOW_EOS_PAD", True))
+
+        group_ids = build_group_token_ids(tokens, token_to_idx)
+
+        # Expand groups into ids
+        allow_group_ids: list[torch.Tensor] = []
+        exclude_group_ids: list[torch.Tensor] = []
+        for g in groups:
+            gl = str(g).lower().strip()
+            if gl not in group_ids:
+                raise ValueError(f"Unknown TOKEN_FILTER_GROUPS entry: {g!r}. Use one of {list(group_ids.keys())}.")
+            # In allow mode, groups are treated as allowlists. In exclude mode, treated as blocklists.
+            (allow_group_ids if mode == "allow" else exclude_group_ids).append(group_ids[gl])
+
+        allow_ids = torch.cat(allow_group_ids, dim=0) if allow_group_ids else torch.empty((0,), dtype=torch.long)
+        exclude_ids = torch.cat(exclude_group_ids, dim=0) if exclude_group_ids else torch.empty((0,), dtype=torch.long)
+
+        # Merge explicit token lists
+        if allow_toks:
+            allow_ids = torch.unique(
+                torch.cat([allow_ids, expand_material_or_token_to_ids(allow_toks, token_to_idx, base_to_ids)], dim=0)
+            )
+        if exclude_toks:
+            exclude_ids = torch.unique(
+                torch.cat([exclude_ids, expand_material_or_token_to_ids(exclude_toks, token_to_idx, base_to_ids)], dim=0)
+            )
+
+        if mode == "allow" and allow_ids.numel() == 0:
+            raise ValueError(
+                "TOKEN_FILTER_MODE='allow' requires TOKEN_FILTER_GROUPS and/or TOKEN_FILTER_ALLOW_TOKENS to be non-empty."
+            )
+
+        # Apply to model if supported (OptoLlama)
+        if hasattr(model, "set_token_constraints"):
+            model.set_token_constraints(
+                allow_ids=allow_ids if allow_ids.numel() > 0 else None,
+                exclude_ids=exclude_ids if exclude_ids.numel() > 0 else None,
+                allow_eos_pad=allow_eos_pad,
+                allow_msk=allow_msk,
+            )
+            print(f"Token constraints enabled (mode={mode}, allow={int(allow_ids.numel())}, exclude={int(exclude_ids.numel())}).")
+        else:
+            print("Warning: model does not support token constraints; TOKEN_FILTER_* will be ignored.")
+
+    # Optional: hard cap on generated solution length (target-spectrum relevant)
+    # This is an inference-time decoding constraint, not a model architecture change.
+    max_emit_len = getattr(cfg, "MAX_EMIT_LEN", None)
+    if max_emit_len is not None:
+        if hasattr(model, "set_max_emit_len"):
+            model.set_max_emit_len(int(max_emit_len))
+            print(f"MAX_EMIT_LEN enabled: {int(max_emit_len)}")
+        else:
+            print("Warning: model does not support MAX_EMIT_LEN; ignoring.")
 
     # How many designed targets?
     n_tar = cfg.N_TARGETS
@@ -195,6 +348,8 @@ def run_inference(
         gather=True,
         track_step_mae=cfg.TRACK_STEP_MAE,
         roi_mask=wl_mask(cfg.WAVELENGTHS, cfg.ROI_MIN, cfg.ROI_MAX, device),
+        record_all_mc=True,  # <-- enable grid recording
+        record_pred_spectra=True,  # <-- include predicted spectra grid (TMM_FAST)
     )
 
     # Persist results on rank 0 (or single-process)
@@ -206,15 +361,17 @@ def run_inference(
             base = getattr(cfg, "RUN_NAME", "infer")
             tag = "target" if target else "valid"
             save_as_json(cfg.PATH_SAVED, out.get("results", []), f"results_{base}_{tag}")
-            print(f"💾 Saved {len(out.get('results', []))} record(s) to {cfg.PATH_SAVED}")
+            save_as_json(cfg.PATH_SAVED, out.get("mae_grid", []).numpy().tolist(), f"results_{base}_{tag}_mae")
+            save_as_json(cfg.PATH_SAVED, out.get("ids_grid", []).numpy().tolist(), f"results_{base}_{tag}_ids")
+            print(f"Saved {len(out.get('results', []))} record(s) to {cfg.PATH_SAVED}")
         except Exception as e:
             print(f"Could not save results JSON: {e}")
 
     # Summary (accuracy/MAE may be None for single target without ground-truth)
     if out.get("mean_acc") is not None:
-        print(f"✔ mean token accuracy: {100.0 * float(out['mean_acc']):.2f}%")
+        print(f"mean token accuracy: {100.0 * float(out['mean_acc']):.2f}%")
     if out.get("mean_mae") is not None:
-        print(f"✔ mean spectrum MAE: {float(out['mean_mae']):.6f}")
+        print(f"mean spectrum MAE: {float(out['mean_mae']):.6f}")
 
     return out, idx_to_token, eos_idx, pad_idx, msk_idx
 
@@ -222,13 +379,17 @@ def run_inference(
 # ----------------------------- CLI entry -----------------------------
 if __name__ == "__main__":
     if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "./configs/config_OG_LOCAL.yaml"])
-        sys.argv.extend(["--config", "./configs/config_OL_LOCAL.yaml"])
+        sys.argv.extend(["--config", "config_OG_LOCAL.yaml"])
+        sys.argv.extend(["--config", "config_OL_LOCAL.yaml"])
         # sys.argv.extend(["--config", "./OptoLlama/scripts/config_OL_HPCZ1.yaml"])
 
     # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
     args = cli.parse_arguments()
     cfg = cli.load_config_with_overrides(args)
+
+    if getattr(args, "print_config", False):
+        cli.print_config(cfg)
+        sys.exit(0)
 
     out, idx_to_token, eos_idx, pad_idx, msk_idx = run_inference(
         cfg=cfg,
@@ -237,144 +398,3 @@ if __name__ == "__main__":
         target=getattr(cfg, "TARGET", None),
         n_targets=cfg.N_TARGETS,
     )
-
-    # %%
-
-    tar = torch.tensor([out["results"][0]["rat_target"]])
-    valkey = min(
-        [
-            [
-                masked_mae_roi(
-                    torch.tensor([out["results"][i]["rat_pred"]]), tar, wl_mask(cfg.WAVELENGTHS, cfg.ROI_MIN, cfg.ROI_MAX, "cpu")
-                ),
-                i,
-            ]
-            for i, item in enumerate(out["results"])
-        ]
-    )
-    key = valkey[1]
-    # key = 1
-
-    # key = 0
-    target_spec = torch.tensor(out["results"][key]["rat_target"])
-    train_paths = sorted([getattr(cfg, k) for k in dir(cfg) if k.startswith("PATH_TRAIN")])
-
-
-    result = find_best_train_for_target(
-        target_spec,
-        train_paths=train_paths,  # or a list of dirs/files
-        train_chunk_size=4 * 2048,
-        wl_range=wl_mask(cfg.WAVELENGTHS, cfg.ROI_MIN, cfg.ROI_MAX, "cuda"),
-    )
-    print(result)
-    nn_spectrum, nn_seq_ids, shard_path, local_idx = load_train_sample_by_global_id(
-        global_id=result["best_global_index"], train_paths=train_paths
-    )
-    nn_sequence = [idx_to_token[int(t)] for t in nn_seq_ids[: cfg.MAX_SEQ_LEN] if int(t) not in (eos_idx, pad_idx, msk_idx)]
-
-
-    plot_samples_clean_NN(
-        cfg,
-        RAT_pred=torch.tensor(out["results"][key]["rat_pred"]),
-        RAT_tar=target_spec,
-        stack_pred=out["results"][key]["stack_pred_tokens"],
-        stack_tar=out["results"][key]["stack_target_tokens"],
-        ACC=out["results"][key]["acc"],
-        number=cfg.MC_SAMPLES,
-        RAT_nn=nn_spectrum,
-        stack_nn=nn_sequence,
-        nn_global_id=result["best_global_index"],
-    )
-
-# %%
-# from utils import load_as_json
-# save_path = r"d:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\runs\MD67\results"
-# out = {}
-# val_results = load_as_json('D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD67/results_MD67_valid_3k_steps_final.json')
-# b = [1691, 1879, 2067, 2255, 2443, 2631, 2819, 3007]
-# b.reverse()
-# for ind in b:
-#     val_results.pop(ind)
-# # out = load_as_json('D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/MD67/results_MD67_valid_1k_steps_final.json')
-# out['results'] = val_results
-# from plots import plot_mae_trajectory, plot_mae_band
-# example = out["results"][0]          # pick an example
-# mae_traj = example["mae_traj"]       # list of length = steps
-
-# plot_mae_trajectory(mae_traj, title=f"Example {example['dataset_index']}")
-
-# mae_trajs = [
-#     rec["mae_traj"]
-#     for rec in out["results"]
-#     if "mae_traj" in rec
-#     ]
-
-# plot_mae_band(mae_trajs, save_path, mode="percentile", title="MAE trajectory band")
-
-# %% OptoGPT
-# from utils import load_as_json
-# data = load_as_json(r'd:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\runs\MD68\results\results_MD68_valid.json')
-# # b = [1691, 1879, 2067, 2255, 2443, 2631, 2819, 3007]
-# # b.reverse()
-# # for ind in b:
-#     # data.pop(ind)
-# import numpy as np
-# ll = [data[i]['mae'] for i in range(len(data))]
-# mean = np.mean(ll)
-# lower = np.percentile(ll, 10, axis=0)
-# upper = np.percentile(ll, 90, axis=0)
-# print(mean, lower, upper)
-
-# %% Template
-# from utils import unique_length_int_generator
-# a = unique_length_int_generator(0e0, 1000000 - 1, 3000)
-# nn_matches = load_as_json(r"d:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\data\TF_safetensors\test_to_train_nn.json")  # list with test_index, best_train_index, mae
-# nnll = [nn_matches[i]['mae'] for i in a]
-# nnmean = np.mean(nnll)
-# lower = np.percentile(nnll, 10, axis=0)
-# upper = np.percentile(nnll, 90, axis=0)
-# print(mean, lower, upper)
-
-# %%
-# from utils import load_as_json
-# from plots import plot_model_vs_nn_scatter
-
-# # 1) Validation results from training/inference
-# val_results = load_as_json(r"d:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\runs\MD67\results_MD67_valid_3k_steps_final.json")    # list of dicts from validate_model
-# # val_results = load_as_json(r"d:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\runs\MD67\results\results_MD67_valid.json")    # list of dicts from validate_model
-# # val_results = load_as_json(r"/scratch/htc/jschaibl/repos/ColorAppearanceToolbox/Diffusion/runs/MD65/results/results_MD65_valid_1m.json")     # list of dicts from validate_model
-# # val_results = val_results[:3000]
-# b = [1691, 1879, 2067, 2255, 2443, 2631, 2819, 3007]
-# b.reverse()
-# for ind in b:
-#     val_results.pop(ind)
-# # 2) Nearest-neighbor mapping JSON you created
-# nn_matches = load_as_json(r"d:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\data\TF_safetensors\test_to_train_nn.json")  # list with test_index, best_train_index, mae
-# # nn_matches = load_as_json(r"/scratch/htc/jschaibl/repos/ColorAppearanceToolbox/OptoLlama/data/TF_safetensors/test_to_train_nn.json")  # list with test_index, best_train_index, mae
-
-# max_points=3000
-# save_path = r"d:\Profile\a3536\Eigene Dateien\GitHub\OptoLlama\runs\MD67\results"
-# # save_path = r"/scratch/htc/jschaibl/repos/ColorAppearanceToolbox/Diffusion/runs/MD65/results"
-
-# # 3) Plot ~1000 points
-# plot_model_vs_nn_scatter(val_results, nn_matches, save_path, max_points)
-
-# %%
-
-# import pandas as pd
-# path = r'D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/targets'
-# fileT = 'T_Morpho_txt_side.Probe.Rohdaten.csv'
-# fileR = 'R_Morpho_txt_side.Probe.Rohdaten.csv'
-# Rdata = pd.read_csv(rf'{path}/{fileR}', sep=';')
-# Tdata = pd.read_csv(rf'{path}/{fileT}', sep=';')
-# data = pd.DataFrame(pd.concat([Rdata['R'][::-1], 100-Rdata['R'][::-1]-Tdata['T'][::-1],Tdata['T'][::-1]], axis=1).values[::2]/100,index=Rdata['nm'][::-1].values[::2], columns=['R_measured','A_measured','T_measured'])
-# # torch.load(rf'{path}/{fileR}')
-# import matplotlib.pyplot as plt
-# fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-# data.plot(ax=ax)
-
-# path_d = r'D:\Profile\a3536\Nextcloud\PhD - HEIBRiDS\Conferences\20250801_NatureMachineIntelligence\content paper\fig3\colorfilter\example-morphocolor.csv'
-# data2 = pd.read_csv(path_d, sep=',')
-# data2.index = Rdata['nm'][::-1].values[::2]
-# data2[['RAT_tarR','RAT_tarA','RAT_tarT']].plot(ax=ax)
-# # data_all = pd.concat([data.values,data2[['RAT_tarR','RAT_tarT','RAT_tarT']].values])

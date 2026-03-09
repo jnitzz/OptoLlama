@@ -118,7 +118,7 @@ def parse_arguments() -> argparse.Namespace:
     p.add_argument(
         "--print-config",
         action="store_true",
-        default=True,
+        default=False,
         help="Print the final config and exit",
     )
     p.add_argument(
@@ -247,3 +247,10 @@ def load_config_with_overrides(args: argparse.Namespace) -> Any:
     set_top_level(cfg, "TOP_P", top_p)
 
     return cfg
+
+
+def print_config(cfg: Any) -> None:
+    """Pretty-print a SimpleNamespace/dict config."""
+    keys = [k for k in dir(cfg) if not k.startswith("_") and not callable(getattr(cfg, k))]
+    for k in sorted(keys):
+        print(f"{k} = {getattr(cfg, k)!r}")
