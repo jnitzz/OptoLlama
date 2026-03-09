@@ -2,11 +2,12 @@ import os
 import sys
 from typing import Any
 
-import cli as cli
+import cli
 import torch
 import tqdm
 from dataset import SpectraDataset, make_loader
-from evaluate import token_accuracy, validate_model
+from evaluate import validate_model
+from metrics import token_accuracy
 from model import build_model
 from runner import _is_ddp, setup_run
 from simulation_TMM_FAST import build_tmm_context
@@ -88,7 +89,6 @@ def train(cfg: Any) -> None:
 
     # --- metric buffers / resume bookkeeping ---
     train_losses = torch.zeros(cfg.EPOCHS)
-    train_losses_CE = torch.zeros(cfg.EPOCHS)
     train_acc = torch.zeros(cfg.EPOCHS)
     valid_acc = torch.zeros(cfg.EPOCHS)
     valid_mae = torch.ones(cfg.EPOCHS) * torch.inf
@@ -168,14 +168,14 @@ def train(cfg: Any) -> None:
                         torch.distributed.all_reduce(log_ce)
                         log_ce /= world_size
 
-                    train_losses_CE[epoch] += log_ce.item()
+                    train_losses[epoch] += log_ce.item()
 
                     acc, _ = token_accuracy(stacks, logits.argmax(dim=-1), eos_idx, pad_idx, msk_idx)
                     train_acc[epoch] += acc
 
                 if rank == 0:
                     pbar.set_postfix(
-                        loss_CE=f"{train_losses_CE[epoch] / (i + 1):.4f}",
+                        loss_CE=f"{train_losses[epoch] / (i + 1):.4f}",
                         acc=f"{train_acc[epoch] / (i + 1) * 100:.4f}%",
                     )
                     pbar.update()
@@ -281,9 +281,9 @@ if __name__ == "__main__":
     cfg = cli.load_config_with_overrides(args)
 
     # Optional: support `--print-config` from here too (no run)
-    if getattr(args, "print_config", True):
-        for k in sorted([k for k in dir(cfg) if not k.startswith("_") and not callable(getattr(cfg, k))]):
-            print(f"{k} = {getattr(cfg, k)!r}")
+    if getattr(args, "print_config", False):
+        cli.print_config(cfg)
+        sys.exit(0)
 
     try:
         train(cfg)
