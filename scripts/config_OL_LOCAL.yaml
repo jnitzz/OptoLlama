@@ -28,11 +28,11 @@ PATH_SAVED: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/OptoLlama/res
 PATH_CKPT: "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/runs/OptoLlama/results/ol3l-checkpoint_best.pt"
 
 # --- training / model hyperparameters (same as HPC) ---
-NOTRAIN: false
+NOTRAIN: true
 NUM_WORKERS: 4
 EPOCHS: 10000
 NUM_SAMPLES_TRAIN: 3000
-NUM_SAMPLES_VALID: 4
+NUM_SAMPLES_VALID: 3000
 TRAIN_BATCH: 256
 VAL_BATCH: 256
 STEPS: 500
@@ -42,7 +42,7 @@ N_HEADS: 8
 DROPOUT: 0.0
 MAX_GRAD_NORM: 1000
 
-SEED: 2
+SEED: 3
 
 DB_DOWNLOAD: false
 DB_PLOTNK: false
@@ -58,46 +58,70 @@ INCIDENCE_ANGLE: 0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 10
-N_TARGETS: 100
+MC_SAMPLES: 20
+N_TARGETS: 20
 
 VALIDSIM: TMM_FAST
 TRACK_STEP_MAE: false
-ROI_MIN: 400
-ROI_MAX: 1400
+ROI_MIN: 300
+ROI_MAX: 2000
 
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_bandpass.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_bandpass_stochastic.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_2bandpass_stochastic.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_bandstop.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_gaussian_peak.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_flat_absorber.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_flat_reflector.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_narrowband_bandpass_filter.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_thermal_reflector.json"
-TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_VIStra_NIRref.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/morpho.csv"
-
+# TARGETS JSON
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/Ma_NIRreflector_stochastic.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/Ma_perfectabsorber_stochastic.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/Ma_bandstop_stochastic.json"
-# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_bandpass750_stochastic.json"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/test_bandpass800_stochastic.json"
+
+# TARGETS FINAL
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-morphocolor_target.csv"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-morphocolor_targetmeasured.csv"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-morphocolor_TF_target.csv"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-thermalreflector_target.csv"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-perfectabsorber_target.csv"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-bandnotch_target.csv"
 
 # TARGET: "random"
 
+#cong tests
+TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/N6.csv"
+
+
+MAX_EMIT_LEN:    # forces EOS at pos 5, PAD after
+
+TOKEN_FILTER_ENABLED: false
+TOKEN_FILTER_MODE: "allow"          # "exclude" or "allow"
+
+# One or more of: ["metals", "semiconductors", "dielectrics"]
+TOKEN_FILTER_GROUPS: []
+
+# Optional explicit token strings (or ids):
+TOKEN_FILTER_EXCLUDE_TOKENS: []       # e.g. ["Ag", "TiN"]
+TOKEN_FILTER_ALLOW_TOKENS: ["SiO2", "Ta2O5", "MgO"]         # used mainly with MODE="allow"
+
+# Usually keep these defaults:
+TOKEN_FILTER_ALLOW_EOS_PAD: true
+TOKEN_FILTER_ALLOW_MSK: false
+
 NOISE:
-  enabled: true
-  sigma_abs: 0.1
+  enabled: false
+  sigma_abs: 0.01
   sigma_rel: 0.00
   per_channel: [1.0, 0.0, 1.0]
-  wl_min: 1200
+  wl_min: 300
   wl_max: 2000
   clip_0_1: false
 
 SMOOTH:
-  enabled: true
+  enabled: false
   method: "gaussian"
   win: 25
   sigma: 1.50
 
 MISMATCH_FILL_ORDER: "R>T>A"
+
+FILL_OUTSIDE_ROI:
+  enabled: false
+  skip_index0: true
+  mode: "prior_plus_noise"
+  strength: 0.95
+  kernel_size: 50
