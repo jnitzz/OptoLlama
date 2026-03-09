@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
+from utils import top_k_top_p_filtering
 
 # ruff: noqa: D101, D102, D103, N801
 # mypy: disable-error-code=no-untyped-def
@@ -156,38 +157,8 @@ def _filter_logits_topk_topp(
     top_p: float = 0.0,
     filter_value: float = -float("inf"),
 ) -> torch.Tensor:
-    """
-    Apply combined top-k and top-p (nucleus) filtering to logits.
-
-    Args:
-        logits: Logits over the vocabulary, shape [B, V].
-        top_k: If > 0, keep only the `top_k` tokens with largest logit.
-        top_p: If > 0, keep the smallest prefix of tokens whose cumulative
-            probability ≥ `top_p`.
-        filter_value: Value used to mask filtered logits (typically -inf).
-
-    Returns
-    -------
-        Filtered logits of shape [B, V], with unlikely tokens set to `filter_value`.
-    """
-    logits = torch.nan_to_num(logits, neginf=-1e9, posinf=1e9)
-
-    if top_k and top_k > 0:
-        top_k = min(top_k, logits.size(-1))
-        kth = torch.topk(logits, top_k, dim=-1).values[:, -1].unsqueeze(-1)  # [B,1]
-        logits = torch.where(logits < kth, torch.full_like(logits, filter_value), logits)
-
-    if top_p and top_p > 0.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-        probs = torch.softmax(sorted_logits, dim=-1)
-        cumprobs = torch.cumsum(probs, dim=-1)
-        remove = cumprobs > top_p
-        remove[..., 1:] = remove[..., :-1].clone()
-        remove[..., 0] = False
-        mask = torch.zeros_like(remove, dtype=torch.bool).scatter(1, sorted_idx, remove)
-        logits = logits.masked_fill(mask, filter_value)
-
-    return logits
+    """Backward-compatible wrapper around :func:`utils.top_k_top_p_filtering`."""
+    return top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0), filter_value=filter_value)
 
 
 def _subsequent_mask(seq_len: int, device: torch.device) -> torch.Tensor:
