@@ -12,8 +12,15 @@
 OptoLlama is a transformer AI-model enabling the inverse design of thin-film material stacks. Given an reflectance-absorptance-transmittance input spectrum (RAT), OptoLlama is able to propose a corresponding stack of materials and their layer thickness producing the "prompted" characteristics.
 
 ## Installation
-We heavily recommend installing the `OptoLlama` package in a dedicated `Python3.11+` virtual environment. You can
-install ``OptoLlama`` directly from the GitHub repository via:
+
+We heavily recommend installing the `OptoLlama` package in a dedicated `Python3.11+` virtual environment as follows:
+
+```bash
+python3 -m venv ~/.venv/optollama
+source ~/.venv/optollama/bin/activate
+```
+
+You can then install ``OptoLlama`` directly from the GitHub repository via:
 ```bash
 pip install git+https://github.com/jnitzz/OptoLlama
 ```
@@ -47,11 +54,22 @@ state_dict = load_file(safetensors_path)
 model.load_state_dict(state_dict)
 ```
 
+You can also download the data and trained model using provided CLI scripts as follows
+
+```bash
+git clone git@github.com:jnitzz/OptoLlama.git
+cd OptoLlama
+./scripts/download_data --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
+./scripts/download_checkpoint --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
+```
+
 ## How to contribute
+
 Check out our [contribution guidelines](CONTRIBUTING.md) if you are interested in contributing to the `OptoLlama` project :fire:.
 Please also carefully check our [code of conduct](CODE_OF_CONDUCT.md) :blue_heart:.
 
 ## Acknowledgments
+
 This work is supported by the [Helmholtz AI](https://www.helmholtz.ai/) platform grant.
 
 -----------
