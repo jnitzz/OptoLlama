@@ -47,6 +47,15 @@ state_dict = load_file(safetensors_path)
 model.load_state_dict(state_dict)
 ```
 
+You can also download the data and trained model using provided CLI scripts as follows
+
+```bash
+git clone git@github.com:jnitzz/OptoLlama.git
+cd OptoLlama
+./scripts/download_data --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
+./scripts/download_checkpoint --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
+```
+
 ## How to contribute
 Check out our [contribution guidelines](CONTRIBUTING.md) if you are interested in contributing to the `OptoLlama` project :fire:.
 Please also carefully check our [code of conduct](CODE_OF_CONDUCT.md) :blue_heart:.
