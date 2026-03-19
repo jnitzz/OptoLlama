@@ -1,36 +1,27 @@
 #!/usr/bin/env python
 
-import os
-import sys
-from typing import Any
-
 import torch
 import tqdm
 
-import optollama.scripts.cli as cli
-from optollama.dataloader.dataset import SpectraDataset, make_loader
-from optollama.model.model import build_model
-from optollama.scripts.evaluate import token_accuracy, validate_model
-from optollama.scripts.runner import _is_ddp, setup_run
-from optollama.utils.simulation_TMM_FAST import build_tmm_context
-from optollama.utils.utils import init_tokenmaps, load_checkpoint, save_as_json, save_checkpoint
+import optollama
+import optollama.cli
+import optollama.runner
 
 # ruff: noqa: N806
 
 
-# ------------------------------- training loop -------------------------------
-def train(cfg: Any) -> None:
+def train(cfg: dict) -> None:
     """
-    Train and optionally validate OptoLlama (OptoGPT).
+    Train and optionally validate OptoLlama (or OptoGPT).
 
-    Parameters
-    ----------
+    Args
+    ----
     cfg:
         Configuration object (SimpleNamespace or similar) as returned by
         `cli.load_config_with_overrides`. Must contain at least the keys used
         below (paths, model hyperparameters, batch sizes, etc.).
     """
-    device, slurm_localid, rank, world_size = setup_run(cfg, make_dirs=True)
+    device, slurm_localid, rank, world_size = optollama.runner.setup_run(cfg, make_dirs=True)
     tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = init_tokenmaps(cfg.PATH_DATA)
 
     train_ds, train_loader, train_sampler = make_loader(
@@ -267,31 +258,13 @@ def train(cfg: Any) -> None:
 
 
 if __name__ == "__main__":
-    # Make repeated runs in IDEs safe by cleaning up any stale DDP state
-    try:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-    except Exception:
-        pass
+    optollama.runner.stop_ddp() # clean up old ddp sesssion in interactive mode
 
-    if "--config" not in sys.argv:
-        sys.argv.extend(["--config", "./configs/config_optollama.yaml"])
-
-    # Parse args and build final config (applies --ckpt/--mc-samples/--validsim and --set)
-    args = cli.parse_arguments()
-    cfg = cli.load_config_with_overrides(args)
-
-    # Optional: support `--print-config` from here too (no run)
-    if getattr(args, "print_config", False):
-        cli.print_config(cfg)
-        sys.exit(0)
+    # parse args and build final config
+    args = optollama.cli.parse_arguments()
+    cfg = optollama.cli.load_config(args)
 
     try:
         train(cfg)
     finally:
-        # Always clean up DDP
-        try:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
-        except Exception:
-            pass
+       optollama.runner.stop_ddp()

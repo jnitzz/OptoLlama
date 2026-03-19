@@ -20,7 +20,7 @@ TRAIN_9_DATA_PATH: "${DATA_PATH}/train/train-9.safetensors"
 
 TEST_DATA_PATH: "${DATA_PATH}/test/test.safetensors"
 
-OUTPUT_PATH: "${DATA_PATH}/output"
+OUTPUT_PATH: "${DATA_PATH}/results"
 CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}.pt"
 
 # Optionally:
@@ -92,5 +92,5 @@ TOKEN_FILTER_ENABLED: false
 TOKEN_FILTER_MODE: "allow"  # "exclude" or "allow"
 TOKEN_FILTER_GROUPS: []  # One or more of: ["metals", "semiconductors", "dielectrics"]
 # Optional explicit token strings (or ids):
-TOKEN_FILTER_EXCLUDE_TOKENS: []. # e.g. ["Ag", "TiN"]
+TOKEN_FILTER_EXCLUDE_TOKENS: [] # e.g. ["Ag", "TiN"]
 TOKEN_FILTER_ALLOW_TOKENS: ["SiO2", "Ta2O5", "MgO"]  # used mainly with TOKEN_FILTER_MODE="allow"

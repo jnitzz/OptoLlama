@@ -90,5 +90,5 @@ TOKEN_FILTER_ENABLED: false
 TOKEN_FILTER_MODE: "allow"  # "exclude" or "allow"
 TOKEN_FILTER_GROUPS: []  # One or more of: ["metals", "semiconductors", "dielectrics"]
 # Optional explicit token strings (or ids):
-TOKEN_FILTER_EXCLUDE_TOKENS: []. # e.g. ["Ag", "TiN"]
+TOKEN_FILTER_EXCLUDE_TOKENS: [] # e.g. ["Ag", "TiN"]
 TOKEN_FILTER_ALLOW_TOKENS: ["SiO2", "Ta2O5", "MgO"]  # used mainly with TOKEN_FILTER_MODE="allow"
