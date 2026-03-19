@@ -42,7 +42,7 @@ dependencies = [
   "safetensors",
   "tmm_fast",
   "tqdm",
-  "pyyaml",
+  "omegaconf",
 ]
 
 [project.optional-dependencies]
