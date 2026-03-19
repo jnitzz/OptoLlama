@@ -8,7 +8,4 @@
 #SBATCH --output=train-log-%x_%j.out
 #SBATCH --error=error-log-%x_%j.err
 
-export OL_DATA_ROOT=...
-
-srun --gpu-bind=closest python -u OptoLlama/scripts/train.py --config OptoLlama/configs/optollama_horeka.yaml
-
+srun --gpu-bind=closest python -u ../scripts/train.py --config ../configs/optollama.yaml
