@@ -1,0 +1,96 @@
+MODEL: "optollama"
+RUN: "MD1"
+
+# --- paths ---
+DATA_PATH: "."
+
+TOKENS_PATH: "${DATA_PATH}/tokens.json"
+MATERIALS_PATH: "${DATA_PATH}/materials/"
+
+TRAIN_0_DATA_PATH: "${DATA_PATH}/train/train-0.safetensors"
+TRAIN_1_DATA_PATH: "${DATA_PATH}/train/train-1.safetensors"
+TRAIN_2_DATA_PATH: "${DATA_PATH}/train/train-2.safetensors"
+TRAIN_3_DATA_PATH: "${DATA_PATH}/train/train-3.safetensors"
+TRAIN_4_DATA_PATH: "${DATA_PATH}/train/train-4.safetensors"
+TRAIN_5_DATA_PATH: "${DATA_PATH}/train/train-5.safetensors"
+TRAIN_6_DATA_PATH: "${DATA_PATH}/train/train-6.safetensors"
+TRAIN_7_DATA_PATH: "${DATA_PATH}/train/train-7.safetensors"
+TRAIN_8_DATA_PATH: "${DATA_PATH}/train/train-8.safetensors"
+TRAIN_9_DATA_PATH: "${DATA_PATH}/train/train-9.safetensors"
+
+TEST_DATA_PATH: "${DATA_PATH}/test/test.safetensors"
+
+OUTPUT_PATH: "${DATA_PATH}/output"
+CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}.pt"
+
+# Optionally:
+# TARGET: "${DATA_PATH}/targets/<YOUR_TARGET>.json"
+
+# --- hyperparameters ---
+SEED: 3
+NUM_WORKERS: 4
+
+D_MODEL: 1024
+N_BLOCKS: 6
+N_HEADS: 8
+DROPOUT: 0.0
+
+TEMPERATURE: 0.65
+TOP_K: 0
+TOP_P: 0.90
+MC_SAMPLES: 10
+N_TARGETS: 1
+
+EPOCHS: 1000
+DIFFUSION_STEPS: 500
+TRACK_DIFFUSION_STEPS_MAE: false
+NUM_SAMPLES_TRAIN: 1e7
+NUM_SAMPLES_VALID: 3000
+TRAIN_BATCH: 256
+TEST_BATCH: 256
+
+WAVELENGTH_MIN: 300
+WAVELENGTH_MAX: 2000
+WAVELENGTH_STEPS: 10
+MAX_SEQ_LEN: 21
+
+# --- target design ---
+NOISE:
+  ENABLED: false
+  SIGMA_ABS: 0.01
+  SIGMA_REL: 0.00
+  PER_CHANNEL: [1.0, 0.0, 1.0]
+  WL_MIN: 300
+  WL_MAX: 2000
+  CLIP_0_1: false
+
+SMOOTH:
+  ENABLED: false
+  METHOD: "gaussian"
+  WIN: 25
+  SIGMA: 1.50
+
+MISMATCH_FILL_ORDER: "R>T>A"
+
+FILL_OUTSIDE_ROI:
+  ENABLED: false
+  SKIP_INDEX_0: true
+  MODE: "prior_plus_noise"
+  STRENGTH: 0.95
+  KERNEL_SIZE: 50
+
+# --- evaluation ----
+PLOT_NK: false
+VALIDSIM: "TMM_FAST"
+INCIDENCE_ANGLE: 0
+ROI_MIN: 300
+ROI_MAX: 2000
+
+MAX_EMIT_LEN: ${MAX_SEQ_LEN}  # if smaller than MAX_SEQ_LEN, forces an early EOS at given position, PAD after
+
+TOKEN_FILTER_ENABLED: false
+TOKEN_FILTER_MODE: "allow"  # "exclude" or "allow"
+TOKEN_FILTER_GROUPS: []  # One or more of: ["metals", "semiconductors", "dielectrics"]
+# Optional explicit token strings (or ids):
+TOKEN_FILTER_EXCLUDE_TOKENS: []. # e.g. ["Ag", "TiN"]
+TOKEN_FILTER_ALLOW_TOKENS: ["SiO2", "Ta2O5", "MgO"]  # used mainly with TOKEN_FILTER_MODE="allow"
