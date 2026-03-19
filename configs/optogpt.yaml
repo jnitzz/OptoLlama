@@ -2,23 +2,23 @@ MODEL: "optogpt"
 RUN: "MD1"
 
 # --- paths ---
-DATA_PATH: "."
+DATA_PATH: "/Users/mgoetz/Downloads/data"
 
 TOKENS_PATH: "${DATA_PATH}/tokens.json"
 MATERIALS_PATH: "${DATA_PATH}/materials/"
 
-TRAIN_0_DATA_PATH: "${DATA_PATH}/train/train-0.safetensors"
-TRAIN_1_DATA_PATH: "${DATA_PATH}/train/train-1.safetensors"
-TRAIN_2_DATA_PATH: "${DATA_PATH}/train/train-2.safetensors"
-TRAIN_3_DATA_PATH: "${DATA_PATH}/train/train-3.safetensors"
-TRAIN_4_DATA_PATH: "${DATA_PATH}/train/train-4.safetensors"
-TRAIN_5_DATA_PATH: "${DATA_PATH}/train/train-5.safetensors"
-TRAIN_6_DATA_PATH: "${DATA_PATH}/train/train-6.safetensors"
-TRAIN_7_DATA_PATH: "${DATA_PATH}/train/train-7.safetensors"
-TRAIN_8_DATA_PATH: "${DATA_PATH}/train/train-8.safetensors"
-TRAIN_9_DATA_PATH: "${DATA_PATH}/train/train-9.safetensors"
+DATA_PATH_TRAIN_0: "${DATA_PATH}/train/train-0.safetensors"
+DATA_PATH_TRAIN_1: "${DATA_PATH}/train/train-1.safetensors"
+# DATA_PATH_TRAIN_2: "${DATA_PATH}/train/train-2.safetensors"
+# DATA_PATH_TRAIN_3: "${DATA_PATH}/train/train-3.safetensors"
+# DATA_PATH_TRAIN_4: "${DATA_PATH}/train/train-4.safetensors"
+# DATA_PATH_TRAIN_5: "${DATA_PATH}/train/train-5.safetensors"
+# DATA_PATH_TRAIN_6: "${DATA_PATH}/train/train-6.safetensors"
+# DATA_PATH_TRAIN_7: "${DATA_PATH}/train/train-7.safetensors"
+# DATA_PATH_TRAIN_8: "${DATA_PATH}/train/train-8.safetensors"
+# DATA_PATH_TRAIN_9: "${DATA_PATH}/train/train-9.safetensors"
 
-TEST_DATA_PATH: "${DATA_PATH}/test/test.safetensors"
+DATA_PATH_TEST: "${DATA_PATH}/test/test.safetensors"
 
 OUTPUT_PATH: "${DATA_PATH}/output"
 CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}.pt"
@@ -43,9 +43,9 @@ N_TARGETS: 1
 
 EPOCHS: 1000
 NUM_SAMPLES_TRAIN: 1e7
-NUM_SAMPLES_VALID: 3000
-TRAIN_BATCH: 256
-TEST_BATCH: 256
+NUM_SAMPLES_TEST: 3000
+TRAIN_BATCH_SIZE: 256
+TEST_BATCH_SIZE: 256
 
 WAVELENGTH_MIN: 300
 WAVELENGTH_MAX: 2000
@@ -79,7 +79,7 @@ FILL_OUTSIDE_ROI:
 
 # --- evaluation ----
 PLOT_NK: false
-VALIDSIM: "TMM_FAST"
+VALID_SIM: "TMM_FAST"
 INCIDENCE_ANGLE: 0
 ROI_MIN: 300
 ROI_MAX: 2000

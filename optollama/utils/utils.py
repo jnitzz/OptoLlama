@@ -8,6 +8,7 @@ import torch.nn.functional as f
 from safetensors.torch import load_file, save_file
 from torch.nn.parallel import DistributedDataParallel
 
+
 PAD_TOKEN = "<PAD>"
 MSK_TOKEN = "<MSK>"
 EOS_TOKEN = "<EOS>"
@@ -17,10 +18,13 @@ def save_as_json(path: str, pyobj: Any, name: Optional[str] = None) -> None:
     """
     Save a Python object (e.g., list of strings, dict, etc.) as a JSON file.
 
-    Args:
-        pyobj: The Python object to serialize.
-        path: Destination file path.
-        Optional: name: file name, ".json" will be added automatically
+    Args
+    ----
+    path: str
+        Destination file path.
+    pyobj: str
+        The Python object to serialize.
+    Optional: name: file name, ".json" will be added automatically
     """
     if name is not None:
         path = f"{path}/{name}.json"
@@ -30,27 +34,39 @@ def save_as_json(path: str, pyobj: Any, name: Optional[str] = None) -> None:
         json.dump(pyobj, f, indent=2, ensure_ascii=False)
 
 
-def load_as_json(path: str, name: Optional[str] = None) -> Any:
+def load_as_json(path: str) -> Any:
     """
     Load and return a Python object from a JSON file.
 
-    Args:
-        path: Destination file path.
-        Optional: name: file name, ".json" will be added automatically
-    Returns:
-        Python object (e.g. list, dict).
+    Args
+    ----
+    path: str
+        Path to the JSON file.
+    
+    Returns
+    -------
+    dict
+        The file content as Python object.
     """
-    if name is None:
-        with open(rf"{path}", "r", encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        with open(rf"{path}/{name}.json", "r", encoding="utf-8") as f:
-            return json.load(f)
+    with open(rf"{path}", "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def init_tokenmaps(path: str) -> Tuple[List[str], Dict[str, int], Dict[int, str], str, str, str, int, int, int]:
-    """Return the list of tokens, two dicts with idx/tokens, the special token strings and their respective id."""
-    tokens = load_as_json(path, "tokens")
+def init_tokens(path: str) -> tuple[list[str], dict[str, int], dict[int, str], str, str, str, int, int, int]:
+    """
+    Return the list of tokens, two dicts with idx/tokens, the special token strings and their respective id.
+
+    Args
+    ----
+    path: str
+        Path to the tokens.json file
+    
+    Returns
+    -------
+    dict
+        Combination of mappings from tokens to ids and vice versa.
+    """
+    tokens = load_as_json(path)
     token_to_idx = {tk: i for i, tk in enumerate(tokens)}
     eos_idx = token_to_idx[EOS_TOKEN]
     pad_idx = token_to_idx[PAD_TOKEN]
@@ -60,20 +76,35 @@ def init_tokenmaps(path: str) -> Tuple[List[str], Dict[str, int], Dict[int, str]
     return tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx
 
 
-def unique_length_int_generator(start: float, stop: float, amount: float) -> torch.Tensor:
-    """Return a list of ints with start, stop as (-1 < start < stop) and amount (0 < amount <= stop)."""
-    start = int(start)
-    stop = int(stop)
-    amount = int(amount)
+def unique_length_int_generator(start: int, stop: int, amount: int) -> torch.Tensor:
+    """
+    Return a list of ints with start, stop as (-1 < start < stop) and amount (0 < amount <= stop).
+    
+    Args
+    ----
+    start: int
+        The start index to subset from.
+    end: int
+        The maximum index for the subset.
+    amount: int
+        The number of items to take.
+    
+    Returns
+    -------
+    torch.Tensor
+        The subset indices.
+    """
     if not (-1 < start < stop) or not (0 < amount <= stop):
         raise ValueError(
             f"Invalid arguments: start={start}, stop={stop}, amount={amount}. Require (-1 < start < stop) and (0 < amount <= stop)."
         )
+    
     len_unique = -1
     amount = amount - 1
+    
     while len_unique < amount:
         amount = amount + 1
-        subset_idx = torch.linspace(start, stop - 1, amount, dtype=int).unique()
+        subset_idx = torch.linspace(start, stop - 1, amount, dtype=torch.int).unique()
         len_unique = len(subset_idx)
 
     return subset_idx

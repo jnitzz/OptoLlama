@@ -5,7 +5,7 @@ import torch
 
 from optollama.evaluation.metrics import masked_mae
 from optollama.scripts.evaluate import simulate_spectra_ids
-from optollama.utils.simulation_TMM_FAST import TMMContext
+from optollama.utils.simulation_tmm_fast import TMMContext
 from optollama.utils.utils import top_k_top_p_filtering
 
 # ruff: noqa: D102, D105, D107
@@ -422,8 +422,7 @@ class OptoLlama(torch.nn.Module):
             batch: Token batch whose size determines the number of timesteps.
             sampling_eps: Minimum timestep value to avoid degenerate noise.
 
-        Returns
-        -------
+        Returns:
             Tensor of shape [B] with sampled timesteps in (eps, 1].
         """
         n, device = batch.shape[0], batch.device

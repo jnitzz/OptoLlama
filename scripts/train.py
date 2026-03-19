@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 
+import os
+
 import torch
 import tqdm
 
 import optollama
-import optollama.cli
-import optollama.runner
+import optollama.data
+import optollama.model
 
 # ruff: noqa: N806
 
@@ -16,77 +18,78 @@ def train(cfg: dict) -> None:
 
     Args
     ----
-    cfg:
-        Configuration object (SimpleNamespace or similar) as returned by
-        `cli.load_config_with_overrides`. Must contain at least the keys used
-        below (paths, model hyperparameters, batch sizes, etc.).
+    cfg: dict
+        Configuration object
     """
-    device, slurm_localid, rank, world_size = optollama.runner.setup_run(cfg, make_dirs=True)
-    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = init_tokenmaps(cfg.PATH_DATA)
+    # --- distributed computation setup ---
+    device, local_rank, rank, world_size = optollama.runner.setup_run(cfg, make_dirs=True)
+    ddp = optollama.runner.is_ddp()
+    
+    # --- data loading and preprocessing ---
+    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = optollama.utils.init_tokens(cfg["TOKENS_PATH"])
 
-    train_ds, train_loader, train_sampler = make_loader(
-        cfg,
-        split="train",
-        subset_n=cfg.NUM_SAMPLES_TRAIN,
-        ddp=_is_ddp(),
+    train_ds, train_loader, train_sampler = optollama.data.make_loader(
+        cfg, 
+        split="train", 
+        subset_n=cfg["NUM_SAMPLES_TRAIN"], 
+        ddp=ddp
+    )
+    test_ds, test_loader, test_sampler = optollama.data.make_loader(
+        cfg, 
+        split="test", 
+        subset_n=cfg["NUM_SAMPLES_TEST"], 
+        ddp=ddp
     )
 
-    valid_ds, valid_loader, valid_sampler = make_loader(
-        cfg,
-        split="valid",
-        subset_n=cfg.NUM_SAMPLES_VALID,
-        ddp=_is_ddp(),
-    )
-
-    # --- physics / TMM (centralized) ---
-    # TMM context
-    tmm_ctx = None
-    if cfg.VALIDSIM == "TMM_FAST":
-        tmm_ctx = build_tmm_context(cfg=cfg, idx_to_token=idx_to_token, device=device)
+    # --- TMM simulation ---
+    tmm_ctx = optollama.build_tmm_context(
+        cfg=cfg, 
+        idx_to_token=idx_to_token, 
+        device=device
+    ) if cfg["VALID_SIM"] == "TMM_FAST" else None
 
     # --- model ---
     vocab_size = len(idx_to_token)
-    example_spectrum = train_ds.spectra[0] if isinstance(train_ds, SpectraDataset) else train_ds.dataset.spectra[0]
-    model = build_model(
-        model_type=getattr(cfg, "MODEL_KEY", "optollama"),
+    
+    example_spectrum = train_ds.spectra[0] if isinstance(train_ds, optollama.data.SpectraDataset) else train_ds.dataset.spectra[0]
+    model = optollama.model.build_model(
+        model_type=cfg["MODEL"],
         sample_spectrum=example_spectrum,  # [W,3] example
         vocab_size=vocab_size,
-        max_stack_depth=train_ds.maximum_depth if isinstance(train_ds, SpectraDataset) else train_ds.dataset.maximum_depth,
-        d_model=cfg.D_MODEL,
-        n_blocks=cfg.N_BLOCKS,
-        n_heads=cfg.N_HEADS,
-        timesteps=cfg.STEPS,
-        dropout=cfg.DROPOUT,
+        max_stack_depth=cfg["MAX_SEQ_LEN"],
+        d_model=cfg["D_MODEL"],
+        n_blocks=cfg["N_BLOCKS"],
+        n_heads=cfg["N_HEADS"],
+        timesteps=cfg.get("DIFFUSION_STEPS", None),
+        dropout=cfg["DROPOUT"],
         idx_to_token=idx_to_token,
         mask_idx=msk_idx,
         pad_idx=pad_idx,
         eos_idx=eos_idx,
         device=device,
-        temperature=cfg.TEMPERATURE,
-        top_k=cfg.TOP_K,
-        top_p=cfg.TOP_P,
+        temperature=cfg["TEMPERATURE"],
+        top_k=cfg["TOP_K"],
+        top_p=cfg["TOP_P"],
     ).to(device)
 
-    # --- DDP wrapper (only when actually in DDP) ---
-    is_ddp = _is_ddp()
-    if is_ddp and torch.cuda.is_available():
+    # --- DDP wrapper ---
+    if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
-            device_ids=[slurm_localid],
-            output_device=slurm_localid,
-            find_unused_parameters=False,
+            device_ids=[local_rank],
+            output_device=local_rank
         )
 
     # --- optimizer ---
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     # --- metric buffers / resume bookkeeping ---
-    train_losses = torch.zeros(cfg.EPOCHS)
-    train_acc = torch.zeros(cfg.EPOCHS)
-    valid_acc = torch.zeros(cfg.EPOCHS)
-    valid_mae = torch.ones(cfg.EPOCHS) * torch.inf
+    train_losses = torch.zeros(cfg["EPOCHS"])
+    train_acc = torch.zeros(cfg["EPOCHS"])
+    valid_acc = torch.zeros(cfg["EPOCHS"])
+    valid_mae = torch.full((cfg["EPOCHS"],), torch.inf)
 
-    checkpoint = cfg.PATH_CKPT
+    checkpoint = cfg["CHECKPOINT_PATH"]
 
     best_valid_acc = 0.0
     best_valid_mae = torch.inf
@@ -95,6 +98,7 @@ def train(cfg: dict) -> None:
     if checkpoint and os.path.exists(checkpoint):
         start_epoch, blob = load_checkpoint(checkpoint, model, optimizer=optimizer, map_location="cpu", strict=True)
         start_epoch = start_epoch or 0
+        
         # recover metric buffers if present
         train_losses = blob.get("train_losses", train_losses)
         train_acc = blob.get("train_acc", train_acc)
@@ -108,18 +112,18 @@ def train(cfg: dict) -> None:
             best_valid_mae = float(torch.min(valid_mae[torch.isfinite(valid_mae)]))
 
     # ------------------------------ epochs ------------------------------
-    for epoch in range(start_epoch, cfg.EPOCHS):
+    for epoch in range(start_epoch, cfg["EPOCHS"]):
         # DDP epoch seeds
-        if is_ddp and getattr(train_loader, "sampler", None) is not None:
+        if ddp and getattr(train_loader, "sampler", None) is not None:
             train_loader.sampler.set_epoch(epoch)
-        if is_ddp and getattr(valid_loader, "sampler", None) is not None:
+        if ddp and getattr(valid_loader, "sampler", None) is not None:
             valid_loader.sampler.set_epoch(epoch)
 
         # ------------------------------ train ------------------------------
         if not cfg.NOTRAIN:
             model.train()
             if rank == 0:
-                pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{cfg.EPOCHS} train", leave=True)
+                pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{cfg['EPOCHS']} train", leave=True)
 
             for i, batch in enumerate(train_loader):
                 optimizer.zero_grad(set_to_none=True)
@@ -151,7 +155,7 @@ def train(cfg: dict) -> None:
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.MAX_GRAD_NORM)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1000.0)
                 optimizer.step()
 
                 # --- logging (DDP-avg for losses) ---
@@ -237,7 +241,7 @@ def train(cfg: dict) -> None:
                 else:
                     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
 
-            os.makedirs(cfg.PATH_SAVED, exist_ok=True)
+            os.makedirs(cfg["OUTPUT_PATH"], exist_ok=True)
             save_checkpoint(
                 checkpoint,
                 model=model,
@@ -249,22 +253,22 @@ def train(cfg: dict) -> None:
                 valid_mae=valid_mae,
                 extra={
                     "sampling": {
-                        "temperature": float(getattr(cfg, "TEMPERATURE", 0.0)),
-                        "top_k": int(getattr(cfg, "TOP_K", 0)),
-                        "top_p": float(getattr(cfg, "TOP_P", 0.0)),
+                        "temperature": cfg["TEMPERATURE"],
+                        "top_k": cfg["TOP_K"],
+                        "top_p": cfg["TOP_P"],
                     }
                 },
             )
 
 
 if __name__ == "__main__":
-    optollama.runner.stop_ddp() # clean up old ddp sesssion in interactive mode
+    optollama.stop_ddp() # clean up old ddp sesssion in interactive mode
 
     # parse args and build final config
-    args = optollama.cli.parse_arguments()
-    cfg = optollama.cli.load_config(args)
+    args = optollama.parse_arguments()
+    cfg = optollama.load_config(args)
 
     try:
         train(cfg)
     finally:
-       optollama.runner.stop_ddp()
+       optollama.stop_ddp()

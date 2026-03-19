@@ -20,7 +20,8 @@ def init_distributed() -> tuple[str, int, int, int]:
 
     Returns
     -------
-    A tuple with (device, local_rank, rank, world_size)
+    tuple
+        A tuple with (device, local_rank, rank, world_size)
     """
     rank = int(os.getenv("SLURM_PROCID", 0))  # Get individual process ID.
     world_size = int(os.getenv("SLURM_NTASKS", 1))  # Total number of processes.
@@ -50,22 +51,11 @@ def init_distributed() -> tuple[str, int, int, int]:
     if rank == 0:
         print(
             f"[DDP] backend={backend} world={world_size} rank={rank} "
-            f"local_rank={local_rank}"
+            f"local_rank={local_rank} "
             f"device={device}"
         )
 
     return device, local_rank, rank, world_size
-
-
-def _is_ddp() -> bool:
-    """
-    Determines whether ddp is running.
-    
-    Returns
-    -------
-    Whether ddp is running as boolean
-    """
-    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
 
 def set_all_seeds(seed: int = 42) -> None:
@@ -113,6 +103,18 @@ def setup_run(cfg: dict, make_dirs: bool = False) -> tuple[str, int, int, int]:
         os.makedirs(cfg["OUTPUT_PATH"], exist_ok=True)
         
     return device, local_rank, rank, world_size
+    
+
+def is_ddp() -> bool:
+    """
+    Determines whether ddp is running.
+    
+    Returns
+    -------
+    bool
+        Whether ddp is running.
+    """
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     
     
 def stop_ddp() -> None:
