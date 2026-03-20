@@ -4,8 +4,8 @@ from typing import List, Optional, Tuple
 import torch
 
 from optollama.evaluation.metrics import masked_mae
-from optollama.scripts.evaluate import simulate_spectra_ids
-from optollama.utils.simulation_tmm_fast import TMMContext
+from optollama.evaluation import simulate_spectra_ids
+from optollama.evaluation import TMMContext
 from optollama.utils.utils import top_k_top_p_filtering
 
 # ruff: noqa: D102, D105, D107

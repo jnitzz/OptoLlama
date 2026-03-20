@@ -7,7 +7,9 @@ import tqdm
 
 import optollama
 import optollama.data
+import optollama.evaluation
 import optollama.model
+import optollama.utils
 
 # ruff: noqa: N806
 
@@ -22,8 +24,8 @@ def train(cfg: dict) -> None:
         Configuration object
     """
     # --- distributed computation setup ---
-    device, local_rank, rank, world_size = optollama.runner.setup_run(cfg, make_dirs=True)
-    ddp = optollama.runner.is_ddp()
+    device, local_rank, rank, world_size = optollama.utils.setup_run(cfg, make_dirs=True)
+    ddp = optollama.utils.is_ddp()
     
     # --- data loading and preprocessing ---
     tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = optollama.utils.init_tokens(cfg["TOKENS_PATH"])
@@ -42,7 +44,7 @@ def train(cfg: dict) -> None:
     )
 
     # --- TMM simulation ---
-    tmm_ctx = optollama.build_tmm_context(
+    tmm_ctx = optollama.evaluation.simulation.build_tmm_context(
         cfg=cfg, 
         idx_to_token=idx_to_token, 
         device=device
@@ -262,13 +264,13 @@ def train(cfg: dict) -> None:
 
 
 if __name__ == "__main__":
-    optollama.stop_ddp() # clean up old ddp sesssion in interactive mode
+    optollama.utils.stop_ddp() # clean up old ddp sesssion in interactive mode
 
     # parse args and build final config
-    args = optollama.parse_arguments()
-    cfg = optollama.load_config(args)
+    args = optollama.utils.parse_arguments()
+    cfg = optollama.utils.load_config(args)
 
     try:
         train(cfg)
     finally:
-       optollama.stop_ddp()
+       optollama.utils.stop_ddp()
