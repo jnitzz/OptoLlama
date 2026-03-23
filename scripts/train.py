@@ -3,6 +3,7 @@
 import os
 
 import torch
+import torch.utils.data
 import tqdm
 
 import optollama
@@ -28,15 +29,15 @@ def train(cfg: dict) -> None:
     ddp = optollama.utils.is_ddp()
     
     # --- data loading and preprocessing ---
-    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = optollama.utils.init_tokens(cfg["TOKENS_PATH"])
+    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
 
-    train_ds, train_loader, train_sampler = optollama.data.make_loader(
+    train_ds, train_loader, train_sampler = optollama.data.SpectraDataset.make_loader(
         cfg, 
         split="train", 
         subset_n=cfg["NUM_SAMPLES_TRAIN"], 
         ddp=ddp
     )
-    test_ds, test_loader, test_sampler = optollama.data.make_loader(
+    test_ds, test_loader, test_sampler = optollama.data.SpectraDataset.make_loader(
         cfg, 
         split="test", 
         subset_n=cfg["NUM_SAMPLES_TEST"], 
@@ -52,8 +53,8 @@ def train(cfg: dict) -> None:
 
     # --- model ---
     vocab_size = len(idx_to_token)
+    example_spectrum = train_ds.dataset.spectra[0] if isinstance(train_ds, torch.utils.data.Subset) else train_ds.spectra[0]
     
-    example_spectrum = train_ds.spectra[0] if isinstance(train_ds, optollama.data.SpectraDataset) else train_ds.dataset.spectra[0]
     model = optollama.model.build_model(
         model_type=cfg["MODEL"],
         sample_spectrum=example_spectrum,  # [W,3] example
@@ -88,112 +89,84 @@ def train(cfg: dict) -> None:
     # --- metric buffers / resume bookkeeping ---
     train_losses = torch.zeros(cfg["EPOCHS"])
     train_acc = torch.zeros(cfg["EPOCHS"])
-    valid_acc = torch.zeros(cfg["EPOCHS"])
-    valid_mae = torch.full((cfg["EPOCHS"],), torch.inf)
+    test_acc = torch.zeros(cfg["EPOCHS"])
+    test_mae = torch.full((cfg["EPOCHS"],), torch.inf)
 
     checkpoint = cfg["CHECKPOINT_PATH"]
 
-    best_valid_acc = 0.0
-    best_valid_mae = torch.inf
+    best_test_acc = 0.0
+    best_test_mae = torch.inf
     start_epoch = 0
 
     if checkpoint and os.path.exists(checkpoint):
         start_epoch, blob = load_checkpoint(checkpoint, model, optimizer=optimizer, map_location="cpu", strict=True)
-        start_epoch = start_epoch or 0
         
         # recover metric buffers if present
         train_losses = blob.get("train_losses", train_losses)
         train_acc = blob.get("train_acc", train_acc)
-        valid_acc = blob.get("valid_acc", valid_acc)
-        valid_mae = blob.get("valid_mae", valid_mae)
-
-        # robust bests
-        if torch.any(torch.isfinite(valid_acc)):
-            best_valid_acc = float(torch.max(valid_acc[torch.isfinite(valid_acc)]))
-        if torch.any(torch.isfinite(valid_mae)):
-            best_valid_mae = float(torch.min(valid_mae[torch.isfinite(valid_mae)]))
+        test_acc = blob.get("test_acc", test_acc)
+        test_mae = blob.get("test_mae", test_mae)
 
     # ------------------------------ epochs ------------------------------
-    for epoch in range(start_epoch, cfg["EPOCHS"]):
+    epochs = cfg["EPOCHS"]
+    for epoch in range(start_epoch, epochs):
         # DDP epoch seeds
-        if ddp and getattr(train_loader, "sampler", None) is not None:
+        if ddp:
             train_loader.sampler.set_epoch(epoch)
-        if ddp and getattr(valid_loader, "sampler", None) is not None:
-            valid_loader.sampler.set_epoch(epoch)
+            test_loader.sampler.set_epoch(epoch)
 
         # ------------------------------ train ------------------------------
-        if not cfg.NOTRAIN:
-            model.train()
-            if rank == 0:
-                pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{cfg['EPOCHS']} train", leave=True)
+        model.train()
+        if rank == 0:
+            pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{epochs} train", leave=True)
 
-            for i, batch in enumerate(train_loader):
-                optimizer.zero_grad(set_to_none=True)
+        for i, batch in enumerate(train_loader):
+            optimizer.zero_grad(set_to_none=True)
 
-                spectra, stacks = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
-                logits = model(spectra, stacks)  # teacher forcing path → [B,S,V]
+            spectra, stacks = batch[0].to(device), batch[1].to(device)
+            logits = model(spectra, stacks)  # teacher forcing path → [B,S,V]
 
-                log_probs = torch.nn.functional.log_softmax(torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0), dim=-1)
-                loss_CE = torch.nn.NLLLoss(ignore_index=pad_idx)(log_probs.view(-1, vocab_size), stacks.view(-1))
+            log_probs = torch.nn.functional.log_softmax(torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0), dim=-1)
+            loss = torch.nn.NLLLoss(ignore_index=pad_idx)(log_probs.view(-1, vocab_size), stacks.view(-1))
 
-                # Guard for NaNs, DDP-synchronized
-                ce_bad = torch.tensor([float(not torch.isfinite(loss_CE))], device=device)
-                if is_ddp:
-                    torch.distributed.all_reduce(ce_bad, op=torch.distributed.ReduceOp.MAX)
-                if ce_bad.item() > 0.0:
-                    if rank == 0:
-                        what = "CE" if ce_bad.item() > 0 else ""
-                        print(f"non-finite loss ({what}) at epoch {epoch}, step {i} — skipping batch")
-                    continue
+            loss.backward()
+            optimizer.step()
 
-                loss_CE.backward()
-                bad_grad = False
-                for p in model.parameters():
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        bad_grad = True
-                        print("bad_grad, scipping")
-                        break
-                if bad_grad:
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+            # --- logging (DDP-avg for losses) ---
+            with torch.no_grad():
+                log_ce = loss.detach().clone()
+                if ddp:
+                    torch.distributed.all_reduce(log_ce)
+                    log_ce /= world_size
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1000.0)
-                optimizer.step()
+                train_losses[epoch] += log_ce.item()
 
-                # --- logging (DDP-avg for losses) ---
-                with torch.no_grad():
-                    log_ce = loss_CE.detach().clone()
-                    if is_ddp:
-                        torch.distributed.all_reduce(log_ce)
-                        log_ce /= world_size
-
-                    train_losses[epoch] += log_ce.item()
-
-                    acc, _ = token_accuracy(stacks, logits.argmax(dim=-1), eos_idx, pad_idx, msk_idx)
-                    train_acc[epoch] += acc
-
-                if rank == 0:
-                    pbar.set_postfix(
-                        loss_CE=f"{train_losses[epoch] / (i + 1):.4f}",
-                        acc=f"{train_acc[epoch] / (i + 1) * 100:.4f}%",
-                    )
-                    pbar.update()
+                acc, _ = optollama.evaluation.metrics.token_accuracy(stacks, logits.argmax(dim=-1), eos_idx, pad_idx, msk_idx)
+                # train_acc[epoch] += acc
 
             if rank == 0:
-                pbar.close()
+                pbar.set_postfix(
+                    loss_CE=f"{train_losses[epoch] / (i + 1):.4f}",
+                    acc=f"{train_acc[epoch] / (i + 1) * 100:.4f}%",
+                )
+                pbar.update()
+
+        if rank == 0:
+            pbar.close()
 
         # ------------------------------ validation ------------------------------
-        val_out = validate_model(
+        model.eval()
+        test_output = optollama.evaluation.evaluate_model(
             model,
-            valid_loader,
-            mode=cfg.VALIDSIM,
+            test_loader,
+            device=device,
+            mode=cfg["VALID_SIM"],
             eos=eos_idx,
             pad=pad_idx,
             msk=msk_idx,
-            device=device,
             idx_to_token=idx_to_token,
             tmm_ctx=tmm_ctx,
-            mc_samples=cfg.MC_SAMPLES,
+            mc_samples=cfg["MC_SAMPLES"],
             rank=rank,
             world_size=world_size,
             gather=True,
@@ -201,9 +174,9 @@ def train(cfg: dict) -> None:
         )
 
         # update trackers
-        valid_acc[epoch] = float(val_out["mean_acc"])
-        if cfg.VALIDSIM == "TMM_FAST":
-            valid_mae[epoch] = float(val_out["mean_mae"])
+        test_acc[epoch] = test_output["mean_acc"].item()
+        if cfg["VALID_SIM"] == "TMM_FAST":
+            test_mae[epoch] = test_output["mean_mae"].item()
 
         # save per-example results (rank 0 only)
         if rank == 0 and "results" in val_out:
@@ -213,36 +186,36 @@ def train(cfg: dict) -> None:
             print(f"[rank 0] Saved {len(val_out['results'])} samples → …/{out_name}.json")
             if cfg.VALIDSIM == "TMM_FAST":
                 print(
-                    f" min valid MAE: {float(torch.min(valid_mae).item()) if torch.isfinite(valid_mae).any() else valid_mae[epoch]:.4f}"
+                    f" min valid MAE: {float(torch.min(test_mae).item()) if torch.isfinite(test_mae).any() else test_mae[epoch]:.4f}"
                 )
-                print(f"last valid MAE: {valid_mae[epoch]:.4f}")
+                print(f"last valid MAE: {test_mae[epoch]:.4f}")
             else:
-                print(f"Validation accuracy: {valid_acc[epoch]:.2f}%")
+                print(f"Validation accuracy: {test_acc[epoch]:.2f}%")
                 if rank == 0:
                     print(f"No validation at epoch {epoch}")
                     continue
-
+        
         # ------------------------------ checkpointing ------------------------------
         if not cfg.NOTRAIN and rank == 0:
             if cfg.VALIDSIM != "TMM_FAST":
                 # accuracy-based checkpointing
-                new_acc = float(valid_acc[epoch].item())
-                if new_acc > (best_valid_acc + 1e-7):
-                    print(f"Checkpoint saved (ACC): new={new_acc:.6f} > best={best_valid_acc:.6f} [epoch {epoch}]")
-                    best_valid_acc = new_acc
+                new_acc = float(test_acc[epoch].item())
+                if new_acc > (best_test_acc + 1e-7):
+                    print(f"Checkpoint saved (ACC): new={new_acc:.6f} > best={best_test_acc:.6f} [epoch {epoch}]")
+                    best_test_acc = new_acc
                     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
                 else:
                     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
             else:
                 # MAE-based checkpointing
-                new_mae = float(valid_mae[epoch].item())
-                if new_mae < (best_valid_mae - 1e-7):
-                    print(f"Checkpoint saved (MAE): new={new_mae:.6f} < best={best_valid_mae:.6f} [epoch {epoch}]")
-                    best_valid_mae = new_mae
+                new_mae = float(test_mae[epoch].item())
+                if new_mae < (best_test_mae - 1e-7):
+                    print(f"Checkpoint saved (MAE): new={new_mae:.6f} < best={best_test_mae:.6f} [epoch {epoch}]")
+                    best_test_mae = new_mae
                     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
                 else:
                     checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
-
+        
             os.makedirs(cfg["OUTPUT_PATH"], exist_ok=True)
             save_checkpoint(
                 checkpoint,
@@ -251,8 +224,8 @@ def train(cfg: dict) -> None:
                 epoch=epoch,
                 train_losses=train_losses,
                 train_acc=train_acc,
-                valid_acc=valid_acc,
-                valid_mae=valid_mae,
+                test_acc=test_acc,
+                test_mae=test_mae,
                 extra={
                     "sampling": {
                         "temperature": cfg["TEMPERATURE"],

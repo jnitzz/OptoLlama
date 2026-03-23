@@ -6,7 +6,17 @@ import os
 from huggingface_hub import login, snapshot_download
 
 
-def setup_args():
+def setup_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for the checkpoint download script.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments containing:
+        - ``token`` (str): HuggingFace API token.
+        - ``dest`` (str): Local directory to save the downloaded files.
+    """
     parser = argparse.ArgumentParser(description="Download a private Hugging Face model checkpoint.")
 
     # huggingface API token
@@ -28,7 +38,18 @@ def setup_args():
     return parser.parse_args()
 
 
-def main(args: argparse.Namespace):
+def main(args: argparse.Namespace) -> None:
+    """
+    Authenticate with HuggingFace and download the OptoLlama model checkpoint.
+
+    Args
+    ----
+    args : argparse.Namespace
+        Parsed CLI arguments. Expected attributes:
+
+        - ``token`` (str): HuggingFace API token used for authentication.
+        - ``dest`` (str): Local directory where the checkpoint will be saved.
+    """
     # authenticate
     login(token=args.token)
 

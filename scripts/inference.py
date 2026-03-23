@@ -21,17 +21,47 @@ from optollama.utils.utils import init_tokenmaps, load_checkpoint, save_as_json,
 
 
 def base_material_name(token: str) -> str:
-    """Extract a base material name from a token string.
+    """
+    Extract a base material name from a token string.
 
     Robust to common formats where thickness/parameters are appended, e.g.
-    "SiO2_120", "TiN(30nm)", etc. Adjust regex if your token format differs.
+    ``"SiO2_120"``, ``"TiN(30nm)"``, etc. Adjust the split logic if your
+    token format differs.
+
+    Args
+    ----
+    token : str
+        A token string such as ``"SiO2_120"`` or ``"TiN"``.
+
+    Returns
+    -------
+    str
+        The base material name (everything before the first ``"_"``).
     """
     return token.split("_", 1)[0]
 
 
 def build_base_to_ids(token_to_idx: dict[str, int], special: set[str]) -> dict[str, list[int]]:
-    """Build a base material index."""
-    base_to_ids: dict[str, list[int]] = {}
+    """
+    Build a mapping from base material names to lists of token ids.
+
+    Iterates over the full vocabulary and groups token ids by their base
+    material name (e.g. all ``"SiO2_*"`` tokens are grouped under ``"SiO2"``).
+    Special tokens (PAD, EOS, MSK) are excluded.
+
+    Args
+    ----
+    token_to_idx : dict[str, int]
+        Full vocabulary mapping from token string to integer id.
+    special : set[str]
+        Set of special token strings to exclude (e.g. ``{"<PAD>", "<EOS>", "<MSK>"}``).
+
+    Returns
+    -------
+    dict[str, list[int]]
+        Mapping from base material name to a list of corresponding token ids.
+    """
+    base_to_ids = {}
     for tok, tid in token_to_idx.items():
         if tok in special:
             continue
@@ -41,13 +71,40 @@ def build_base_to_ids(token_to_idx: dict[str, int], special: set[str]) -> dict[s
 
 
 def expand_material_or_token_to_ids(items: list, token_to_idx: dict[str, int], base_to_ids: dict[str, list[int]]) -> torch.Tensor:
-    """Expand filtered materials or tokens to ids.
-
-    - int -> token id
-    - str -> exact token if exists (e.g. "SiO2_120")
-           -> otherwise base material (e.g. "SiO2" expands to all SiO2_*)
     """
-    ids: list[int] = []
+    Expand a mixed list of material names or token ids into a tensor of token ids.
+
+    Each entry in ``items`` is resolved as follows:
+
+    - ``int`` → used directly as a token id.
+    - ``str`` → looked up as an exact token first (e.g. ``"SiO2_120"``);
+      if not found, treated as a base material name and expanded to all
+      matching token ids (e.g. ``"SiO2"`` → all ``"SiO2_*"`` ids).
+
+    Args
+    ----
+    items : list
+        Mixed list of ``int`` token ids or ``str`` token/material names.
+    token_to_idx : dict[str, int]
+        Full vocabulary mapping from token string to integer id.
+    base_to_ids : dict[str, list[int]]
+        Mapping from base material name to a list of token ids,
+        as produced by :func:`build_base_to_ids`.
+
+    Returns
+    -------
+    torch.Tensor
+        1-D long tensor of unique resolved token ids. Empty tensor if
+        ``items`` is empty.
+
+    Raises
+    ------
+    ValueError
+        If a string entry cannot be resolved as an exact token or base material.
+    TypeError
+        If an entry is neither ``int`` nor ``str``.
+    """
+    ids = []
     for x in items:
         if isinstance(x, int):
             ids.append(int(x))
@@ -70,20 +127,36 @@ def expand_material_or_token_to_ids(items: list, token_to_idx: dict[str, int], b
 
 
 def build_group_token_ids(tokens: list[str], token_to_idx: dict[str, int]) -> dict[str, torch.Tensor]:
-    """Build predefined material-group id sets.
+    """
+    Build predefined material-group token-id sets from the vocabulary.
 
-    Groups:
-      - metals: Ag, Al, TiN
-      - semiconductors: Ge, ITO, Si, ZnO, ZnS, ZnSe
-      - dielectrics: remaining non-special tokens
+    Partitions all non-special tokens into three groups:
+
+    - ``"metals"`` — Ag, Al, TiN
+    - ``"semiconductors"`` — Ge, ITO, Si, ZnO, ZnS, ZnSe
+    - ``"dielectrics"`` — all remaining non-special tokens
+
+    Args
+    ----
+    tokens : list[str]
+        Full list of token strings in the vocabulary (including special tokens).
+    token_to_idx : dict[str, int]
+        Mapping from token string to integer id.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        Dictionary with keys ``"metals"``, ``"semiconductors"``, and
+        ``"dielectrics"``, each mapping to a 1-D long tensor of token ids
+        belonging to that group.
     """
     metals = {"Ag", "Al", "TiN"}
     semis = {"Ge", "ITO", "Si", "ZnO", "ZnS", "ZnSe"}
     special = {"<PAD>", "<MSK>", "<EOS>"}
 
-    metal_toks: list[str] = []
-    semi_toks: list[str] = []
-    other_toks: list[str] = []
+    metal_toks = []
+    semi_toks = []
+    other_toks = []
 
     for t in tokens:
         if t in special:
@@ -239,8 +312,8 @@ def run_inference(
         group_ids = build_group_token_ids(tokens, token_to_idx)
 
         # Expand groups into ids
-        allow_group_ids: list[torch.Tensor] = []
-        exclude_group_ids: list[torch.Tensor] = []
+        allow_group_ids = []
+        exclude_group_ids = []
         for g in groups:
             gl = str(g).lower().strip()
             if gl not in group_ids:
