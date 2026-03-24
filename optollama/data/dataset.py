@@ -1,8 +1,7 @@
 import re
 
-from typing import Any, Optional, Union
+from typing import Any, Optional, Self, Union
 
-import pathlib
 import safetensors.torch
 import torch
 
@@ -79,6 +78,11 @@ class SpectraDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Return specra, stacks and index.
+        
+        Args
+        ----
+        index: int
+            The index of the data items to return.
 
         Returns
         -------
@@ -86,72 +90,75 @@ class SpectraDataset(torch.utils.data.Dataset):
             Spectrum of shape [3,W] in float32 and stack tokens of shape [S] as longs and the passed index number.
         """
         return self.spectra[index], self.stacks[index], index
+        
+    @classmethod
+    def make_loader(cls, cfg: dict, split: str, subset_n: int = None, ddp: bool = False) -> tuple[Union[Self, Subset[Self]], DataLoader, DistributedSampler]:
+        """
+        Build dataset, optional subset, sampler, and DataLoader in train/test.
 
+        Args
+        ----
+        cfg: dict
+            Configuration mapping.
+        split: str
+            'train' or 'test'.
+        subset_n: int
+            Optional number of samples to subset for quick runs, defaults to None (aka all items).
+        ddp: bool
+            Whether to use in data parallel mode, defaults to False.
 
-def make_loader(cfg: dict, split: str, subset_n: int = None, ddp: bool = False) -> tuple[Union[SpectraDataset, Subset[SpectraDataset]], DataLoader, DistributedSampler]:
-    """
-    Build dataset, optional subset, sampler, and DataLoader in train/test.
-
-    Args
-    ----
-    cfg: dict
-        Configuration mapping.
-    split: str
-        'train' or 'test'.
-    subset_n: int
-        Optional number of samples to subset for quick runs, defaults to None (aka all items).
-    ddp: bool
-        Whether to use in data parallel mode, defaults to False.
-
-    Returns
-    -------
-    Union[SpectraDataset, Subset[SpectraDataset]]
-        The loaded dataset
-    DataLoader
-        The dataloader wrapping the above dataset.
-    DistributedSampler
-        The indices sampler.
-    """
-    split_lower = split.lower()
-    if split_lower not in ("train", "test"):
-        raise ValueError(f"Unknown data split {split_lower}, expected 'train' or 'test'")
+        Returns
+        -------
+        Union[SpectraDataset, Subset[SpectraDataset]]
+            The loaded dataset
+        DataLoader
+            The dataloader wrapping the above dataset.
+        DistributedSampler
+            The indices sampler.
+        """
+        split_lower = split.lower()
+        if split_lower not in ("train", "test"):
+            raise ValueError(f"Unknown data split {split_lower}, expected 'train' or 'test'")
     
-    search_string = "DATA_PATH_TRAIN" if split_lower == "train" else "DATA_PATH_TEST"
-    dataset_path = sorted([cfg[k] for k in cfg.keys() if k.startswith(search_string)])
+        search_string = "DATA_PATH_TRAIN" if split_lower == "train" else "DATA_PATH_TEST"
+        dataset_path = sorted([cfg[k] for k in cfg.keys() if k.startswith(search_string)])
 
-    # --- build dataset ---
-    ds = SpectraDataset(dataset_path)
+        # --- build dataset ---
+        ds = cls(dataset_path)
 
-    # --- optional subset for quick debugging ---
-    if subset_n is not None and subset_n < ds.length_dataset:
-        idxs = unique_length_int_generator(0, ds.length_dataset - 1, subset_n)
-        ds = Subset(ds, idxs)
+        # --- optional subset for quick debugging ---
+        if subset_n is not None and subset_n < ds.length_dataset:
+            idxs = unique_length_int_generator(0, ds.length_dataset - 1, subset_n)
+            ds = Subset(ds, idxs)
 
-    # --- configure sampler and shuffling ---
-    if split_lower == "train":
-        sampler = DistributedSampler(ds, shuffle=True) if ddp else None
-        shuffle = not ddp
-        drop_last = True
-    else:
-        sampler = DistributedSampler(ds, shuffle=False) if ddp else None
-        shuffle = False
-        drop_last = False
+        # --- configure sampler and shuffling ---
+        if split_lower == "train":
+            sampler = DistributedSampler(ds, shuffle=True) if ddp else None
+            shuffle = not ddp
+            drop_last = True
+        else:
+            sampler = DistributedSampler(ds, shuffle=False) if ddp else None
+            shuffle = False
+            drop_last = False
 
-    # --- build DataLoader ---
-    batch_size = cfg["TRAIN_BATCH_SIZE"] if split == "train" else cfg["TEST_BATCH_SIZE"]
-    num_workers = cfg["NUM_WORKERS"]
+        # --- build DataLoader ---
+        batch_size = cfg["TRAIN_BATCH_SIZE"] if split == "train" else cfg["TEST_BATCH_SIZE"]
+        num_workers = cfg["NUM_WORKERS"]
 
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=drop_last,
-    )
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=not torch.mps.is_available(),
+            drop_last=drop_last,
+        )
 
-    return ds, loader, sampler
+        return ds, loader, sampler
+
+
+
 
 
 def smooth_1d_reflect(v: torch.Tensor, kernel_size: int = 15) -> torch.Tensor:
@@ -169,7 +176,6 @@ def apply_stochastic_filler(
     base: torch.Tensor,
     wl: torch.Tensor,
     data: dict,
-    *,
     seed_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
@@ -330,7 +336,8 @@ def make_repeated_spec_loader(
     """
     Build dataset, sampler, and DataLoader for inference.
 
-    Args:
+    Args
+    ----
         base_spec_3w: base spectrum target (3,W)
         n_items: number of noise variations for the base spectrum
         max_stack_depth: maximum stack depth allowed
@@ -368,4 +375,5 @@ def make_repeated_spec_loader(
         seed=seed,
     )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    
     return ds, loader, None

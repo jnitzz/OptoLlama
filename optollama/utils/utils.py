@@ -1,37 +1,15 @@
 import json
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
+import pandas as pd
 import torch
 import torch.nn.functional as f
+
 from safetensors.torch import load_file, save_file
+from scipy.interpolate import interp1d
 from torch.nn.parallel import DistributedDataParallel
-
-
-PAD_TOKEN = "<PAD>"
-MSK_TOKEN = "<MSK>"
-EOS_TOKEN = "<EOS>"
-
-
-def save_as_json(path: str, pyobj: Any, name: Optional[str] = None) -> None:
-    """
-    Save a Python object (e.g., list of strings, dict, etc.) as a JSON file.
-
-    Args
-    ----
-    path: str
-        Destination file path.
-    pyobj: str
-        The Python object to serialize.
-    Optional: name: file name, ".json" will be added automatically
-    """
-    if name is not None:
-        path = f"{path}/{name}.json"
-    else:
-        path = path
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(pyobj, f, indent=2, ensure_ascii=False)
 
 
 def load_as_json(path: str) -> Any:
@@ -40,59 +18,58 @@ def load_as_json(path: str) -> Any:
 
     Args
     ----
-    path: str
+    path : str
         Path to the JSON file.
-    
+
     Returns
     -------
-    dict
-        The file content as Python object.
+    Any
+        The deserialized Python object (typically a ``dict`` or ``list``).
     """
     with open(rf"{path}", "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def init_tokens(path: str) -> tuple[list[str], dict[str, int], dict[int, str], str, str, str, int, int, int]:
+def save_as_json(path: str, pyobj: Any) -> None:
     """
-    Return the list of tokens, two dicts with idx/tokens, the special token strings and their respective id.
+    Save a Python object (e.g., list of strings, dict, etc.) as a JSON file.
 
     Args
     ----
-    path: str
-        Path to the tokens.json file
-    
-    Returns
-    -------
-    dict
-        Combination of mappings from tokens to ids and vice versa.
+    path : str
+        Destination file path.
+    pyobj : Any
+        The Python object to serialize.
     """
-    tokens = load_as_json(path)
-    token_to_idx = {tk: i for i, tk in enumerate(tokens)}
-    eos_idx = token_to_idx[EOS_TOKEN]
-    pad_idx = token_to_idx[PAD_TOKEN]
-    msk_idx = token_to_idx[MSK_TOKEN]
-    idx_to_token = {i: tk for i, tk in enumerate(token_to_idx)}
-
-    return tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(pyobj, f, indent=2, ensure_ascii=False)
 
 
 def unique_length_int_generator(start: int, stop: int, amount: int) -> torch.Tensor:
     """
-    Return a list of ints with start, stop as (-1 < start < stop) and amount (0 < amount <= stop).
-    
+    Generate a tensor of ``amount`` unique, evenly-spaced integer indices.
+
+    Requires ``-1 < start < stop`` and ``0 < amount <= stop``.
+
     Args
     ----
-    start: int
+    start : int
         The start index to subset from.
-    end: int
-        The maximum index for the subset.
-    amount: int
-        The number of items to take.
-    
+    stop : int
+        The exclusive upper bound for the subset.
+    amount : int
+        The number of unique indices to return.
+
     Returns
     -------
     torch.Tensor
-        The subset indices.
+        1-D integer tensor of ``amount`` unique indices in ``[start, stop)``.
+
+    Raises
+    ------
+    ValueError
+        If the constraints ``-1 < start < stop`` or ``0 < amount <= stop``
+        are not satisfied.
     """
     if not (-1 < start < stop) or not (0 < amount <= stop):
         raise ValueError(
@@ -110,7 +87,23 @@ def unique_length_int_generator(start: int, stop: int, amount: int) -> torch.Ten
     return subset_idx
 
 
-def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def _strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    Strip the ``"module."`` prefix from all keys in a state dict.
+
+    This is needed when loading weights saved from a
+    ``DistributedDataParallel``-wrapped model into a plain model.
+
+    Args
+    ----
+    state_dict : dict[str, torch.Tensor]
+        Model state dict, potentially with ``"module."``-prefixed keys.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        State dict with the ``"module."`` prefix removed from all keys.
+    """
     if not state_dict:
         return state_dict
     if any(k.startswith("module.") for k in state_dict.keys()):
@@ -120,84 +113,44 @@ def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
 
 
 @torch.no_grad()
-def save_checkpoint(
-    path: str,
-    model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    epoch: Optional[int] = None,
-    train_losses: Optional[torch.Tensor] = None,
-    train_acc: Optional[torch.Tensor] = None,
-    valid_acc: Optional[torch.Tensor] = None,
-    valid_mae: Optional[torch.Tensor] = None,
-    *,
-    scaler: Any = None,
-    scheduler: Any = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Save checkpoint (.pt and .safetensors) with DDP-safe model weights."""
-    core = model.module if isinstance(model, DistributedDataParallel) else model
-    model_state = _strip_module_prefix(core.state_dict())
-
-    state = {
-        "epoch": int(epoch) if epoch is not None else None,
-        "model_state": model_state,
-        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
-        "train_losses": train_losses,
-        "train_acc": train_acc,
-        "valid_acc": valid_acc,
-        "valid_mae": valid_mae,
-        # optional but useful:
-        "scaler_state": (scaler.state_dict() if scaler else None),
-        "scheduler_state": (scheduler.state_dict() if scheduler else None),
-        "format_version": 1,
-    }
-    if extra:
-        state["extra"] = extra
-
-    ckpt_dir = os.path.dirname(path)
-    if ckpt_dir:
-        os.makedirs(ckpt_dir, exist_ok=True)
-
-    # ---- 1) atomic write of the full PyTorch checkpoint (.pt) ----
-    with tempfile.NamedTemporaryFile(dir=ckpt_dir or None, delete=False) as tmp:
-        torch.save(state, tmp.name)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = tmp.name
-    os.replace(tmp_path, path)
-
-    # ---- 2) atomic write of weights-only .safetensors next to it ----
-    base, _ = os.path.splitext(path)
-    safe_path = base + ".safetensors"
-
-    with tempfile.NamedTemporaryFile(dir=ckpt_dir or None, delete=False) as tmp:
-        # safetensors stores a simple dict[str, Tensor]
-        save_file(model_state, tmp.name)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_safe_path = tmp.name
-    os.replace(tmp_safe_path, safe_path)
-
-
-@torch.no_grad()
 def load_checkpoint(
     path: str,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    *,
     map_location: str = "cpu",
     strict: bool = True,
     scaler: Any = None,
     scheduler: Any = None,
-) -> Tuple[Optional[int], Dict[str, Any]]:
+) -> tuple[Optional[int], dict[str, Any]]:
     """
-    Load an optollama-style checkpoint, robust to DDP/non-DDP diffs.
+    Load an optollama-style checkpoint, robust to DDP/non-DDP differences.
 
-    Supports:
-      - Full .pt checkpoints saved by `save_checkpoint`
-      - Weights-only `.safetensors` files (model weights only)
+    Supports full ``.pt`` checkpoints saved by :func:`save_checkpoint` as
+    well as weights-only ``.safetensors`` files.
 
-    Returns (start_epoch, full_state_dict_like).
+    Args
+    ----
+    path : str
+        Path to the checkpoint file (``.pt`` or ``.safetensors``).
+    model : torch.nn.Module
+        Model into which weights are loaded (DDP-wrapped or plain).
+    optimizer : torch.optim.Optimizer, optional
+        Optimizer to restore state into, if present in the checkpoint.
+    map_location : str
+        Device string passed to ``torch.load`` (default: ``"cpu"``).
+    strict : bool
+        Whether to enforce strict key matching when loading state dicts.
+    scaler : optional
+        GradScaler instance to restore state into.
+    scheduler : optional
+        LR scheduler to restore state into.
+
+    Returns
+    -------
+    tuple[int | None, dict[str, Any]]
+        A 2-tuple of ``(start_epoch, blob)`` where ``start_epoch`` is the
+        next epoch to train from (``None`` for safetensors-only checkpoints)
+        and ``blob`` is the full checkpoint dictionary.
     """
     # --- weights-only safetensors path ---
     if path.lower().endswith(".safetensors"):
@@ -206,7 +159,7 @@ def load_checkpoint(
         sd = _strip_module_prefix(sd)
         core.load_state_dict(sd, strict=strict)
         # no optimizer/scheduler/epoch information here
-        blob: Dict[str, Any] = {"model_state": sd}
+        blob = {"model_state": sd}
         print("Checkpoint from .safetensors")
         return None, blob
 
@@ -251,21 +204,128 @@ def load_checkpoint(
     return start_epoch, blob
 
 
+@torch.no_grad()
+def save_checkpoint(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    epoch: Optional[int] = None,
+    train_losses: Optional[torch.Tensor] = None,
+    train_acc: Optional[torch.Tensor] = None,
+    test_acc: Optional[torch.Tensor] = None,
+    test_mae: Optional[torch.Tensor] = None,
+    scaler: Any = None,
+    scheduler: Any = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """
+    Save a checkpoint as both a ``.pt`` file and a ``.safetensors`` file.
+
+    Handles ``DistributedDataParallel``-wrapped models by unwrapping the
+    inner module before saving. Both files are written atomically.
+
+    Args
+    ----
+    path : str
+        Destination path for the ``.pt`` checkpoint file. A sibling
+        ``.safetensors`` file is written at the same base path.
+    model : torch.nn.Module
+        The model to checkpoint (DDP-wrapped or plain).
+    optimizer : torch.optim.Optimizer, optional
+        Optimizer whose state should be saved.
+    epoch : int, optional
+        Current training epoch index.
+    train_losses : torch.Tensor, optional
+        Per-epoch training loss history.
+    train_acc : torch.Tensor, optional
+        Per-epoch training accuracy history.
+    test_acc : torch.Tensor, optional
+        Per-epoch validation accuracy history.
+    test_mae : torch.Tensor, optional
+        Per-epoch validation MAE history.
+    scaler : optional
+        GradScaler instance (AMP) whose state should be saved.
+    scheduler : optional
+        LR scheduler whose state should be saved.
+    extra : dict[str, Any], optional
+        Additional key-value pairs to store in the checkpoint.
+    """
+    core = model.module if isinstance(model, DistributedDataParallel) else model
+    model_state = _strip_module_prefix(core.state_dict())
+
+    state = {
+        "epoch": int(epoch) if epoch is not None else None,
+        "model_state": model_state,
+        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+        "train_losses": train_losses,
+        "train_acc": train_acc,
+        "test_acc": test_acc,
+        "test_mae": test_mae,
+        # optional but useful:
+        "scaler_state": (scaler.state_dict() if scaler else None),
+        "scheduler_state": (scheduler.state_dict() if scheduler else None),
+        "format_version": 1,
+    }
+    if extra:
+        state["extra"] = extra
+
+    ckpt_dir = os.path.dirname(path)
+    if ckpt_dir:
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+    # ---- 1) atomic write of the full PyTorch checkpoint (.pt) ----
+    with tempfile.NamedTemporaryFile(dir=ckpt_dir or None, delete=False) as tmp:
+        torch.save(state, tmp.name)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
+
+    # ---- 2) atomic write of weights-only .safetensors next to it ----
+    base, _ = os.path.splitext(path)
+    safe_path = base + ".safetensors"
+
+    with tempfile.NamedTemporaryFile(dir=ckpt_dir or None, delete=False) as tmp:
+        # safetensors stores a simple dict[str, Tensor]
+        save_file(model_state, tmp.name)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_safe_path = tmp.name
+    os.replace(tmp_safe_path, safe_path)
+
+
 def top_k_top_p_filtering(
     logits: torch.Tensor,
-    *,
     top_k: int = 0,
     top_p: float = 0.0,
     filter_value: float = -float("inf"),
 ) -> torch.Tensor:
-    """Apply combined top-k and top-p (nucleus) filtering to logits.
+    """
+    Apply combined top-k and top-p (nucleus) filtering to logits.
 
-    Expects logits of shape [..., V] and filters along the last dimension.
+    Filters along the last dimension of ``logits`` (shape ``[..., V]``).
+
+    Args
+    ----
+    logits : torch.Tensor
+        Raw logits of shape ``[..., V]``.
+    top_k : int
+        If > 0, keep only the top-k highest-probability tokens.
+    top_p : float
+        If > 0, keep the smallest set of tokens whose cumulative probability
+        exceeds ``top_p`` (nucleus sampling).
+    filter_value : float
+        Value assigned to filtered-out positions (default: ``-inf``).
+
+    Returns
+    -------
+    torch.Tensor
+        Filtered logits of the same shape as the input.
 
     Notes
     -----
-      - Uses a large negative number for NaNs/Infs to keep kernels stable.
-      - If both `top_k` and `top_p` are disabled, returns logits unchanged.
+    Uses a large negative number for NaNs/Infs to keep kernels stable.
+    If both ``top_k`` and ``top_p`` are disabled, returns logits unchanged.
     """
     logits = torch.nan_to_num(logits, neginf=-1e9, posinf=1e9)
 
@@ -292,7 +352,22 @@ def top_k_top_p_filtering(
 
 
 def boxcar_kernel(win: int, device: str) -> torch.Tensor:
-    """Boxcar kernal."""
+    """
+    Create a normalized boxcar (uniform) smoothing kernel.
+
+    Args
+    ----
+    win : int
+        Kernel window size. Rounded up to the nearest odd integer.
+    device : str
+        Device on which to allocate the kernel tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        1-D float32 tensor of length ``win`` with all values equal to
+        ``1 / win``.
+    """
     win = max(1, int(win))
     if win % 2 == 0:
         win += 1
@@ -301,7 +376,24 @@ def boxcar_kernel(win: int, device: str) -> torch.Tensor:
 
 
 def gauss_kernel(win: int, sigma: float, device: str) -> torch.Tensor:
-    """Gauss kernal."""
+    """
+    Create a normalized Gaussian smoothing kernel.
+
+    Args
+    ----
+    win : int
+        Kernel window size. Rounded up to the nearest odd integer.
+    sigma : float
+        Standard deviation of the Gaussian.
+    device : str
+        Device on which to allocate the kernel tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        1-D float32 tensor of length ``win`` containing the normalized
+        Gaussian weights.
+    """
     win = max(1, int(win))
     if win % 2 == 0:
         win += 1
@@ -313,7 +405,25 @@ def gauss_kernel(win: int, sigma: float, device: str) -> torch.Tensor:
 
 
 def smooth_1d(x_3w: torch.Tensor, method: str, win: int, sigma: float) -> torch.Tensor:
-    """Depthwise 1D conv along last dim x_3w: [...,3,W]."""
+    """
+    Apply depthwise 1-D smoothing along the wavelength axis.
+
+    Args
+    ----
+    x_3w : torch.Tensor
+        Input tensor of shape ``[3, W]`` or ``[B, 3, W]``.
+    method : str
+        Smoothing method: ``"gaussian"`` or ``"boxcar"``.
+    win : int
+        Kernel window size (rounded up to nearest odd integer).
+    sigma : float
+        Standard deviation used when ``method="gaussian"``.
+
+    Returns
+    -------
+    torch.Tensor
+        Smoothed tensor of the same shape as ``x_3w``.
+    """
     orig_dim = x_3w.dim()
     if orig_dim == 2:
         x_3w = x_3w.unsqueeze(0)  # [1,3,W]
@@ -330,8 +440,22 @@ def smooth_1d(x_3w: torch.Tensor, method: str, win: int, sigma: float) -> torch.
     return x.squeeze(0) if orig_dim == 2 else x
 
 
-def parse_order(order_str: str) -> Tuple[int, ...]:
-    """Set order to fill the missing target values (e.g. R>A>T)."""
+def parse_order(order_str: str) -> tuple[int, ...]:
+    """
+    Parse a channel priority string into a tuple of channel indices.
+
+    Args
+    ----
+    order_str : str
+        Priority string such as ``"R>A>T"`` specifying the order in which
+        channels are used to fill or crop residual energy.
+
+    Returns
+    -------
+    tuple[int, ...]
+        A 3-tuple of channel indices (0=R, 1=A, 2=T) in the specified
+        priority order.
+    """
     order_str = (order_str or "R>A>T").upper()
     mapping = {"R": 0, "A": 1, "T": 2}
     seq = [mapping[c.strip()] for c in order_str.split(">") if c.strip() in mapping]
@@ -341,7 +465,27 @@ def parse_order(order_str: str) -> Tuple[int, ...]:
 
 
 def wl_mask(wavelengths: Any, wl_min: float, wl_max: float, device: str) -> Optional[torch.Tensor]:
-    """Mask wavelength regions with True withing the boundary, else False."""
+    """
+    Build a boolean mask selecting wavelengths within a given range.
+
+    Args
+    ----
+    wavelengths : array-like or None
+        Wavelength values (nm). If ``None``, returns ``None``.
+    wl_min : float
+        Lower bound of the wavelength range (inclusive).
+    wl_max : float
+        Upper bound of the wavelength range (inclusive).
+    device : str
+        Device on which to allocate the mask tensor.
+
+    Returns
+    -------
+    torch.Tensor or None
+        Boolean tensor of shape ``[W]`` where ``True`` indicates wavelengths
+        within ``[wl_min, wl_max]``, or ``None`` if ``wavelengths`` is
+        ``None``.
+    """
     if wavelengths is None:
         return None
     wl = torch.as_tensor(wavelengths, dtype=torch.float32, device=device)
@@ -350,9 +494,27 @@ def wl_mask(wavelengths: Any, wl_min: float, wl_max: float, device: str) -> Opti
 
 def redistribute_mismatch(tar_spec: torch.Tensor, order: str, target_sum: float = 1.0) -> torch.Tensor:
     """
-    tar_spec: [...,3,W] with values in [0,1].
+    Enforce a per-wavelength channel sum by redistributing residual energy.
 
-    Enforce per-W sum≈target_sum by distributing residual in the given priority order.
+    Given a spectrum tensor with values in ``[0, 1]``, adjusts channel values
+    so that ``R + A + T ≈ target_sum`` at every wavelength, distributing any
+    deficit or excess according to the channel priority order.
+
+    Args
+    ----
+    tar_spec : torch.Tensor
+        Spectrum tensor of shape ``[3, W]`` or ``[B, 3, W]`` with values in
+        ``[0, 1]``.
+    order : str
+        Channel priority string (e.g. ``"R>A>T"``) controlling which channel
+        absorbs residual energy first.
+    target_sum : float
+        Desired per-wavelength sum of all channels (default: ``1.0``).
+
+    Returns
+    -------
+    torch.Tensor
+        Adjusted spectrum tensor of the same shape, clamped to ``[0, 1]``.
     """
     orig_dim = tar_spec.dim()
     if orig_dim == 2:
@@ -381,8 +543,32 @@ def redistribute_mismatch(tar_spec: torch.Tensor, order: str, target_sum: float 
     return tar_spec.squeeze(0) if orig_dim == 2 else tar_spec
 
 
-def apply_noise(tar_spec: torch.Tensor, noise_cfg: Optional[Dict[str, Any]], wavelengths: Any) -> torch.Tensor:
-    """Apply noise to the target spectrum following the noise config."""
+def apply_noise(tar_spec: torch.Tensor, noise_cfg: Optional[dict[str, Any]], wavelengths: Any) -> torch.Tensor:
+    """
+    Apply additive Gaussian noise to a spectrum tensor.
+
+    Args
+    ----
+    tar_spec : torch.Tensor
+        Spectrum tensor of shape ``[3, W]`` or ``[B, 3, W]``.
+    noise_cfg : dict[str, Any] or None
+        Noise configuration dictionary. Expected keys:
+
+        - ``"enabled"`` (bool): whether to apply noise.
+        - ``"sigma_abs"`` (float): absolute noise standard deviation.
+        - ``"sigma_rel"`` (float): relative noise standard deviation.
+        - ``"per_channel"`` (list[float]): per-channel scale factors.
+        - ``"wl_min"`` / ``"wl_max"`` (float, optional): wavelength range
+          to restrict noise to.
+        - ``"clip_0_1"`` (bool): whether to clamp output to ``[0, 1]``.
+    wavelengths : array-like or None
+        Wavelength values used to build the optional wavelength mask.
+
+    Returns
+    -------
+    torch.Tensor
+        Noised spectrum tensor of the same shape as ``tar_spec``.
+    """
     if not noise_cfg or not noise_cfg.get("enabled", False):
         return tar_spec
     orig_dim = tar_spec.dim()
@@ -417,8 +603,27 @@ def apply_noise(tar_spec: torch.Tensor, noise_cfg: Optional[Dict[str, Any]], wav
     return tar_spec.squeeze(0) if orig_dim == 2 else tar_spec
 
 
-def apply_smoothing(tar_spec: torch.Tensor, smooth_cfg: Optional[Dict[str, Any]]) -> torch.Tensor:
-    """Smooth the target spectrum following the window and sigma in the dict."""
+def apply_smoothing(tar_spec: torch.Tensor, smooth_cfg: Optional[dict[str, Any]]) -> torch.Tensor:
+    """
+    Apply 1-D smoothing to a spectrum tensor.
+
+    Args
+    ----
+    tar_spec : torch.Tensor
+        Spectrum tensor of shape ``[3, W]`` or ``[B, 3, W]``.
+    smooth_cfg : dict[str, Any] or None
+        Smoothing configuration dictionary. Expected keys:
+
+        - ``"enabled"`` (bool): whether to apply smoothing.
+        - ``"method"`` (str): ``"gaussian"`` or ``"boxcar"``.
+        - ``"win"`` (int): kernel window size.
+        - ``"sigma"`` (float): Gaussian standard deviation.
+
+    Returns
+    -------
+    torch.Tensor
+        Smoothed spectrum tensor of the same shape as ``tar_spec``.
+    """
     if not smooth_cfg or not smooth_cfg.get("enabled", False):
         return tar_spec
     method = smooth_cfg.get("method", "gaussian")
@@ -427,8 +632,28 @@ def apply_smoothing(tar_spec: torch.Tensor, smooth_cfg: Optional[Dict[str, Any]]
     return smooth_1d(tar_spec, method, win, sigma)
 
 
-def ensure_3w(tar_spec: torch.Tensor) -> Tuple[torch.Tensor, bool]:
-    """Accept [(B,)3,W] or [(B,)W,3]; return (tar_spec_[...,3,W], was_transposed)."""
+def ensure_3w(tar_spec: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """
+    Ensure a spectrum tensor has shape ``[..., 3, W]``, transposing if needed.
+
+    Args
+    ----
+    tar_spec : torch.Tensor
+        Spectrum tensor of shape ``[3, W]``, ``[W, 3]``, ``[B, 3, W]``, or
+        ``[B, W, 3]``.
+
+    Returns
+    -------
+    tuple[torch.Tensor, bool]
+        A 2-tuple of ``(tensor, was_transposed)`` where ``tensor`` has shape
+        ``[..., 3, W]`` and ``was_transposed`` is ``True`` if the input was
+        transposed.
+
+    Raises
+    ------
+    ValueError
+        If the input shape is not one of the supported formats.
+    """
     if tar_spec.dim() == 2:
         if tar_spec.size(0) == 513:
             tar_spec = tar_spec.reshape(3, 171)
@@ -449,15 +674,32 @@ def ensure_3w(tar_spec: torch.Tensor) -> Tuple[torch.Tensor, bool]:
 
 def normalize_rat_fill_crop(r: torch.Tensor, a: torch.Tensor, t: torch.Tensor, target: float = 1.0) -> torch.Tensor:
     """
-    Non-negative RAT with T as the filler and primary crop source.
+    Normalize R, A, T channels so their per-wavelength sum equals ``target``.
+
+    Uses T as the primary filler and crop source, then A, then R.
 
     Steps per wavelength:
-      1) Clamp R,A,T >= 0
-      2) If sum < target: add (target - sum) to T
-      3) If sum > target: reduce T first; if still > target, reduce A; then R
-         (never below 0). This guarantees sum == target afterward.
 
-    Returns R, A, T as float arrays.
+    1. Clamp R, A, T to be non-negative.
+    2. If ``R + A + T < target``: add the deficit to T.
+    3. If ``R + A + T > target``: reduce T first; if still over, reduce A;
+       then R. Values are never reduced below 0.
+
+    Args
+    ----
+    r : torch.Tensor
+        Reflectance channel, shape ``[W]``.
+    a : torch.Tensor
+        Absorptance channel, shape ``[W]``.
+    t : torch.Tensor
+        Transmittance channel, shape ``[W]``.
+    target : float
+        Desired per-wavelength sum (default: ``1.0``).
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Normalized ``(r, a, t)`` float32 tensors, each of shape ``[W]``.
     """
     r = torch.clamp(torch.as_tensor(r), min=0.0)
     a = torch.clamp(torch.as_tensor(a), min=0.0)
@@ -496,3 +738,62 @@ def normalize_rat_fill_crop(r: torch.Tensor, a: torch.Tensor, t: torch.Tensor, t
             over[still] -= cut
 
     return r.to(torch.float32), a.to(torch.float32), t.to(torch.float32)
+
+
+def load_materials(path_materials: str, wavelengths: torch.Tensor) -> dict:
+    """
+    Load complex refractive indices for all materials in a folder.
+
+    Reads CSV files and interpolates the nk data onto the given wavelength
+    grid.
+
+    Args
+    ----
+    path_materials : str
+        Directory containing CSV files with columns ``"nm"``, ``"n"``,
+        ``"k"``.
+    wavelengths : torch.Tensor
+        1-D tensor of wavelengths (nm) at which nk is required, shape
+        ``[W]``.
+
+    Returns
+    -------
+    dict
+        Mapping from material name (file stem) to complex nk values
+        interpolated onto ``wavelengths``. Values are array-like of shape
+        ``[W]``.
+    """
+    material_files = [item[:-4] for item in sorted(os.listdir(path_materials)) if item.lower().endswith(".csv")]
+
+    nk_dict = {}
+
+    for mat in material_files:
+        try:
+            data_temp = pd.read_csv(os.path.join(path_materials, f"{mat}.csv"))
+            wavelength_nm = data_temp["nm"].to_numpy()
+            n_vals = data_temp["n"].to_numpy()
+            k_vals = data_temp["k"].to_numpy()
+        except Exception:
+            print("Error: NK file does not have the right format: .csv with columns 'nm', 'n', 'k', comma (,) separated.")
+            continue
+
+        n_fn = interp1d(
+            wavelength_nm,
+            n_vals,
+            axis=0,
+            bounds_error=False,
+            kind="linear",
+            fill_value=(n_vals[0], n_vals[-1]),
+        )
+        k_fn = interp1d(
+            wavelength_nm,
+            k_vals,
+            axis=0,
+            bounds_error=False,
+            kind="linear",
+            fill_value=(k_vals[0], k_vals[-1]),
+        )
+
+        nk_dict[mat] = n_fn(wavelengths.cpu().numpy()) + 1j * k_fn(wavelengths.cpu().numpy())
+
+    return nk_dict

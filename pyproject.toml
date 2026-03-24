@@ -43,6 +43,7 @@ dependencies = [
   "tmm_fast",
   "tqdm",
   "omegaconf",
+  "huggingface_hub"
 ]
 
 [project.optional-dependencies]

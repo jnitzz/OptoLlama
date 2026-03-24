@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import torch
 
 
@@ -9,16 +7,17 @@ def token_accuracy(
     eos: int,
     pad: int,
     msk: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute weighted global token accuracy and per-sample accuracy.
 
-    Parameters
-    ----------
+    Args
+    ----
     stacks : torch.Tensor
-        Target token IDs of shape [B, L].
+        Target token IDs of shape ``[B, L]``.
     preds : torch.Tensor
-        Either predicted logits of shape [B, L, V] or predicted token IDs [B, L].
+        Either predicted logits of shape ``[B, L, V]`` or predicted token
+        IDs of shape ``[B, L]``.
     eos : int
         Token ID for EOS.
     pad : int
@@ -28,12 +27,13 @@ def token_accuracy(
 
     Returns
     -------
-    global_acc : torch.Tensor
-        Scalar (0-D) float tensor on CPU with weighted global accuracy.
-    per_sample : torch.Tensor
-        Float tensor of shape [B] on CPU with accuracy per batch sample.
+    tuple[torch.Tensor, torch.Tensor]
+        A 2-tuple of:
+
+        - Scalar (0-D) float tensor on CPU with weighted global accuracy.
+        - Float tensor of shape ``[B]`` on CPU with accuracy per batch sample.
     """
-    # Convert logits → token IDs
+    # Convert logits to token IDs
     if preds.dim() == 3:
         preds = preds.argmax(dim=-1)
 
@@ -69,17 +69,17 @@ def masked_mae(
     """
     Compute Mean Absolute Error over only valid (finite) predictions.
 
-    Parameters
-    ----------
+    Args
+    ----
     x : torch.Tensor
-        Ground-truth spectra, shape [B, C, W].
+        Ground-truth spectra, shape ``[B, C, W]``.
     y : torch.Tensor
         Predicted spectra, same shape. Non-finite entries are ignored.
 
     Returns
     -------
-    mae : torch.Tensor
-        Tensor of shape [B] containing per-sample masked MAE.
+    torch.Tensor
+        Tensor of shape ``[B]`` containing per-sample masked MAE.
     """
     # Valid mask: all channels finite
     mask = torch.isfinite(y).all(dim=-1, keepdim=True)  # [B, C, 1]
@@ -100,21 +100,22 @@ def masked_mae_roi(
     wl_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Compute Mean Absolute Error over finite predictions and wavelength range.
+    Compute Mean Absolute Error over finite predictions and a wavelength ROI.
 
-    Parameters
-    ----------
+    Args
+    ----
     x : torch.Tensor
-        Ground-truth spectra, shape [B, C, W].
+        Ground-truth spectra, shape ``[B, C, W]``.
     y : torch.Tensor
         Predicted spectra, same shape. Non-finite entries are ignored.
-    wl_mask : torch.Tensor
-        Crop to Region of Interest (ROI)
+    wl_mask : torch.Tensor, optional
+        Boolean mask of shape ``[W]`` selecting the Region of Interest (ROI).
+        ``True`` entries are included in the MAE computation.
 
     Returns
     -------
-    mae : torch.Tensor
-        Tensor of shape [B] containing per-sample masked MAE.
+    torch.Tensor
+        Tensor of shape ``[B]`` containing per-sample masked MAE.
     """
     # x,y: [B,3,W]
     # wl_mask: [W] bool, True = included in MAE

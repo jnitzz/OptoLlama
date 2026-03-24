@@ -6,9 +6,8 @@ from .optollama import OptoLlama
 
 
 def build_model(
-    *,
     model_type: str,
-    sample_spectrum: torch.Tensor,  # provide a [1,3,W] or [3,W] example
+    sample_spectrum: torch.Tensor,
     vocab_size: int,
     max_stack_depth: int,
     d_model: int,
@@ -25,10 +24,59 @@ def build_model(
     top_k: int = 0,
     top_p: float = 0.0,
 ) -> nn.Module:
-    """Build and return the configured sequence model (OptoGPT or OptoLlama)."""
-    mt = (model_type or "optollama").lower()
+    """
+    Build and return the configured sequence model (OptoGPT or OptoLlama).
 
-    if mt == "optogpt":
+    Args
+    ----
+    model_type : str
+        Which model architecture to build: ``"optogpt"`` or ``"optollama"``.
+    sample_spectrum : torch.Tensor
+        A representative spectrum of shape ``[1, 3, W]`` or ``[3, W]`` used
+        to infer the spectral input dimension.
+    vocab_size : int
+        Number of discrete material/layer tokens.
+    max_stack_depth : int
+        Maximum token sequence length.
+    d_model : int
+        Transformer hidden dimension.
+    n_blocks : int
+        Number of transformer blocks / decoder layers.
+    n_heads : int
+        Number of attention heads.
+    timesteps : int
+        Number of diffusion sampling steps (OptoLlama only).
+    dropout : float
+        Dropout probability.
+    idx_to_token : dict
+        Mapping from token index to token string.
+    mask_idx : int
+        Index of the ``<MASK>`` token.
+    pad_idx : int
+        Index of the ``<PAD>`` token.
+    eos_idx : int
+        Index of the ``<EOS>`` token.
+    device : str
+        Device string (e.g. ``"cuda"`` or ``"cpu"``).
+    temperature : float
+        Sampling temperature (``0.0`` = greedy; default: ``0.0``).
+    top_k : int
+        Top-k sampling cutoff (``0`` = disabled; default: ``0``).
+    top_p : float
+        Top-p (nucleus) sampling cutoff (``0.0`` = disabled; default:
+        ``0.0``).
+
+    Returns
+    -------
+    torch.nn.Module
+        Initialized model moved to ``device`` and cast to float32.
+
+    Raises
+    ------
+    ValueError
+        If ``model_type`` is not ``"optogpt"`` or ``"optollama"``.
+    """
+    if model_type == "optogpt":
         return (
             OriginalDecoderWrapper(
                 vocab_size=vocab_size,
@@ -49,7 +97,7 @@ def build_model(
             .to(torch.float32)
             .to(device)
         )
-    elif mt == "optollama":
+    elif model_type == "optollama":
         return (
             OptoLlama(
                 spectra_dim=max(sample_spectrum.size()),
@@ -72,4 +120,4 @@ def build_model(
             .to(device)
         )
     else:
-        raise ValueError(f"Unsupported model key: {mt}")
+        raise ValueError(f"Unsupported model key: {model_type}")

@@ -26,18 +26,21 @@ def train(cfg: dict) -> None:
     """
     # --- distributed computation setup ---
     device, local_rank, rank, world_size = optollama.utils.setup_run(cfg, make_dirs=True)
+
+    # --- configuration checks
     ddp = optollama.utils.is_ddp()
+    tmm = cfg["VALID_SIM"] == "TMM_FAST"
     
     # --- data loading and preprocessing ---
-    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
+    _, _, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
 
-    train_ds, train_loader, train_sampler = optollama.data.SpectraDataset.make_loader(
+    train_ds, train_loader, _ = optollama.data.SpectraDataset.make_loader(
         cfg, 
         split="train", 
         subset_n=cfg["NUM_SAMPLES_TRAIN"], 
         ddp=ddp
     )
-    test_ds, test_loader, test_sampler = optollama.data.SpectraDataset.make_loader(
+    _, test_loader, _ = optollama.data.SpectraDataset.make_loader(
         cfg, 
         split="test", 
         subset_n=cfg["NUM_SAMPLES_TEST"], 
@@ -45,11 +48,11 @@ def train(cfg: dict) -> None:
     )
 
     # --- TMM simulation ---
-    tmm_ctx = optollama.evaluation.simulation.build_tmm_context(
-        cfg=cfg, 
-        idx_to_token=idx_to_token, 
+    tmm_ctx = optollama.evaluation.simulation.TMMContext.make(
+        cfg=cfg,
+        idx_to_token=idx_to_token,
         device=device
-    ) if cfg["VALID_SIM"] == "TMM_FAST" else None
+    ) if tmm else None
 
     # --- model ---
     vocab_size = len(idx_to_token)
@@ -92,20 +95,30 @@ def train(cfg: dict) -> None:
     test_acc = torch.zeros(cfg["EPOCHS"])
     test_mae = torch.full((cfg["EPOCHS"],), torch.inf)
 
-    checkpoint = cfg["CHECKPOINT_PATH"]
+    checkpoint = cfg["LAST_CHECKPOINT_PATH"]
 
     best_test_acc = 0.0
     best_test_mae = torch.inf
     start_epoch = 0
 
     if checkpoint and os.path.exists(checkpoint):
-        start_epoch, blob = load_checkpoint(checkpoint, model, optimizer=optimizer, map_location="cpu", strict=True)
+        print(f"Resuming from checkpoint {checkpoint}")
+        start_epoch, blob = optollama.utils.load_checkpoint(
+            checkpoint, 
+            model, 
+            optimizer=optimizer, 
+            map_location="cpu", 
+            strict=True
+        )
         
         # recover metric buffers if present
         train_losses = blob.get("train_losses", train_losses)
         train_acc = blob.get("train_acc", train_acc)
         test_acc = blob.get("test_acc", test_acc)
         test_mae = blob.get("test_mae", test_mae)
+
+    if rank == 0:
+        os.makedirs(cfg["OUTPUT_PATH"], exist_ok=True)
 
     # ------------------------------ epochs ------------------------------
     epochs = cfg["EPOCHS"]
@@ -118,31 +131,39 @@ def train(cfg: dict) -> None:
         # ------------------------------ train ------------------------------
         model.train()
         if rank == 0:
-            pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{epochs} train", leave=True)
+            pbar = tqdm.tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}/{epochs} train", leave=True)
 
         for i, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
 
             spectra, stacks = batch[0].to(device), batch[1].to(device)
-            logits = model(spectra, stacks)  # teacher forcing path → [B,S,V]
+            logits = model(spectra, stacks)
 
             log_probs = torch.nn.functional.log_softmax(torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0), dim=-1)
-            loss = torch.nn.NLLLoss(ignore_index=pad_idx)(log_probs.view(-1, vocab_size), stacks.view(-1))
+            loss = torch.nn.NLLLoss(ignore_index=pad_idx)(
+                log_probs.view(-1, vocab_size), 
+                stacks.view(-1)
+            )
 
             loss.backward()
             optimizer.step()
 
             # --- logging (DDP-avg for losses) ---
             with torch.no_grad():
-                log_ce = loss.detach().clone()
+                total_loss = loss.detach().clone()
                 if ddp:
-                    torch.distributed.all_reduce(log_ce)
-                    log_ce /= world_size
+                    torch.distributed.all_reduce(total_loss)
+                    total_loss /= world_size
 
-                train_losses[epoch] += log_ce.item()
+                train_losses[epoch] += total_loss.item()
 
-                acc, _ = optollama.evaluation.metrics.token_accuracy(stacks, logits.argmax(dim=-1), eos_idx, pad_idx, msk_idx)
-                # train_acc[epoch] += acc
+                acc, _ = optollama.evaluation.metrics.token_accuracy(
+                    stacks, 
+                    logits.argmax(dim=-1), 
+                    eos_idx, 
+                    pad_idx, 
+                    msk_idx
+                )
 
             if rank == 0:
                 pbar.set_postfix(
@@ -156,7 +177,7 @@ def train(cfg: dict) -> None:
 
         # ------------------------------ validation ------------------------------
         model.eval()
-        test_output = optollama.evaluation.evaluate_model(
+        test_output = optollama.evaluation.model_prediction(
             model,
             test_loader,
             device=device,
@@ -174,66 +195,59 @@ def train(cfg: dict) -> None:
         )
 
         # update trackers
-        test_acc[epoch] = test_output["mean_acc"].item()
-        if cfg["VALID_SIM"] == "TMM_FAST":
-            test_mae[epoch] = test_output["mean_mae"].item()
+        test_acc[epoch] = test_output["mean_acc"]
+        if tmm:
+            test_mae[epoch] = test_output["mean_mae"]
 
         # save per-example results (rank 0 only)
-        if rank == 0 and "results" in val_out:
-            os.makedirs(cfg.PATH_SAVED, exist_ok=True)
-            out_name = f"results_{cfg.RUN_NAME}"
-            save_as_json(cfg.PATH_SAVED, val_out["results"], out_name)
-            print(f"[rank 0] Saved {len(val_out['results'])} samples → …/{out_name}.json")
-            if cfg.VALIDSIM == "TMM_FAST":
-                print(
-                    f" min valid MAE: {float(torch.min(test_mae).item()) if torch.isfinite(test_mae).any() else test_mae[epoch]:.4f}"
-                )
-                print(f"last valid MAE: {test_mae[epoch]:.4f}")
+        if rank == 0:
+            samples = len(test_output["results"])
+            optollama.utils.save_as_json(cfg["SAMPLES_PATH"], test_output["results"])
+            print(f"[rank 0] Saved {samples} samples → {cfg['SAMPLES_PATH']}")
+
+            if tmm:
+                print(f"\tmin valid MAE: {torch.min(test_mae).item():.6f}")
+                print(f"\tlast valid MAE: {test_mae[epoch]:.6f}")
             else:
-                print(f"Validation accuracy: {test_acc[epoch]:.2f}%")
-                if rank == 0:
-                    print(f"No validation at epoch {epoch}")
-                    continue
+                print(f"\tvalidation accuracy: {test_acc[epoch]:.2f}%")
         
         # ------------------------------ checkpointing ------------------------------
-        if not cfg.NOTRAIN and rank == 0:
-            if cfg.VALIDSIM != "TMM_FAST":
-                # accuracy-based checkpointing
-                new_acc = float(test_acc[epoch].item())
-                if new_acc > (best_test_acc + 1e-7):
-                    print(f"Checkpoint saved (ACC): new={new_acc:.6f} > best={best_test_acc:.6f} [epoch {epoch}]")
-                    best_test_acc = new_acc
-                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
-                else:
-                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
-            else:
+        if rank == 0:
+            checkpoint_paths = [cfg["LAST_CHECKPOINT_PATH"],]
+
+            if tmm:
                 # MAE-based checkpointing
-                new_mae = float(test_mae[epoch].item())
-                if new_mae < (best_test_mae - 1e-7):
-                    print(f"Checkpoint saved (MAE): new={new_mae:.6f} < best={best_test_mae:.6f} [epoch {epoch}]")
+                new_mae = test_mae[epoch].item()
+                if new_mae < best_test_mae:
+                    print(f"Saving best checkpoint (MAE): new={new_mae:.6f} < best={best_test_mae:.6f} [epoch {epoch + 1}]")
                     best_test_mae = new_mae
-                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint_best.pt"
-                else:
-                    checkpoint = f"{cfg.PATH_SAVED}/ol3l-checkpoint.pt"
+                    checkpoint_paths.append(cfg["BEST_CHECKPOINT_PATH"])
+            else:
+                # accuracy-based checkpointing
+                new_acc = test_acc[epoch].item()
+                if new_acc > best_test_acc:
+                    print(f"Saving best checkpoint (ACC): new={new_acc:.2f} > best={best_test_acc:.2f} [epoch {epoch + 1}]")
+                    best_test_acc = new_acc
+                    checkpoint_paths.append(cfg["BEST_CHECKPOINT_PATH"])
         
-            os.makedirs(cfg["OUTPUT_PATH"], exist_ok=True)
-            save_checkpoint(
-                checkpoint,
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                train_losses=train_losses,
-                train_acc=train_acc,
-                test_acc=test_acc,
-                test_mae=test_mae,
-                extra={
-                    "sampling": {
-                        "temperature": cfg["TEMPERATURE"],
-                        "top_k": cfg["TOP_K"],
-                        "top_p": cfg["TOP_P"],
-                    }
-                },
-            )
+            for path in checkpoint_paths:
+                optollama.utils.save_checkpoint(
+                    path,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    train_losses=train_losses,
+                    train_acc=train_acc,
+                    test_acc=test_acc,
+                    test_mae=test_mae,
+                    extra={
+                        "sampling": {
+                            "temperature": cfg["TEMPERATURE"],
+                            "top_k": cfg["TOP_K"],
+                            "top_p": cfg["TOP_P"],
+                        }
+                    },
+                )
 
 
 if __name__ == "__main__":

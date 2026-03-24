@@ -1,65 +1,11 @@
-import os
+from typing import Any, NamedTuple, Self, Union
 
-from typing import Any, NamedTuple, Union
-
-import pandas as pd
 import torch
 import torch.nn as nn
 
-from scipy.interpolate import interp1d
 from tmm_fast import coh_tmm
 
-
-def load_materials(path_materials: str, wavelengths: torch.Tensor) -> dict:
-    """
-    Load complex refractive indices for all materials in a folder and interpolate them onto the given wavelength grid.
-
-    Args
-    ----
-    path_materials: str
-        Directory containing CSV files with columns "nm", "n", "k".
-    wavelengths: torch.Tensor
-        1D tensor of wavelengths (nm) at which nk is required, shape [W].
-
-    Returns
-    -------
-    Mapping from material name (file stem) to complex nk values on the given grid. 
-    Values are array-like of shape [W] (e.g. numpy array).
-    """
-    material_files = [item[:-4] for item in sorted(os.listdir(path_materials)) if item.lower().endswith(".csv") ]
-
-    nk_dict = {}
-    
-    for mat in material_files:
-        try:
-            data_temp = pd.read_csv(os.path.join(path_materials, f"{mat}.csv"))
-            wavelength_nm = data_temp["nm"].to_numpy()
-            n_vals = data_temp["n"].to_numpy()
-            k_vals = data_temp["k"].to_numpy()
-        except Exception:
-            print("Error: NK file does not have the right format: .csv with columns 'nm', 'n', 'k', comma (,) separated.")
-            continue
-
-        n_fn = interp1d(
-            wavelength_nm,
-            n_vals,
-            axis=0,
-            bounds_error=False,
-            kind="linear",
-            fill_value=(n_vals[0], n_vals[-1]),
-        )
-        k_fn = interp1d(
-            wavelength_nm,
-            k_vals,
-            axis=0,
-            bounds_error=False,
-            kind="linear",
-            fill_value=(k_vals[0], k_vals[-1]),
-        )
-
-        nk_dict[mat] = n_fn(wavelengths.cpu().numpy()) + 1j * k_fn(wavelengths.cpu().numpy())
-
-    return nk_dict
+import optollama.utils
 
 
 class TMMSpectrum(nn.Module):
@@ -77,7 +23,6 @@ class TMMSpectrum(nn.Module):
         self,
         nk_dict: dict[str, Any],
         idx_to_token: dict[int, str],
-        *,
         substrate: str = "EVA",
         substrate_thick: float = 5e5,
         device: Union[str, torch.device] = "cuda",
@@ -85,28 +30,30 @@ class TMMSpectrum(nn.Module):
         """
         Initialize TMMSpectrum.
 
-        Parameters
-        ----------
-        nk_dict : Dict[str, Any]
-            Mapping from material name to complex nk values (array-like of shape [W]).
-        idx_to_token : Dict[int, str]
-            Vocabulary mapping from token index to token string (e.g. "TiO2_60").
+        Args
+        ----
+        nk_dict : dict[str, Any]
+            Mapping from material name to complex nk values (array-like of
+            shape ``[W]``).
+        idx_to_token : dict[int, str]
+            Vocabulary mapping from token index to token string (e.g.
+            ``"TiO2_60"``).
         substrate : str, optional
-            Name of the substrate material, by default "EVA".
+            Name of the substrate material (default: ``"EVA"``).
         substrate_thick : float, optional
-            Substrate thickness in nm (currently stored but not used explicitly
-            in the forward pass), by default 5e5.
+            Substrate thickness in nm (stored but not used explicitly in the
+            forward pass; default: ``5e5``).
         device : str or torch.device, optional
-            Device where internal buffers are stored, by default "cuda".
+            Device where internal buffers are stored (default: ``"cuda"``).
         """
         super().__init__()
-        self.substrate_thick = float(substrate_thick)
+        self.substrate_thick = substrate_thick
 
         # ---- 1. thickness vector & material lookup ----
         v_length = len(idx_to_token)  # vocabulary size
         thickness = torch.zeros(v_length, dtype=torch.complex128, device=device)
 
-        mat_names: list[str] = []
+        mat_names = []
         for i, tok in idx_to_token.items():
             if "_" in tok:  # e.g. "TiO2_60"
                 mat, th = tok.split("_", 1)
@@ -118,7 +65,7 @@ class TMMSpectrum(nn.Module):
 
         # keep material order stable and ensure substrate is included
         uniq_mats = list(dict.fromkeys(mat_names + [substrate]))
-        self.mat_to_idx: Dict[str, int] = {m: j for j, m in enumerate(uniq_mats)}
+        self.mat_to_idx: dict[str, int] = {m: j for j, m in enumerate(uniq_mats)}
 
         nk_table = torch.stack(
             [torch.as_tensor(nk_dict[m], dtype=torch.complex128, device=device) for m in uniq_mats],
@@ -141,7 +88,6 @@ class TMMSpectrum(nn.Module):
         stacks: torch.Tensor,
         wl_tensor: torch.Tensor,
         theta: torch.Tensor,
-        *,
         eos: int,
         pad: int,
         msk: int,
@@ -219,7 +165,7 @@ class TMMSpectrum(nn.Module):
             t_base = self.thickness[token_ids] * active.to(self.thickness.dtype)  # [B, S]
 
         # ---- 2. Prepend/append semi-infinite media (air front & back) ----
-        b, s, w = n_base.shape
+        b, _, w = n_base.shape
         one = torch.ones(w, dtype=n_base.dtype, device=n_base.device)  # complex
         big = float("inf")
 
@@ -265,39 +211,71 @@ def build_tmm(
     """
     Build a TMMSpectrum instance plus wavelength and angle tensors.
 
-    Parameters
-    ----------
+    Args
+    ----
     incidence_angle : float
         Incidence angle in degrees.
     device : str or torch.device
         Device on which to allocate model and buffers.
     wavelengths : torch.Tensor
-        1D tensor of wavelengths (nm), real-valued, shape [W].
+        1-D tensor of wavelengths (nm), real-valued, shape ``[W]``.
     path_materials : str
         Path to directory with nk CSV files.
-    idx_to_token : Dict[int, str]
+    idx_to_token : dict[int, str]
         Vocabulary mapping from token index to token string.
 
     Returns
     -------
-    tmm : TMMSpectrum
-        Initialized TMM model.
-    wl_tensor : torch.Tensor
-        Wavelength tensor on the given device, dtype complex128, shape [W].
-    theta : torch.Tensor
-        Incidence angle in radians, dtype complex128, shape [1].
+    tuple[TMMSpectrum, torch.Tensor, torch.Tensor]
+        A 3-tuple of ``(tmm, wl_tensor, theta)`` where:
+
+        - ``tmm`` is the initialized :class:`TMMSpectrum` model.
+        - ``wl_tensor`` is the wavelength tensor on ``device``, dtype
+          ``complex128``, shape ``[W]``.
+        - ``theta`` is the incidence angle in radians, dtype ``complex128``,
+          shape ``[1]``.
     """
     theta = torch.tensor(
         incidence_angle * torch.pi / 180.0,
         device=device,
         dtype=torch.complex128,
-    ).unsqueeze(0)  # [1]
+    ).unsqueeze(0)
 
     wl_tensor = wavelengths.to(device=device, dtype=torch.complex128).clone()  # [W]
-    nk_dict = load_materials(path_materials, wavelengths)
+    nk_dict = optollama.utils.load_materials(path_materials, wavelengths)
     tmm = TMMSpectrum(nk_dict, idx_to_token, device=device).to(device).eval()
     
     return tmm, wl_tensor, theta
+
+
+@torch.no_grad()
+def simulate_token_sequence(ids: torch.Tensor, tmm_ctx: "TMMContext", eos: int, pad: int, msk: int) -> torch.Tensor:
+    """
+    Simulate RAT spectra from a batch of token id sequences.
+
+    Args
+    ----
+    ids : torch.Tensor
+        Hard token id sequences of shape ``[B, S]`` (long).
+    tmm_ctx : TMMContext
+        Bundled TMM model, wavelength tensor, and incidence angle.
+    eos : int
+        EOS token id used to terminate each sequence.
+    pad : int
+        PAD token id (zero-thickness layers).
+    msk : int
+        MASK token id (zero-thickness layers).
+
+    Returns
+    -------
+    torch.Tensor
+        Simulated RAT spectra of shape ``[B, 3, W]``, float32, clamped to
+        ``[0, 1]``.
+    """
+    tmm, wl, theta = tmm_ctx
+    out = tmm(ids, wl, theta, eos=eos, pad=pad, msk=msk)  # [B, 3, W]
+
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
 
 
 class TMMContext(NamedTuple):
@@ -317,39 +295,40 @@ class TMMContext(NamedTuple):
     wl: torch.Tensor
     theta: torch.Tensor
 
+    @staticmethod
+    @torch.no_grad()
+    def make(
+        cfg: dict,
+        idx_to_token: dict[int, str],
+        device: Union[str, torch.device],
+    ) -> Self:
+        """
+        Centralized helper to construct a TMMContext from a config object.
 
-@torch.no_grad()
-def build_tmm_context(
-    cfg: dict,
-    idx_to_token: dict[int, str],
-    device: Union[str, torch.device],
-) -> TMMContext:
-    """
-    Centralized helper to construct a TMMContext from a config object.
+        Args
+        ----
+        cfg : dict
+            Configuration dictionary providing at least:
 
-    Args
-    ----
-    cfg: dict
-        Configuration object providing at least:
-        - INCIDENCE_ANGLE (float, degrees)
-        - WAVELENGTHS (torch.Tensor)
-        - PATH_MATERIALS (str)
-    idx_to_token: dict[int, str]
-        Vocabulary mapping from token index to token string.
-    device : str or torch.device
-        Device for model and buffers.
+            - ``"INCIDENCE_ANGLE"`` (float, degrees)
+            - ``"WAVELENGTHS"`` (torch.Tensor)
+            - ``"MATERIALS_PATH"`` (str)
+        idx_to_token : dict[int, str]
+            Vocabulary mapping from token index to token string.
+        device : str or torch.device
+            Device for model and buffers.
 
-    Returns
-    -------
-    TMMContext
-        Bundled (tmm model, wavelength tensor, angle tensor).
-    """
-    tmm, wl_tensor, theta = build_tmm(
-        incidence_angle=cfg["INCIDENCE_ANGLE"],
-        device=device,
-        wavelengths=cfg["WAVELENGTHS"],
-        path_materials=cfg["MATERIALS_PATH"],
-        idx_to_token=idx_to_token,
-    )
-    
-    return TMMContext(tmm=tmm, wl=wl_tensor, theta=theta)
+        Returns
+        -------
+        TMMContext
+            Named tuple bundling ``(tmm, wl_tensor, theta)``.
+        """
+        tmm, wl_tensor, theta = build_tmm(
+            incidence_angle=cfg["INCIDENCE_ANGLE"],
+            device=device,
+            wavelengths=cfg["WAVELENGTHS"],
+            path_materials=cfg["MATERIALS_PATH"],
+            idx_to_token=idx_to_token,
+        )
+
+        return TMMContext(tmm=tmm, wl=wl_tensor, theta=theta)

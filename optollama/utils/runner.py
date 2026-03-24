@@ -1,8 +1,5 @@
-import datetime
 import os
 import random
-
-from typing import Optional
 
 import numpy as np
 import torch
@@ -27,8 +24,10 @@ def init_distributed() -> tuple[str, int, int, int]:
     world_size = int(os.getenv("SLURM_NTASKS", 1))  # Total number of processes.
     local_rank = int(os.getenv("SLURM_LOCALID", rank))  # Local GPU ID.
     
+    ddp = False
     device = "cpu"
     backend = "gloo"
+    
     if torch.cuda.is_available():
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
@@ -36,6 +35,7 @@ def init_distributed() -> tuple[str, int, int, int]:
     device = torch.device(device)
 
     if dist.is_available() and not dist.is_initialized() and world_size > 1:
+        ddp = True
         slurm_addr = os.environ.get("SLURM_LAUNCH_NODE_IPADDR", "127.0.0.1")
         os.environ["MASTER_ADDR"] = slurm_addr
         os.environ["MASTER_PORT"] = "29500"
@@ -50,7 +50,7 @@ def init_distributed() -> tuple[str, int, int, int]:
 
     if rank == 0:
         print(
-            f"[DDP] backend={backend} world={world_size} rank={rank} "
+            f"[DDP={ddp}] backend={backend} world={world_size} rank={rank} "
             f"local_rank={local_rank} "
             f"device={device}"
         )
@@ -94,6 +94,11 @@ def setup_run(cfg: dict, make_dirs: bool = False) -> tuple[str, int, int, int]:
         The configuration.
     make_dirs: bool
         Whether to create the directories if not existing, defaults to False.
+    
+    Returns
+    -------
+    tuple[str, int, int, int]
+        The device string, node local rank, global rank and world size
     """
     device, local_rank, rank, world_size = init_distributed()
     seed = cfg["SEED"] or random.randint(1, int(1e6))
@@ -118,7 +123,7 @@ def is_ddp() -> bool:
     
     
 def stop_ddp() -> None:
-    """Destroys the DDP group"""
+    """Destroys the DDP group."""
     try:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
