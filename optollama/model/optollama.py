@@ -1,11 +1,11 @@
 import math
-from typing import List, Optional, Tuple
+
+from typing import Optional
 
 import torch
 
 from optollama.evaluation.metrics import masked_mae
-from optollama.evaluation import simulate_spectra_ids
-from optollama.evaluation import TMMContext
+from optollama.evaluation.simulation import simulate_token_sequence, TMMContext
 from optollama.utils.utils import top_k_top_p_filtering
 
 # ruff: noqa: D102, D105, D107
@@ -19,8 +19,10 @@ class SquareNoise(torch.nn.Module):
     noise level β(t) used during masking / remasking. A small epsilon offset
     prevents degenerate zero noise.
 
-    Args:
-        eps: Minimum noise level added to the schedule.
+    Args
+    ----
+    eps : float
+        Minimum noise level added to the schedule.
     """
 
     def __init__(self, eps: float = 1e-3) -> None:
@@ -37,13 +39,16 @@ class PositionalEncoding(torch.nn.Module):
     """
     Classic sinusoidal positional encoding.
 
-    Creates a matrix of shape [max_len, d_model] containing deterministic
+    Creates a matrix of shape ``[max_len, d_model]`` containing deterministic
     sin/cos positional features. Returned encodings are sliced to match the
     sequence length of the input.
 
-    Args:
-        max_len: Maximum supported sequence length.
-        d_model: Embedding dimensionality.
+    Args
+    ----
+    max_len : int
+        Maximum supported sequence length.
+    d_model : int
+        Embedding dimensionality.
     """
 
     def __init__(self, max_len: int, d_model: int) -> None:
@@ -70,11 +75,14 @@ class SpectrumEmbedding(torch.nn.Module):
     Embeds an input spectrum vector into the model's hidden dimension.
 
     Applies a small MLP + LayerNorm to project spectral inputs
-    (e.g., RAT / reflectance curves) into d_model.
+    (e.g., RAT / reflectance curves) into ``d_model``.
 
-    Args:
-        input_dim: Dimensionality of the raw spectrum.
-        d_model: model hidden dimension.
+    Args
+    ----
+    input_dim : int
+        Dimensionality of the raw spectrum.
+    d_model : int
+        Model hidden dimension.
     """
 
     def __init__(self, input_dim: int, d_model: int) -> None:
@@ -95,9 +103,12 @@ class StackEmbedding(torch.nn.Module):
     """
     Standard token embedding for discrete stack tokens.
 
-    Args:
-        input_vocab: Vocabulary size for layer/material tokens.
-        d_model: Embedding dimensionality.
+    Args
+    ----
+    input_vocab : int
+        Vocabulary size for layer/material tokens.
+    d_model : int
+        Embedding dimensionality.
     """
 
     def __init__(self, input_vocab: int, d_model: int) -> None:
@@ -117,9 +128,12 @@ class TimestepEmbedding(torch.nn.Module):
     Implements the sinusoidal timestep embedding from the BD3LMS / DiT
     architecture (Kuleshov Group), followed by a two-layer MLP.
 
-    Args:
-        d_model: Output embedding dimension.
-        frequency_embedding_size: Size of the Fourier feature vector.
+    Args
+    ----
+    d_model : int
+        Output embedding dimension.
+    frequency_embedding_size : int
+        Size of the Fourier feature vector.
     """
 
     def __init__(self, d_model: int, frequency_embedding_size: int = 256) -> None:
@@ -155,14 +169,19 @@ class AdaLayerNormGaussian(torch.nn.Module):
     """
     Adaptive LayerNorm with Gaussian initialization (Peebles & Xie, 2023).
 
-    Modulates normalization using a conditioning vector `cond`, producing
+    Modulates normalization using a conditioning vector ``cond``, producing
     (Δγ, β) shifts that scale and bias normalized activations.
 
-    Args:
-        hidden_size: Size of the normalized dimension.
-        cond_dim: Dimensionality of the conditioning embedding.
-        std_gamma: Init std for Δγ parameters.
-        std_beta: Init std for β parameters.
+    Args
+    ----
+    hidden_size : int
+        Size of the normalized dimension.
+    cond_dim : int
+        Dimensionality of the conditioning embedding.
+    std_gamma : float
+        Initialization std for Δγ parameters.
+    std_beta : float
+        Initialization std for β parameters.
     """
 
     def __init__(self, hidden_size: int, cond_dim: int, std_gamma: float = 1.2e-3, std_beta: float = 8e-4):
@@ -191,16 +210,22 @@ class Block(torch.nn.Module):
     Transformer block with cross-attention, self-attention, and AdaLN-Gaussian.
 
     A single DiT-style block:
-    • Cross-attention over encoded spectra
-    • Self-attention over the predicted token stack
-    • Feed-forward network
-    • α-gates modulating attention with timestep conditioning
 
-    Args:
-        d_model: Hidden dimension.
-        n_heads: Number of attention heads.
-        dropout: Dropout probability.
-        cond_dim: Dimensionality of conditional vector used by AdaLN / gates.
+    - Cross-attention over encoded spectra
+    - Self-attention over the predicted token stack
+    - Feed-forward network
+    - α-gates modulating attention with timestep conditioning
+
+    Args
+    ----
+    d_model : int
+        Hidden dimension.
+    n_heads : int
+        Number of attention heads.
+    dropout : float
+        Dropout probability.
+    cond_dim : int
+        Dimensionality of the conditional vector used by AdaLN / gates.
     """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float, cond_dim: int):
@@ -262,31 +287,48 @@ class OptoLlama(torch.nn.Module):
 
     This model predicts a sequence of discrete material/layer tokens conditioned
     on an input spectrum. It follows a DiT-style architecture with:
-      • Spectrum embedding
-      • Stack token embedding
-      • Timestep embedding
-      • Multiple conditional Transformer blocks
-      • Diffusion-style masking/noising
-      • Autoregressive-free sampling
 
-    Args:
-        spectra_dim: Dimensionality of the input spectrum.
-        vocab_size: Number of discrete material/layer tokens.
-        timesteps: Number of diffusion sampling steps.
-        max_stack_depth: Maximum token length of predicted stack.
-        eos_idx: EOS token index.
-        pad_idx: PAD token index.
-        mask_idx: MASK token index for diffusion noising.
-        d_model: Transformer hidden size.
-        n_blocks: Number of transformer blocks.
-        n_heads: Attention heads.
-        dropout: Dropout probability.
-        idx_to_token: Mapping from token ids to string names.
-        temperature: Sampling temperature (0 = deterministic).
-        top_k: Top-k sampling cutoff.
-        top_p: Top-p (nucleus) sampling cutoff.
+    - Spectrum embedding
+    - Stack token embedding
+    - Timestep embedding
+    - Multiple conditional Transformer blocks
+    - Diffusion-style masking/noising
+    - Autoregressive-free sampling
+
+    Args
+    ----
+    spectra_dim : int
+        Dimensionality of the input spectrum.
+    vocab_size : int
+        Number of discrete material/layer tokens.
+    timesteps : int
+        Number of diffusion sampling steps.
+    max_stack_depth : int
+        Maximum token length of the predicted stack.
+    eos_idx : int
+        EOS token index.
+    pad_idx : int
+        PAD token index.
+    mask_idx : int
+        MASK token index for diffusion noising.
+    d_model : int
+        Transformer hidden size.
+    n_blocks : int
+        Number of transformer blocks.
+    n_heads : int
+        Number of attention heads.
+    dropout : float
+        Dropout probability.
+    idx_to_token : dict
+        Mapping from token ids to token strings.
+    temperature : float
+        Sampling temperature (``0.0`` = deterministic).
+    top_k : int
+        Top-k sampling cutoff.
+    top_p : float
+        Top-p (nucleus) sampling cutoff.
     """
-
+    
     def __init__(
         self,
         spectra_dim: int,
@@ -354,10 +396,15 @@ class OptoLlama(torch.nn.Module):
         self._step_mae_ctx: Optional[TMMContext] = None
 
     def set_max_emit_len(self, max_len: Optional[int]) -> None:
-        """Set a hard maximum emitted sequence length (in tokens, incl. EOS position).
+        """
+        Set a hard maximum emitted sequence length (in tokens, incl. EOS position).
 
-        If max_len is None: disable constraint.
-        If max_len <= 0: treated as 1 (immediate EOS at position 0).
+        Args
+        ----
+        max_len : int or None
+            Maximum number of emitted tokens (including the EOS position).
+            If ``None``, the constraint is disabled. Values ``<= 0`` are
+            treated as ``1`` (immediate EOS at position 0).
         """
         if max_len is None:
             self.max_emit_len = None
@@ -370,23 +417,28 @@ class OptoLlama(torch.nn.Module):
 
     def set_token_constraints(
         self,
-        *,
         allow_ids: Optional[torch.Tensor] = None,
         exclude_ids: Optional[torch.Tensor] = None,
         allow_eos_pad: bool = True,
         allow_msk: bool = False,
     ) -> None:
-        """Set inference-time sampling constraints.
+        """
+        Set inference-time sampling constraints.
 
         This does **not** change model weights; it only changes which tokens
-        can be sampled during `_sample_logits`.
+        can be sampled during ``_sample_logits``.
 
-        Args:
-            allow_ids: If provided, only these token ids are allowed (plus
-                optionally EOS/PAD).
-            exclude_ids: If provided, these token ids are forbidden.
-            allow_eos_pad: If True, always allow EOS and PAD even in allowlist mode.
-            allow_msk: If True, allow emitting <MSK> as a sampled output token.
+        Args
+        ----
+        allow_ids : torch.Tensor, optional
+            If provided, only these token ids are allowed (plus optionally
+            EOS/PAD depending on ``allow_eos_pad``).
+        exclude_ids : torch.Tensor, optional
+            If provided, these token ids are forbidden.
+        allow_eos_pad : bool
+            If ``True``, always allow EOS and PAD even in allowlist mode.
+        allow_msk : bool
+            If ``True``, allow emitting ``<MSK>`` as a sampled output token.
         """
         mask = torch.zeros((self.vocab_size,), dtype=torch.bool, device=self.allowed_vocab_mask.device)
         if allow_ids is None:
@@ -418,12 +470,17 @@ class OptoLlama(torch.nn.Module):
         Produces a set of timesteps for batched diffusion training. Ensures
         even coverage of the unit interval and avoids t=0.
 
-        Args:
-            batch: Token batch whose size determines the number of timesteps.
-            sampling_eps: Minimum timestep value to avoid degenerate noise.
+        Args
+        ----
+        batch : torch.Tensor
+            Token batch whose size determines the number of timesteps.
+        sampling_eps : float
+            Minimum timestep value to avoid degenerate noise.
 
-        Returns:
-            Tensor of shape [B] with sampled timesteps in (eps, 1].
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``[B]`` with sampled timesteps in ``(eps, 1]``.
         """
         n, device = batch.shape[0], batch.device
 
@@ -441,14 +498,19 @@ class OptoLlama(torch.nn.Module):
         Embeds spectra, stacks, and timesteps; applies positional encodings and
         conditional DiT blocks; finally projects to vocabulary logits.
 
-        Args:
-            spectra: Input spectra, shape [B, D_spec].
-            noised_stacks: Masked/noised stack tokens, shape [B, S].
-            timesteps: Diffusion timesteps, shape [B].
+        Args
+        ----
+        spectra : torch.Tensor
+            Input spectra, shape ``[B, D_spec]``.
+        noised_stacks : torch.Tensor
+            Masked/noised stack tokens, shape ``[B, S]``.
+        timesteps : torch.Tensor
+            Diffusion timesteps, shape ``[B]``.
 
         Returns
         -------
-            Predicted logits over tokens, shape [B, S, vocab_size].
+        torch.Tensor
+            Predicted logits over tokens, shape ``[B, S, vocab_size]``.
         """
         embedded_spectra = self.spectrum_embedding(spectra)  # [B, 3, d_model]
         embedded_spectra += self.positional_encoding(embedded_spectra)
@@ -472,13 +534,17 @@ class OptoLlama(torch.nn.Module):
         Samples a timestep, applies masking noise to the input stack, and predicts
         denoised logits via the transformer backbone.
 
-        Args:
-            spectra: Conditioning spectra, shape [B, D_spec].
-            stacks: Ground-truth token stacks, shape [B, S].
+        Args
+        ----
+        spectra : torch.Tensor
+            Conditioning spectra, shape ``[B, D_spec]``.
+        stacks : torch.Tensor
+            Ground-truth token stacks, shape ``[B, S]``.
 
         Returns
         -------
-            Predicted logits for all stack positions.
+        torch.Tensor
+            Predicted logits for all stack positions, shape ``[B, S, vocab_size]``.
         """
         # sample time points
         timesteps = self._sample_t(stacks)
@@ -503,12 +569,17 @@ class OptoLlama(torch.nn.Module):
 
     def enable_step_mae(self, tmm_ctx: Optional[TMMContext]) -> None:
         """
-        Enable/disable per-step MAE tracking during sampling.
+        Enable or disable per-step MAE tracking during sampling.
 
-        If `tmm_ctx` is not None and mode='TMM_FAST', `_sample` will:
-          - simulate spectra at every denoising step
-          - compute masked_mae against the conditioning spectra
-          - return a [B, steps] trajectory as the second output.
+        When ``tmm_ctx`` is not ``None``, ``_sample`` will simulate spectra at
+        every denoising step, compute ``masked_mae`` against the conditioning
+        spectra, and return a ``[B, steps]`` trajectory as the second output.
+
+        Args
+        ----
+        tmm_ctx : TMMContext or None
+            TMM simulation context used for per-step spectrum evaluation.
+            Pass ``None`` to disable tracking.
         """
         self._step_mae_ctx = tmm_ctx
         self._step_mae_enabled = tmm_ctx is not None
@@ -525,14 +596,19 @@ class OptoLlama(torch.nn.Module):
         If all sampling knobs are disabled (temperature ≤ 0, no top-k, no top-p),
         falls back to greedy argmax decoding.
 
-        Args:
-            logits: Logits over vocabulary, shape [B*S, V].
-            top_k: Optional override for top-k sampling.
-            top_p: Optional override for top-p sampling.
+        Args
+        ----
+        logits : torch.Tensor
+            Logits over vocabulary, shape ``[B*S, V]``.
+        top_k : int, optional
+            Override for top-k sampling. Uses ``self.top_k`` if ``None``.
+        top_p : float, optional
+            Override for top-p sampling. Uses ``self.top_p`` if ``None``.
 
         Returns
         -------
-            Sampled token ids of shape [B*S, 1].
+        torch.Tensor
+            Sampled token ids of shape ``[B*S, 1]``.
         """
         # Apply vocabulary constraints (if any). This is inference-time only and does not
         # affect training/weights — it just zeroes probability mass for forbidden tokens.
@@ -571,27 +647,32 @@ class OptoLlama(torch.nn.Module):
 
     def _sample(
         self, spectra: torch.Tensor, eps: float = 1e-3, remask_prob: float = 0.1
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Perform iterative diffusion sampling to generate a token stack.
 
         Runs a full denoising trajectory from pure mask tokens toward a clean
         stack, applying the learned denoising model at each timestep.
 
-        Args:
-            spectra: Conditioning spectra, shape [B, 3, W] (or flattened; the
-                     embedding already handles your current convention).
-            eps: Minimum timestep value used for final denoising steps.
-            remask_prob: Base probability of re-masking tokens between updates.
+        Args
+        ----
+        spectra : torch.Tensor
+            Conditioning spectra, shape ``[B, D_spec]``.
+        eps : float
+            Minimum timestep value used for the final denoising steps.
+        remask_prob : float
+            Base probability of re-masking tokens between updates (overridden
+            by the noise schedule during sampling).
 
         Returns
         -------
-        stacks:
-            Final sampled stack, shape [B, S].
-        step_mae:
-            If `self._step_mae_enabled` and `self._step_mae_ctx` are set,
-            tensor of shape [B, steps] with per-step MAE.
-            Otherwise `None`.
+        tuple[torch.Tensor, torch.Tensor or None]
+            A 2-tuple of ``(stacks, step_mae_traj)`` where:
+
+            - ``stacks`` is the final sampled stack, shape ``[B, S]``.
+            - ``step_mae_traj`` is a tensor of shape ``[B, steps]`` with
+              per-step MAE if ``_step_mae_enabled`` is set, otherwise
+              ``None``.
         """
         timesteps = torch.linspace(1.0, eps, self.steps, device=spectra.device)
 
@@ -606,7 +687,7 @@ class OptoLlama(torch.nn.Module):
 
         # Decide whether we track MAE this run
         track_mae = bool(self._step_mae_enabled and (self._step_mae_ctx is not None))
-        mae_per_step: List[torch.Tensor] = []
+        mae_per_step = []
 
         for i in range(self.steps):
             t = torch.full((spectra.shape[0],), timesteps[i], device=spectra.device)
@@ -647,7 +728,7 @@ class OptoLlama(torch.nn.Module):
             # ---- optional per-step MAE tracking ----
             if track_mae:
                 assert self._step_mae_ctx is not None
-                pred_spec = simulate_spectra_ids(
+                pred_spec = simulate_token_sequence(
                     stacks,
                     self._step_mae_ctx,
                     eos=self.eos,
@@ -670,15 +751,21 @@ class OptoLlama(torch.nn.Module):
         """
         Unified forward interface.
 
-        - If `stacks` is provided → run diffusion training step.
-        - If `stacks` is None → run autoregressive-free diffusion sampling.
+        - If ``stacks`` is provided → run diffusion training step.
+        - If ``stacks`` is ``None`` → run autoregressive-free diffusion sampling.
 
-        Args:
-            spectra: Conditioning spectra.
-            stacks: Optional ground-truth stack for training.
+        Args
+        ----
+        spectra : torch.Tensor
+            Conditioning spectra.
+        stacks : torch.Tensor, optional
+            Ground-truth token stack for training. If ``None``, sampling mode
+            is used.
 
         Returns
         -------
-            Training logits or sampled stacks depending on mode.
+        torch.Tensor
+            Training logits of shape ``[B, S, vocab_size]`` when ``stacks``
+            is provided, or sampled stacks of shape ``[B, S]`` otherwise.
         """
         return self._train(spectra, stacks) if stacks is not None else self._sample(spectra)

@@ -9,14 +9,14 @@ MATERIALS_PATH: "${DATA_PATH}/materials/"
 
 DATA_PATH_TRAIN_0: "${DATA_PATH}/train/train-0.safetensors"
 DATA_PATH_TRAIN_1: "${DATA_PATH}/train/train-1.safetensors"
-# DATA_PATH_TRAIN_2: "${DATA_PATH}/train/train-2.safetensors"
-# DATA_PATH_TRAIN_3: "${DATA_PATH}/train/train-3.safetensors"
-# DATA_PATH_TRAIN_4: "${DATA_PATH}/train/train-4.safetensors"
-# DATA_PATH_TRAIN_5: "${DATA_PATH}/train/train-5.safetensors"
-# DATA_PATH_TRAIN_6: "${DATA_PATH}/train/train-6.safetensors"
-# DATA_PATH_TRAIN_7: "${DATA_PATH}/train/train-7.safetensors"
-# DATA_PATH_TRAIN_8: "${DATA_PATH}/train/train-8.safetensors"
-# DATA_PATH_TRAIN_9: "${DATA_PATH}/train/train-9.safetensors"
+DATA_PATH_TRAIN_2: "${DATA_PATH}/train/train-2.safetensors"
+DATA_PATH_TRAIN_3: "${DATA_PATH}/train/train-3.safetensors"
+DATA_PATH_TRAIN_4: "${DATA_PATH}/train/train-4.safetensors"
+DATA_PATH_TRAIN_5: "${DATA_PATH}/train/train-5.safetensors"
+DATA_PATH_TRAIN_6: "${DATA_PATH}/train/train-6.safetensors"
+DATA_PATH_TRAIN_7: "${DATA_PATH}/train/train-7.safetensors"
+DATA_PATH_TRAIN_8: "${DATA_PATH}/train/train-8.safetensors"
+DATA_PATH_TRAIN_9: "${DATA_PATH}/train/train-9.safetensors"
 
 DATA_PATH_TEST: "${DATA_PATH}/test/test.safetensors"
 
@@ -44,8 +44,8 @@ MC_SAMPLES: 10
 N_TARGETS: 1
 
 EPOCHS: 1000
-NUM_SAMPLES_TRAIN: 512
-NUM_SAMPLES_TEST: 1
+NUM_SAMPLES_TRAIN: 1e7
+NUM_SAMPLES_TEST: 3000
 TRAIN_BATCH_SIZE: 256
 TEST_BATCH_SIZE: 256
 
