@@ -1,14 +1,17 @@
+#!/usr/bin/env python
+
 import argparse
-import sys
+import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import torch
 import tqdm
-from optollama.dataloader.dataset import SpectraDataset
+from optollama.data.dataset import SpectraDataset
 from optollama.evaluation.metrics import masked_mae_roi
 from safetensors.torch import load_file
-from optollama.utils.utils import ensure_3w, save_as_json
+from optollama.data.spectra import ensure_3w
+from optollama.utils.utils import save_as_json
 
 
 def load_train_sample_by_global_id(
@@ -415,23 +418,13 @@ def main() -> None:
     )
 
     # Save mapping as JSON using the project helper
-    save_as_json(args.out_dir, results, name=args.name)
-    print(f"Saved {len(results)} test→train mappings to '{args.out_dir}/{args.name}.json'")
+    out_path = os.path.join(args.out_dir, args.name + ".json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    save_as_json(out_path, results)
+    print(f"Saved {len(results)} test→train mappings to '{out_path}'")
 
 
 if __name__ == "__main__":
-    if "--train" not in sys.argv:
-        sys.argv.extend(["--train", "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/dtrain"])
-    if "--test" not in sys.argv:
-        sys.argv.extend(["--test", "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/dtest"])
-    if "--out_dir" not in sys.argv:
-        sys.argv.extend(["--out_dir", "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors"])
-    if "--device" not in sys.argv:
-        sys.argv.extend(["--device", "cuda"])
-    if "--name" not in sys.argv:
-        sys.argv.extend(["--name", "test_to_train_nn"])
-    if "--chunk_size" not in sys.argv:
-        sys.argv.extend(["--chunk_size", "10240"])
     main()
 
 # python match_test_to_train.py \

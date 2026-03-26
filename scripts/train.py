@@ -157,13 +157,14 @@ def train(cfg: dict) -> None:
 
                 train_losses[epoch] += total_loss.item()
 
-                acc, _ = optollama.evaluation.metrics.token_accuracy(
+                acc, _ = optollama.evaluation.token_accuracy(
                     stacks, 
                     logits.argmax(dim=-1), 
                     eos_idx, 
                     pad_idx, 
                     msk_idx
                 )
+                train_acc[epoch] = acc
 
             if rank == 0:
                 pbar.set_postfix(
@@ -206,10 +207,10 @@ def train(cfg: dict) -> None:
             print(f"[rank 0] Saved {samples} samples → {cfg['SAMPLES_PATH']}")
 
             if tmm:
-                print(f"\tmin valid MAE: {torch.min(test_mae).item():.6f}")
-                print(f"\tlast valid MAE: {test_mae[epoch]:.6f}")
+                print(f"\tmin test MAE: {torch.min(test_mae).item():.6f}")
+                print(f"\tlast test MAE: {test_mae[epoch]:.6f}")
             else:
-                print(f"\tvalidation accuracy: {test_acc[epoch]:.2f}%")
+                print(f"\ttest accuracy: {test_acc[epoch]:.2f}%")
         
         # ------------------------------ checkpointing ------------------------------
         if rank == 0:

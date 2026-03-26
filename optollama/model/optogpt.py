@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as f
 
-from optollama.utils.utils import top_k_top_p_filtering
+import optollama.model.sampling
 
 # ruff: noqa: D101, D102, D103, N801
 # mypy: disable-error-code=no-untyped-def
@@ -205,7 +205,12 @@ def _filter_logits_topk_topp(
     filter_value: float = -float("inf"),
 ) -> torch.Tensor:
     """Backward-compatible wrapper around :func:`utils.top_k_top_p_filtering`."""
-    return top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0), filter_value=filter_value)
+    return optollama.model.sampling.top_k_top_p_filtering(
+        logits, 
+        top_k=int(top_k or 0), 
+        top_p=float(top_p or 0.0), 
+        filter_value=filter_value
+    )
 
 
 def _subsequent_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -228,7 +233,10 @@ def _subsequent_mask(seq_len: int, device: torch.device) -> torch.Tensor:
         Boolean tensor of shape ``[1, seq_len, seq_len]`` where ``True``
         indicates allowed attention positions.
     """
-    return torch.triu(torch.ones(1, seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1) == 0
+    return torch.triu(
+        torch.ones(1, seq_len, seq_len, device=device, dtype=torch.bool), 
+        diagonal=1
+    ) == 0
 
 
 def _flatten_spectra(spectra: torch.Tensor) -> torch.Tensor:
@@ -261,6 +269,7 @@ def _flatten_spectra(spectra: torch.Tensor) -> torch.Tensor:
         return spectra.reshape(b, c * w)
     elif spectra.dim() == 2:
         return spectra
+    
     raise ValueError(f"Unexpected spectra shape {tuple(spectra.shape)}")
 
 

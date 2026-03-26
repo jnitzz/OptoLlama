@@ -7,8 +7,7 @@ import torch
 
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 
-from optollama.utils.utils import apply_noise, apply_smoothing, normalize_rat_fill_crop, redistribute_mismatch, unique_length_int_generator
-
+import optollama.data.spectra
 # ruff: noqa: E731
 
 
@@ -43,6 +42,48 @@ class SpectraDataset(torch.utils.data.Dataset):
         if self.spectra.size(0) != self.stacks.size(0):
             raise RuntimeError("Mismatched number of samples between spectra and thin_films.")
             
+    @staticmethod
+    def indices_of_unique_equidistant_subset(start: int, stop: int, amount: int) -> torch.Tensor:
+        """
+        Generate a tensor of ``amount`` unique, evenly-spaced integer indices.
+
+        Requires ``-1 < start < stop`` and ``0 < amount <= stop``.
+
+        Args
+        ----
+        start : int
+            The start index to subset from.
+        stop : int
+            The exclusive upper bound for the subset.
+        amount : int
+            The number of unique indices to return.
+
+        Returns
+        -------
+        torch.Tensor
+            1-D integer tensor of ``amount`` unique indices in ``[start, stop)``.
+
+        Raises
+        ------
+        ValueError
+            If the constraints ``-1 < start < stop`` or ``0 < amount <= stop``
+            are not satisfied.
+        """
+        if not (-1 < start < stop) or not (0 < amount <= stop):
+            raise ValueError(
+                f"Invalid arguments: start={start}, stop={stop}, amount={amount}. Require (-1 < start < stop) and (0 < amount <= stop)."
+            )
+
+        len_unique = -1
+        amount = amount - 1
+
+        while len_unique < amount:
+            amount = amount + 1
+            subset_idx = torch.linspace(start, stop - 1, amount, dtype=torch.int).unique()
+            len_unique = len(subset_idx)
+
+        return subset_idx
+
     @staticmethod
     def shard_sort_key(path: str) -> tuple[str, int]:
         """
@@ -124,20 +165,20 @@ class SpectraDataset(torch.utils.data.Dataset):
         dataset_path = sorted([cfg[k] for k in cfg.keys() if k.startswith(search_string)])
 
         # --- build dataset ---
-        ds = cls(dataset_path)
+        dataset = cls(dataset_path)
 
         # --- optional subset for quick debugging ---
-        if subset_n is not None and subset_n < ds.length_dataset:
-            idxs = unique_length_int_generator(0, ds.length_dataset - 1, subset_n)
-            ds = Subset(ds, idxs)
+        if subset_n is not None and subset_n < dataset.length_dataset:
+            idxs = cls.indices_of_unique_equidistant_subset(0, dataset.length_dataset - 1, subset_n)
+            dataset = Subset(dataset, idxs)
 
         # --- configure sampler and shuffling ---
         if split_lower == "train":
-            sampler = DistributedSampler(ds, shuffle=True) if ddp else None
+            sampler = DistributedSampler(dataset, shuffle=True) if ddp else None
             shuffle = not ddp
             drop_last = True
         else:
-            sampler = DistributedSampler(ds, shuffle=False) if ddp else None
+            sampler = DistributedSampler(dataset, shuffle=False) if ddp else None
             shuffle = False
             drop_last = False
 
@@ -146,7 +187,7 @@ class SpectraDataset(torch.utils.data.Dataset):
         num_workers = cfg["NUM_WORKERS"]
 
         loader = DataLoader(
-            ds,
+            dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             sampler=sampler,
@@ -155,225 +196,172 @@ class SpectraDataset(torch.utils.data.Dataset):
             drop_last=drop_last,
         )
 
-        return ds, loader, sampler
+        return dataset, loader, sampler
 
 
-
-
-
-def smooth_1d_reflect(v: torch.Tensor, kernel_size: int = 15) -> torch.Tensor:
-    """Smooth 1D moving-average with reflect padding."""
-    if kernel_size <= 1:
-        return v
-    pad = kernel_size // 2
-    kernel = torch.ones(kernel_size, device=v.device, dtype=v.dtype) / kernel_size
-    v_pad = torch.nn.functional.pad(v[None, None, :], (pad, pad), mode="reflect")
-    k = kernel[None, None, :]
-    return torch.nn.functional.conv1d(v_pad, k)[0, 0, : v.shape.numel()]
-
-
-def apply_stochastic_filler(
-    base: torch.Tensor,
-    wl: torch.Tensor,
-    data: dict,
-    seed_override: Optional[int] = None,
-) -> torch.Tensor:
+class RepeatedSpectrumDataset(Dataset):
     """
-    Modify `base` outside a given ROI according to `data['stochastic_filler']`.
+    Dataset that repeats a *base* ``[3, W]`` spectrum ``n_targets`` times.
 
-    - ROI stays untouched.
-    - Outside ROI is overwritten / perturbed depending on mode.
-    """
-    stoch = data.get("stochastic_filler")
-    if not stoch:
-        return base
-
-    roi = stoch.get("roi") or stoch.get("ROI")
-    if not roi or len(roi) != 2:
-        raise ValueError("stochastic_filler.roi must be a 2-element list [lo, hi].")
-
-    lo, hi = float(roi[0]), float(roi[1])
-    roi_mask = (wl >= lo) & (wl <= hi)
-    outside = ~roi_mask
-    if not torch.any(outside):
-        # ROI covers all wavelengths; nothing to fill
-        return base
-
-    mode = str(stoch.get("mode", "smooth_random")).lower()
-    strength = float(stoch.get("strength", 0.3))
-    kernel_size = int(stoch.get("kernel_size", 15))
-    seed = seed_override if seed_override is not None else stoch.get("seed", None)
-
-    # Local random helpers (optional reproducibility)
-    if seed is not None:
-        g = torch.Generator(device=base.device)
-        g.manual_seed(int(seed))
-        rand = lambda shape: torch.rand(shape, generator=g, device=base.device)
-        randn = lambda shape: torch.randn(shape, generator=g, device=base.device)
-    else:
-        rand = lambda shape: torch.rand(shape, device=base.device)
-        randn = lambda shape: torch.randn(shape, device=base.device)
-
-    base = base.clone()
-    r, a, t = base[0], base[1], base[2]
-
-    if mode == "flat_random":
-        # Constant R/A outside ROI
-        r0 = rand(()) * strength
-        a0 = rand(()) * strength
-        r[outside] = r0
-        a[outside] = a0
-
-    elif mode == "tilted_random":
-        # Linear tilt of R/A over wavelength
-        x = (wl - wl.min()) / (wl.max() - wl.min() + 1e-8)
-        slope_r = (rand(()) * 2.0 - 1.0) * strength
-        offset_r = rand(()) * strength
-        slope_a = (rand(()) * 2.0 - 1.0) * strength
-        offset_a = rand(()) * strength
-
-        r_fill = torch.clamp(offset_r + slope_r * x, 0.0, 1.0)
-        a_fill = torch.clamp(offset_a + slope_a * x, 0.0, 1.0)
-
-        r[outside] = r_fill[outside]
-        a[outside] = a_fill[outside]
-
-    elif mode in ("smooth_random", "prior_plus_noise"):
-        # Smooth random fields for R/A
-        noise_r = randn(r.shape) * strength
-        noise_a = randn(a.shape) * strength
-
-        noise_r = smooth_1d_reflect(noise_r, kernel_size=kernel_size)
-        noise_a = smooth_1d_reflect(noise_a, kernel_size=kernel_size)
-
-        if mode == "smooth_random":
-            r_fill = torch.clamp(noise_r, 0.0, 1.0)
-            a_fill = torch.clamp(noise_a, 0.0, 1.0)
-            r[outside] = r_fill[outside]
-            a[outside] = a_fill[outside]
-        else:  # prior_plus_noise
-            r[outside] = torch.clamp(r[outside] + noise_r[outside], 0.0, 1.0)
-            a[outside] = torch.clamp(a[outside] + noise_a[outside], 0.0, 1.0)
-
-    else:
-        raise ValueError(f"Unknown stochastic_filler.mode: {mode}")
-
-    # Normalize to a physical RAT spectrum
-    rn, an, tn = normalize_rat_fill_crop(r, a, t, target=1.0)
-    return torch.stack([rn, an, tn], dim=0)
-
-
-class RepeatedSpecDataset(Dataset):
-    """
-    Dataset that repeats a *base* [3,W] spectrum N times.
-
-    If NOISE.enabled=True, each item draws fresh noise (and smoothing).
-    """
-
-    def __init__(
-        self,
-        base_spec_3w: torch.Tensor,  # [3,W] before noise/smoothing
-        n_items: int,
-        max_stack_depth: int,
-        pad_idx: int,
-        wavelengths: Any,  # np.ndarray [W] (used for wl masks)
-        noise_cfg: dict | None,
-        smooth_cfg: dict | None,
-        mismatch_order: str = "R>A>T",
-        stochastic_filler_cfg: dict | None = None,
-        seed: int = 0,
-    ):
-        assert base_spec_3w.ndim == 2 and base_spec_3w.shape[0] == 3, "base_spec must be [3,W]"
-        self.base = base_spec_3w.detach().clone()  # untouched template
-        self.n = int(n_items)
-        self.maximum_depth = int(max_stack_depth)
-        self.pad_idx = int(pad_idx)
-        self.wavelengths = wavelengths
-        self.noise_cfg = noise_cfg or {"enabled": False}
-        self.smooth_cfg = smooth_cfg or {"enabled": False}
-        self.mismatch_order = mismatch_order
-        self.stochastic_filler_cfg = stochastic_filler_cfg or {}
-        self.seed = int(seed)
-
-    def __len__(self) -> int:
-        """Return the length of the dataset."""
-        return self.n
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return specraand stacks."""
-        stacks = torch.full((self.maximum_depth,), self.pad_idx)  # dummy; eval uses TMM
-        specs = self.base.clone()  # [3,W]
-
-        # Zeroth target: exact original, no stochastic filling
-        if index == 0 and self.stochastic_filler_cfg.get("skip_index0", True):
-            specs = redistribute_mismatch(specs, self.mismatch_order, target_sum=1.0)
-            return specs, stacks
-
-        # 1) vary outside ROI first (keeps ROI untouched)
-        seed_i = self.seed + int(index)  # optionally also + 100000 * rank
-        specs = apply_stochastic_filler(
-            specs, self.wavelengths, {"stochastic_filler": self.stochastic_filler_cfg}, seed_override=seed_i
-        )
-
-        # 2) optionally also apply noise/smoothing (if enabled)
-        specs = apply_noise(specs, self.noise_cfg, self.wavelengths)
-        specs = apply_smoothing(specs, self.smooth_cfg)
-
-        # 3) enforce sum-to-1
-        specs = redistribute_mismatch(specs, self.mismatch_order, target_sum=1.0)
-        return specs, stacks
-
-
-def make_repeated_spec_loader(
-    base_spec_3w: torch.Tensor,
-    n_items: int,
-    max_stack_depth: int,
-    pad_idx: int,
-    wavelengths: Any,
-    cfg: None = None,
-    batch_size: int = 1,
-) -> tuple[Union[SpectraDataset, Subset[SpectraDataset]], DataLoader, None]:
-    """
-    Build dataset, sampler, and DataLoader for inference.
+    Each item returns the (possibly augmented) spectrum paired with an
+    all-padding token sequence. If noise/smoothing/stochastic-filler are
+    enabled in ``cfg``, every item beyond index 0 draws fresh stochastic
+    augmentations so that the model sees varied inputs for the same target.
 
     Args
     ----
-        base_spec_3w: base spectrum target (3,W)
-        n_items: number of noise variations for the base spectrum
-        max_stack_depth: maximum stack depth allowed
-        pad_idx: token <PAD> to fill voide
-        wavelengths: to apply noise in the correct format
-        cfg: config
-        batch_size: batch_size
-
-    Returns
-    -------
-        dataset, loader, sampler
+    spectrum : torch.Tensor
+        Base RAT spectrum of shape ``[3, W]`` used as the template.
+    n_targets : int
+        Number of times the spectrum is repeated (i.e. dataset length).
+    cfg : dict
+        Configuration mapping providing keys such as ``ROI_MIN``,
+        ``ROI_MAX``, ``FILL_OUTSIDE_ROI``, ``MAX_SEQ_LEN``,
+        ``MISMATCH_FILL_ORDER``, ``WAVELENGTHS``, ``NOISE``, and
+        ``SMOOTH``.
+    msk_idx : int
+        Token index used to fill the placeholder stack sequence.
     """
-    roi_min = getattr(cfg, "ROI_MIN", None)
-    roi_max = getattr(cfg, "ROI_MAX", None)
+    def __init__(
+        self,
+        spectrum: torch.Tensor,
+        n_targets: int,
+        cfg: dict,
+        msk_idx: int
+    ):
+        self.spectrum = spectrum.detach().clone()  # untouched template
+        self.n_targets = n_targets
+        self.cfg = cfg
+        self.msk_idx = msk_idx
 
-    stochastic_filler_cfg = getattr(cfg, "FILL_OUTSIDE_ROI", None) if cfg is not None else None
-    if stochastic_filler_cfg is not None and roi_min is not None and roi_max is not None:
-        stochastic_filler_cfg = dict(stochastic_filler_cfg)  # shallow copy
-        stochastic_filler_cfg["roi"] = [roi_min, roi_max]
-    noise_cfg = getattr(cfg, "NOISE", None) if cfg is not None else None
-    smooth_cfg = getattr(cfg, "SMOOTH", None) if cfg is not None else None
-    mismatch_order = getattr(cfg, "MISMATCH_FILL_ORDER", "R>A>T") if cfg is not None else "R>A>T"
-    seed = int(getattr(cfg, "SEED", 0)) if cfg is not None else 0
+        roi = [cfg["ROI_MIN"], cfg["ROI_MAX"]]
+        self.roi = roi if cfg["FILL_OUTSIDE_ROI"]["ENABLED"] else None
 
-    ds = RepeatedSpecDataset(
-        base_spec_3w,
-        n_items,
-        max_stack_depth,
-        pad_idx,
-        wavelengths=wavelengths,
-        noise_cfg=noise_cfg,
-        smooth_cfg=smooth_cfg,
-        mismatch_order=mismatch_order,
-        stochastic_filler_cfg=stochastic_filler_cfg,
-        seed=seed,
-    )
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    def __len__(self) -> int:
+        """
+        Return the number of spectrum repetitions in the dataset.
+
+        Returns
+        -------
+        int
+            The number of items (``n_targets``).
+        """
+        return self.n_targets
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return an augmented spectrum and a placeholder stack for the given index.
+
+        Index 0 returns the base spectrum (no stochastic filling, only
+        mismatch redistribution). All subsequent indices apply stochastic
+        outside-ROI filling followed by noise, smoothing, and mismatch
+        redistribution.
+
+        Args
+        ----
+        index : int
+            The index of the item to return, in ``[0, n_targets)``.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            A 2-tuple of:
+
+            - **spectrum** — augmented RAT spectrum of shape ``[3, W]``
+              in float32.
+            - **stack** — all-padding token sequence of shape
+              ``[MAX_SEQ_LEN]`` as long integers.
+        """
+        stack = torch.full((self.cfg["MAX_SEQ_LEN"],), self.msk_idx)
+        spectrum = self.spectrum.clone()
+        mismatch_order = self.cfg["MISMATCH_FILL_ORDER"]
+
+        # Zeroth index: exact original, no stochastic filling
+        if index == 0 and self.cfg["FILL_OUTSIDE_ROI"]["SKIP_INDEX_0"]:
+            spectrum = optollama.data.spectra.redistribute_mismatch(
+                spectrum, 
+                mismatch_order, 
+                target_sum=1.0
+            )
+
+            return spectrum, stack
+
+        # --- vary outside ROI first (keeps ROI untouched) ---
+        wavelengths = self.cfg["WAVELENGTHS"]
+
+        spectrum = optollama.data.spectra.apply_stochastic_filler(
+            spectrum,
+            wavelengths,
+            self.cfg["FILL_OUTSIDE_ROI"],
+            seed=self.cfg["SEED"] + index,
+            roi=[self.cfg["ROI_MIN"], self.cfg["ROI_MAX"]],
+        )
+
+        # --- optionally also apply noise/smoothing (if enabled) ---
+        spectrum = optollama.data.spectra.apply_noise(
+            spectrum, 
+            self.cfg["NOISE"], 
+            wavelengths
+        )
+        spectrum = optollama.data.spectra.apply_smoothing(
+            spectrum, 
+            self.cfg["SMOOTH"]
+        )
+
+        # --- enforce sum-to-1 ---
+        spectrum = optollama.data.spectra.redistribute_mismatch(
+            spectrum, 
+            mismatch_order, 
+            target_sum=1.0
+        )
+
+        return spectrum, stack
     
-    return ds, loader, None
+    @classmethod
+    def make_loader(
+        cls,
+        spectrum: torch.Tensor,
+        cfg: dict,
+        msk_idx: int,
+    ) -> tuple[Union[SpectraDataset, Subset[SpectraDataset]], DataLoader]:
+        """
+        Build a :class:`RepeatedSpectrumDataset` and its :class:`~torch.utils.data.DataLoader` for inference.
+
+        The number of repetitions is read from ``cfg["N_TARGETS"]``. If
+        that value is ``<= 0`` it is clamped to ``1``. The batch size is
+        taken from ``cfg["TEST_BATCH_SIZE"]``, capped at ``n_targets``.
+
+        Args
+        ----
+        spectrum : torch.Tensor
+            Base RAT spectrum of shape ``[3, W]`` to repeat.
+        cfg : dict
+            Configuration mapping providing at minimum ``N_TARGETS``,
+            ``TEST_BATCH_SIZE``, ``MAX_SEQ_LEN``, ``ROI_MIN``,
+            ``ROI_MAX``, ``FILL_OUTSIDE_ROI``, ``MISMATCH_FILL_ORDER``,
+            ``WAVELENGTHS``, ``NOISE``, and ``SMOOTH``.
+        msk_idx : int
+            Token index used to fill the placeholder stack sequences.
+
+        Returns
+        -------
+        RepeatedSpectrumDataset
+            The constructed dataset.
+        DataLoader
+            DataLoader wrapping the dataset with ``shuffle=False``.
+        """
+        n_targets = cfg["N_TARGETS"]
+        if n_targets <= 0:
+            print(f"N_TARGETS in the configuration was {n_targets}, using 1 instead")
+            n_targets = 1
+
+        dataset = RepeatedSpectrumDataset(spectrum, n_targets, cfg, msk_idx)
+
+        loader = DataLoader(
+            dataset, 
+            batch_size=min(n_targets, cfg["TEST_BATCH_SIZE"]), 
+            shuffle=False,
+            pin_memory=not torch.mps.is_available()
+        )
+        
+        return dataset, loader

@@ -4,9 +4,10 @@ from typing import Optional
 
 import torch
 
-from optollama.evaluation.metrics import masked_mae
-from optollama.evaluation.simulation import simulate_token_sequence, TMMContext
-from optollama.utils.utils import top_k_top_p_filtering
+import optollama.evaluation
+import optollama.model
+
+from optollama.evaluation.simulation import TMMContext
 
 # ruff: noqa: D102, D105, D107
 
@@ -561,12 +562,6 @@ class OptoLlama(torch.nn.Module):
 
         return predicted_stacks
 
-    def _top_k_top_p_filtering(
-        self, logits: torch.Tensor, top_k: int, top_p: float, filter_value: float = -float("inf")
-    ) -> torch.Tensor:
-        """Backward-compatible wrapper around :func:`utils.top_k_top_p_filtering`."""
-        return top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0), filter_value=filter_value)
-
     def enable_step_mae(self, tmm_ctx: Optional[TMMContext]) -> None:
         """
         Enable or disable per-step MAE tracking during sampling.
@@ -639,10 +634,15 @@ class OptoLlama(torch.nn.Module):
             logits = logits / temperature
 
         # apply top-k / top-p if requested
-        logits = top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0))
+        logits = optollama.model.sampling.top_k_top_p_filtering(
+            logits, 
+            top_k=int(top_k or 0), 
+            top_p=float(top_p or 0.0)
+        )
 
         probs = torch.softmax(logits, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0)
+
         return torch.multinomial(probs, num_samples=1)  # [B,1]
 
     def _sample(
@@ -728,14 +728,14 @@ class OptoLlama(torch.nn.Module):
             # ---- optional per-step MAE tracking ----
             if track_mae:
                 assert self._step_mae_ctx is not None
-                pred_spec = simulate_token_sequence(
+                pred_spec = optollama.evaluation.simulation.simulate_token_sequence(
                     stacks,
                     self._step_mae_ctx,
                     eos=self.eos,
                     pad=self.pad,
                     msk=self.mask,
                 )  # [B, 3, W]
-                step_mae = masked_mae(spectra, pred_spec)  # [B]
+                step_mae = optollama.evaluation.metrics.masked_mae(spectra, pred_spec)  # [B]
                 mae_per_step.append(step_mae)
 
         step_mae_traj: Optional[torch.Tensor]
