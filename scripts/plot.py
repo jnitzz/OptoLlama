@@ -1,10 +1,11 @@
-from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Mapping, Optional, Sequence, Union
 
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch  # if not already imported
+
 from optollama.evaluation.metrics import masked_mae_roi
 from optollama.utils.utils import save_as_json, wl_mask
 
@@ -35,8 +36,22 @@ MATERIAL_TO_INDEX = {m: i for i, m in enumerate(MATERIAL_ORDER)}
 SPECIAL_TOKENS = {"<PAD>", "<SOS>", "<EOS>", "<MSK>"}
 
 
-def token_to_layer(token: str) -> Optional[Tuple[str, float]]:
-    """Separate tokens to material and thickness values."""
+def token_to_layer(token: str) -> Optional[tuple[str, float]]:
+    """
+    Parse a token string into a ``(material, thickness)`` pair.
+
+    Args
+    ----
+    token : str
+        A token string such as ``"SiO2_120"`` or a special token like
+        ``"<EOS>"``.
+
+    Returns
+    -------
+    tuple[str, float] or None
+        A ``(material_name, thickness_nm)`` pair, or ``None`` if the token
+        is a special token or cannot be parsed.
+    """
     if token in SPECIAL_TOKENS or "_" not in token:
         return None
     mat, th = token.split("_", 1)
@@ -48,14 +63,28 @@ def token_to_layer(token: str) -> Optional[Tuple[str, float]]:
 
 def build_thickness_grid(
     token_seqs: Sequence[Sequence[str]],
-) -> Tuple[np.ndarray, float, float]:
+) -> tuple[np.ndarray, float, float]:
     """
-    Convert stacks into an absolute-thickness grid.
+    Convert token stacks into an absolute-thickness pixel grid.
 
-    X-axis represents physical thickness in nm (or your unit).
-    Resolution = pixels along the thickness axis.
+    The x-axis represents physical thickness in nm. Resolution equals the
+    integer-rounded maximum total thickness across all stacks. No
+    normalization is applied: stack lengths reflect real total thickness.
 
-    No normalization: stack lengths reflect real total thickness.
+    Args
+    ----
+    token_seqs : Sequence[Sequence[str]]
+        A sequence of token sequences (one per stack row).
+
+    Returns
+    -------
+    tuple[np.ndarray, float, float]
+        A 3-tuple of ``(grid, nm_per_pixel, max_total_nm)`` where:
+
+        - ``grid`` has shape ``[n_stacks, resolution]`` with material
+          indices (``-1`` for empty/air).
+        - ``nm_per_pixel`` is the physical thickness per pixel column.
+        - ``max_total_nm`` is the maximum total thickness across all stacks.
     """
     n = len(token_seqs)
 
@@ -97,18 +126,57 @@ def build_thickness_grid(
 
 def plot_samples_clean_NN(
     cfg: Any,
-    RAT_pred: Union[np.ndarray, torch.Tensor],  # [3, W] - model prediction
-    RAT_tar: Union[np.ndarray, torch.Tensor],  # [3, W] - target
+    RAT_pred: Union[np.ndarray, torch.Tensor],
+    RAT_tar: Union[np.ndarray, torch.Tensor],
     stack_pred: list[str],
     stack_tar: list[str],
     ACC: float,
     number: int,
-    RAT_nn: Union[np.ndarray, torch.Tensor],  # [3, W] - nearest neighbor spectrum
-    stack_nn: list[str],  # nearest neighbor stack
-    nn_global_id: int,  # global id of NN in train set
+    RAT_nn: Union[np.ndarray, torch.Tensor],
+    stack_nn: list[str],
+    nn_global_id: int,
     RAT_tar_mean: Union[torch.Tensor, None] = None,
 ) -> None:
-    """Plot target, template and model prediction, their residuals and stacks."""
+    """
+    Plot target, nearest-neighbour, and model prediction spectra with stacks.
+
+    Produces a three-panel figure:
+
+    1. **Spectra** — R, A, T curves for target, prediction, and NN.
+    2. **Residuals** — per-channel difference (prediction − target) and
+       (NN − target).
+    3. **Thickness-aware stack bars** — absolute-scale material bars for
+       target, prediction, and NN.
+
+    The figure is saved as a PDF and the underlying data as JSON and CSV.
+
+    Args
+    ----
+    cfg : Any
+        Configuration object with attributes ``WAVELENGTHS``, ``ROI_MIN``,
+        ``ROI_MAX``, ``RUN_NAME``, ``PATH_SAVED``, and ``TARGET``.
+    RAT_pred : np.ndarray or torch.Tensor
+        Model-predicted RAT spectrum, shape ``[3, W]``.
+    RAT_tar : np.ndarray or torch.Tensor
+        Target RAT spectrum, shape ``[3, W]``.
+    stack_pred : list[str]
+        Predicted token sequence (may include special tokens).
+    stack_tar : list[str]
+        Ground-truth token sequence (may include special tokens).
+    ACC : float
+        Token accuracy of the prediction.
+    number : int
+        Number of MC samples used.
+    RAT_nn : np.ndarray or torch.Tensor
+        Nearest-neighbour RAT spectrum, shape ``[3, W]``.
+    stack_nn : list[str]
+        Nearest-neighbour token sequence.
+    nn_global_id : int
+        Global index of the nearest neighbour in the training set.
+    RAT_tar_mean : torch.Tensor or None, optional
+        Optional mean target spectrum (e.g. from MC averaging), shape
+        ``[3, W]``.
+    """
     # --- to numpy ---------------------------------------------------------
     try:
         RAT_pred = RAT_pred.detach().cpu().numpy()
@@ -119,7 +187,7 @@ def plot_samples_clean_NN(
     except AttributeError:
         pass
 
-    def _strip(seq: Sequence[str]) -> List[str]:
+    def _strip(seq: Sequence[str]) -> list[str]:
         return [t for t in seq if t not in SPECIAL_TOKENS]
 
     stack_pred = _strip(stack_pred)
@@ -338,23 +406,21 @@ def plot_model_vs_nn_scatter(
     """
     Scatter plot comparing model MAE vs nearest-neighbor MAE.
 
-    Parameters
-    ----------
+    Args
+    ----
     val_results : list[dict]
-        Per-sample records from `validate_model`, each containing
-        at least:
-          - "dataset_index" : int
-          - "mae"           : float  (model vs target spectrum)
+        Per-sample records from ``validate_model``, each containing at least:
+
+        - ``"dataset_index"`` (int)
+        - ``"mae"`` (float): model vs target spectrum MAE.
     nn_matches : list[dict]
-        List loaded from your nearest-neighbors JSON, entries like:
-          {
-            "test_index": <int>,
-            "best_train_index": <int>,
-            "mae": <float>   # NN vs target spectrum
-          }
+        List loaded from the nearest-neighbors JSON, entries like
+        ``{"test_index": int, "best_train_index": int, "mae": float}``.
+    save_path : str
+        Directory where the output PDF, CSV, and JSON are written.
     max_points : int
-        Max number of points to plot (random subset if more).
-    title : str | None
+        Maximum number of points to plot (random subset if more).
+    title : str or None
         Optional custom plot title.
     """
     # Map: test_index -> NN MAE
@@ -439,13 +505,14 @@ def plot_mae_trajectory(
     """
     Plot MAE over denoising steps for a single example.
 
-    Parameters
-    ----------
+    Args
+    ----
     mae_traj : Sequence[float]
-        Per-step MAE, e.g. results[i]["mae_traj"] from validate_model.
+        Per-step MAE values, e.g. ``results[i]["mae_traj"]`` from
+        ``validate_model``.
     timesteps : Sequence[float], optional
-        Optional x-axis values. If None, uses step indices [0..T-1].
-        (You could pass the actual diffusion times if you want.)
+        Optional x-axis values. If ``None``, uses step indices
+        ``[0 .. T-1]``.
     title : str, optional
         Optional plot title.
     """
@@ -473,19 +540,33 @@ def build_thickness_grid_from_tokens(
     resolution: int = 400,
 ) -> np.ndarray:
     """
-    Convert stack to plottable thickness grid.
+    Convert token stacks into a fixed-resolution thickness grid.
 
-    [n_stacks, resolution], x proportional to *global* max thickness.
-    Unused (trailing) pixels stay -1 and will be shown as black.
+    The x-axis is proportional to the *global* maximum total thickness
+    across all stacks. Unused (trailing) pixels remain ``-1`` and are
+    rendered as black.
+
+    Args
+    ----
+    token_seqs : list[list[str]]
+        A list of token sequences (one per stack row).
+    resolution : int
+        Number of pixel columns in the output grid (default: ``400``).
+
+    Returns
+    -------
+    np.ndarray
+        Integer array of shape ``[n_stacks, resolution]`` containing
+        material indices (``-1`` for empty/air).
     """
     n_stacks = len(token_seqs)
     grid = np.full((n_stacks, resolution), -1, dtype=int)
 
     # first pass: parse layers and total thickness per stack
-    parsed_layers: list[list[tuple[str, float]]] = []
-    totals: list[float] = []
+    parsed_layers = []
+    totals = []
     for seq in token_seqs:
-        layers: list[tuple[str, float]] = []
+        layers = []
         for tok in seq:
             layer = token_to_layer(tok)
             if layer is not None:
@@ -525,22 +606,21 @@ def plot_mae_band(
     """
     Plot MAE trajectory uncertainty as a shaded band from multiple samples.
 
-    Parameters
-    ----------
+    Args
+    ----
     mae_trajs : Sequence[Sequence[float]]
-        List of trajectories. Each trajectory has shape [steps].
-        Example: [ result[i]["mae_traj"] for i in all samples ]
+        List of per-sample MAE trajectories, each of length ``steps``.
+        Example: ``[result[i]["mae_traj"] for i in range(N)]``.
+    save_path : str
+        Directory where the output JSON and CSV are written.
     mode : str
-        One of:
-            - "percentile" -> shaded 10th–90th percentile
-            - "minmax"     -> shaded min–max envelope
-            - "std"        -> shaded (mean ± std)
-    title : str, optional
-        Optional plot title.
+        Shading mode. One of:
 
-    Returns
-    -------
-    None (shows plot)
+        - ``"percentile"`` — shaded 10th–90th percentile band.
+        - ``"minmax"``     — shaded min–max envelope.
+        - ``"std"``        — shaded mean ± std band.
+    title : str or None, optional
+        Optional plot title.
     """
     # Convert list to array [N, steps]
     arr = np.asarray(mae_trajs, dtype=float)

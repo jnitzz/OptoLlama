@@ -1,43 +1,57 @@
+#!/usr/bin/env python
+
 import argparse
-import sys
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import tqdm
-from optollama.dataloader.dataset import SpectraDataset
+from optollama.data.dataset import SpectraDataset
 from optollama.evaluation.metrics import masked_mae_roi
 from safetensors.torch import load_file
-from optollama.utils.utils import ensure_3w, save_as_json
+from optollama.data.spectra import ensure_3w
+from optollama.utils.utils import save_as_json
 
 
 def load_train_sample_by_global_id(
     global_id: int,
-    train_paths: Union[List[str], str],
-) -> Tuple[torch.Tensor, torch.Tensor, str, int]:
+    train_paths: Union[list[str], str],
+) -> tuple[torch.Tensor, torch.Tensor, str, int]:
     """
-    Load a single training sample by its GLOBAL index across all shards.
+    Load a single training sample by its global index across all shards.
 
-    Parameters
-    ----------
+    Args
+    ----
     global_id : int
         Global position of the sample in the sorted training set.
-    train_paths : list[str] | str
-        Directory/directories or .safetensors files containing the train shards.
+    train_paths : list[str] or str
+        Directory/directories or ``.safetensors`` files containing the
+        training shards.
 
     Returns
     -------
-    sample : torch.Tensor [3, W]
-    sample_thin_films : torch.Tensor  # [S] token ids / stack
-    file_path : str                 # shard file it comes from
-    local_idx : int                 # index inside the shard
+    tuple[torch.Tensor, torch.Tensor, str, int]
+        A 4-tuple of ``(spectrum, thin_films, file_path, local_idx)`` where:
+
+        - ``spectrum`` has shape ``[3, W]``.
+        - ``thin_films`` contains token ids for the stack.
+        - ``file_path`` is the path to the shard file.
+        - ``local_idx`` is the index inside that shard.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no ``.safetensors`` files are found.
+    IndexError
+        If ``global_id`` exceeds the total dataset size.
     """
     # --- normalize to list ---
     if isinstance(train_paths, str):
         train_paths = [train_paths]
 
     # --- collect safetensors files ---
-    files: list[Path] = []
+    files = []
     for p in map(Path, train_paths):
         if p.is_dir():
             files.extend(sorted(fp for fp in p.glob("*.safetensors")))
@@ -50,7 +64,7 @@ def load_train_sample_by_global_id(
         raise FileNotFoundError("No .safetensors files found")
 
     # --- same sort logic as dataset ---
-    def shard_sort_key(path: Path) -> Tuple[str, Union[int, float]]:
+    def shard_sort_key(path: Path) -> tuple[str, Union[int, float]]:
         import re
 
         m = re.match(r"^(.*?)(\d+)$", path.stem.lower())
@@ -83,30 +97,50 @@ def load_train_sample_by_global_id(
 
 @torch.no_grad()
 def find_best_train_for_target(
-    target_spec: torch.Tensor,  # [3,W] or [1,3,W] or [W,3]
-    train_paths: Union[List[str], str],  # dir(s) or .safetensors file(s)
-    *,
+    target_spec: torch.Tensor,
+    train_paths: Union[list[str], str],
     train_chunk_size: int = 1024,
     device: Optional[Union[str, torch.device]] = None,
     wl_range: Optional[torch.Tensor] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
-    Find closest training sample for a given target via masked MAE.
+    Find the closest training sample to a target spectrum via masked MAE.
 
-    Given a single target spectrum [3,W], stream over the training shards
-    (one .safetensors file at a time) and find the closest training sample
-    by masked MAE.
+    Streams over training shards one ``.safetensors`` file at a time so the
+    full training set is never held in memory simultaneously.
 
-    It never holds the whole train set in memory at once.
+    Args
+    ----
+    target_spec : torch.Tensor
+        Target spectrum of shape ``[3, W]``, ``[1, 3, W]``, or ``[W, 3]``.
+    train_paths : list[str] or str
+        Directory/directories or ``.safetensors`` file(s) containing the
+        training shards.
+    train_chunk_size : int
+        Number of training samples to process per device batch (default:
+        ``1024``).
+    device : str or torch.device, optional
+        Computation device. Defaults to CUDA if available, else CPU.
+    wl_range : torch.Tensor, optional
+        Boolean wavelength mask of shape ``[W]`` restricting the MAE
+        computation to a region of interest.
 
     Returns
     -------
-    {
-        "best_mae": float,
-        "best_global_index": int,       # index in concatenated train set
-        "best_file": str,               # path to safetensors file
-        "best_index_in_file": int,      # index inside that file
-    }
+    dict[str, Any]
+        Dictionary with keys:
+
+        - ``"best_mae"`` (float): minimum MAE found.
+        - ``"best_global_index"`` (int): index in the concatenated train set.
+        - ``"best_file"`` (str): path to the shard file.
+        - ``"best_index_in_file"`` (int): index inside that shard.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no ``.safetensors`` files are found.
+    RuntimeError
+        If no training spectra were processed.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -129,7 +163,7 @@ def find_best_train_for_target(
     if isinstance(train_paths, str):
         train_paths = [train_paths]
 
-    files: list[Path] = []
+    files = []
     for p in map(Path, train_paths):
         if p.is_dir():
             files.extend(sorted(fp for fp in p.glob("*.safetensors")))
@@ -141,8 +175,8 @@ def find_best_train_for_target(
     if not files:
         raise FileNotFoundError("No .safetensors files found in the provided train paths.")
 
-    # mimic the same sort logic as SpectraDataset for consistent indices :contentReference[oaicite:6]{index=6}
-    def shard_sort_key(path: Path) -> Tuple[str, Union[int, float]]:
+    # mimic the same sort logic as SpectraDataset for consistent indices
+    def shard_sort_key(path: Path) -> tuple[str, Union[int, float]]:
         import re
 
         m = re.match(r"^(.*?)(\d+)$", path.stem.lower())
@@ -155,7 +189,7 @@ def find_best_train_for_target(
 
     best_mae_val = float("inf")
     best_global_idx = -1
-    best_file: Optional[str] = None
+    best_file = None
     best_idx_in_file = -1
 
     global_offset = 0  # how many samples we've seen so far
@@ -212,37 +246,35 @@ def find_best_train_for_target(
 def find_nearest_neighbors(
     train_ds: SpectraDataset,
     test_ds: SpectraDataset,
-    *,
     train_chunk_size: int = 1024,
     device: Optional[Union[str, torch.device]] = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     For each test spectrum, find the closest training spectrum by MAE.
 
-    Distance metric:
-        - Mean Absolute Error on the spectra (R/A/T over wavelength).
-        - Uses `metrics.masked_mae_roi` for robustness.
+    Uses :func:`~optollama.evaluation.metrics.masked_mae_roi` as the
+    distance metric (mean absolute error over R/A/T channels).
 
-    Parameters
-    ----------
+    Args
+    ----
     train_ds : SpectraDataset
-        Dataset containing training spectra (train_ds.spectra: [N_train, 3, W]).
+        Dataset containing training spectra of shape ``[N_train, 3, W]``.
     test_ds : SpectraDataset
-        Dataset containing test spectra (test_ds.spectra: [N_test, 3, W]).
-    train_chunk_size : int, optional
-        Number of training samples to process at once on the device,
-        to avoid running out of memory. Default: 1024.
+        Dataset containing test spectra of shape ``[N_test, 3, W]``.
+    train_chunk_size : int
+        Number of training samples to process per device batch to avoid
+        out-of-memory errors (default: ``1024``).
     device : str or torch.device, optional
-        Device used for computation. If None, chooses CUDA if available,
-        else CPU.
+        Computation device. Defaults to CUDA if available, else CPU.
 
     Returns
     -------
-    List[Dict[str, Any]]
+    list[dict[str, Any]]
         One dict per test sample with keys:
-            - "test_index": index in the test dataset
-            - "best_train_index": index in the training dataset
-            - "mae": minimal MAE value
+
+        - ``"test_index"`` (int): index in the test dataset.
+        - ``"best_train_index"`` (int): index in the training dataset.
+        - ``"mae"`` (float): minimum MAE value.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -254,7 +286,7 @@ def find_nearest_neighbors(
     n_train = train_spectra.size(0)
     n_test = test_spectra.size(0)
 
-    results: List[Dict[str, Any]] = []
+    results = []
 
     # Loop over test points
     for test_idx in tqdm.tqdm(range(n_test), desc="Matching test → train"):
@@ -296,16 +328,20 @@ def find_nearest_neighbors(
 
 def parse_args() -> argparse.Namespace:
     """
-    Parse CLI arguments.
+    Parse CLI arguments for the match-test-to-train script.
 
-    CLI arguments:
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments with attributes:
 
-        --train PATH ...   one or more folders/files with training .safetensors
-        --test PATH ...    one or more folders/files with test .safetensors
-        --out_dir PATH     directory where JSON will be written
-        --name NAME        base filename (default: nearest_neighbors)
-        --chunk_size N     training chunk size for distance computation
-        --device DEV       e.g. "cuda", "cuda:0", or "cpu"
+        - ``train`` — one or more folders/files with training
+          ``.safetensors``.
+        - ``test`` — one or more folders/files with test ``.safetensors``.
+        - ``out_dir`` — directory where the JSON result will be written.
+        - ``name`` — base filename (default: ``"nearest_neighbors"``).
+        - ``chunk_size`` — training chunk size for distance computation.
+        - ``device`` — e.g. ``"cuda"``, ``"cuda:0"``, or ``"cpu"``.
     """
     p = argparse.ArgumentParser(description="Match test spectra to nearest training spectra (by MAE).")
     p.add_argument(
@@ -348,7 +384,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run main function."""
+    """
+    Entry point for the match-test-to-train CLI script.
+
+    Loads training and test datasets, computes nearest-neighbour matches by
+    MAE, and saves the result as a JSON file.
+    """
     args = parse_args()
 
     # SpectraDataset already knows how to handle:
@@ -377,23 +418,13 @@ def main() -> None:
     )
 
     # Save mapping as JSON using the project helper
-    save_as_json(args.out_dir, results, name=args.name)
-    print(f"Saved {len(results)} test→train mappings to '{args.out_dir}/{args.name}.json'")
+    out_path = os.path.join(args.out_dir, args.name + ".json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    save_as_json(out_path, results)
+    print(f"Saved {len(results)} test→train mappings to '{out_path}'")
 
 
 if __name__ == "__main__":
-    if "--train" not in sys.argv:
-        sys.argv.extend(["--train", "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/dtrain"])
-    if "--test" not in sys.argv:
-        sys.argv.extend(["--test", "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors/dtest"])
-    if "--out_dir" not in sys.argv:
-        sys.argv.extend(["--out_dir", "D:/Profile/a3536/Eigene Dateien/Github/OptoLlama/data/TF_safetensors"])
-    if "--device" not in sys.argv:
-        sys.argv.extend(["--device", "cuda"])
-    if "--name" not in sys.argv:
-        sys.argv.extend(["--name", "test_to_train_nn"])
-    if "--chunk_size" not in sys.argv:
-        sys.argv.extend(["--chunk_size", "10240"])
     main()
 
 # python match_test_to_train.py \

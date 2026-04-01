@@ -1,12 +1,13 @@
 import copy
 import math
-from typing import Optional, Tuple, Union
+
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
 
-from optollama.utils.utils import top_k_top_p_filtering
+import optollama.model.sampling
 
 # ruff: noqa: D101, D102, D103, N801
 # mypy: disable-error-code=no-untyped-def
@@ -15,7 +16,22 @@ from optollama.utils.utils import top_k_top_p_filtering
 # ===== Original building blocks (unchanged) =====
 # code from https://github.com/taigaoma1997/optogpt/blob/cdedef9526bba02c58fa73181802dc7138fa3900/optogpt/core/models/transformer.py#L26
 # (optogpt/core/models/transformer.py)
-def clones(module, n):
+def clones(module: nn.Module, n: int) -> nn.ModuleList:
+    """
+    Produce ``n`` identical copies of ``module`` as a ``ModuleList``.
+
+    Args
+    ----
+    module : torch.nn.Module
+        The module to clone.
+    n : int
+        Number of copies to produce.
+
+    Returns
+    -------
+    torch.nn.ModuleList
+        A ``ModuleList`` containing ``n`` deep copies of ``module``.
+    """
     return nn.ModuleList([copy.deepcopy(module) for _ in range(n)])
 
 
@@ -47,7 +63,37 @@ class PositionalEncoding_Tf(nn.Module):
         return self.dropout(x)
 
 
-def attention(query, key, value, mask=None, dropout=None):
+def attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    dropout: Optional[nn.Dropout] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute scaled dot-product attention.
+
+    Args
+    ----
+    query : torch.Tensor
+        Query tensor of shape ``[B, H, L_q, d_k]``.
+    key : torch.Tensor
+        Key tensor of shape ``[B, H, L_k, d_k]``.
+    value : torch.Tensor
+        Value tensor of shape ``[B, H, L_k, d_v]``.
+    mask : torch.Tensor, optional
+        Attention mask; positions where ``mask == 0`` are set to ``-1e9``
+        before softmax.
+    dropout : torch.nn.Dropout, optional
+        Dropout applied to the attention weights.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        A 2-tuple of ``(output, attention_weights)`` where ``output`` has
+        shape ``[B, H, L_q, d_v]`` and ``attention_weights`` has shape
+        ``[B, H, L_q, L_k]``.
+    """
     d_k = query.size(-1)
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
@@ -159,46 +205,63 @@ def _filter_logits_topk_topp(
     filter_value: float = -float("inf"),
 ) -> torch.Tensor:
     """Backward-compatible wrapper around :func:`utils.top_k_top_p_filtering`."""
-    return top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0), filter_value=filter_value)
+    return optollama.model.sampling.top_k_top_p_filtering(
+        logits, 
+        top_k=int(top_k or 0), 
+        top_p=float(top_p or 0.0), 
+        filter_value=filter_value
+    )
 
 
 def _subsequent_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     """
-    Create an autoregressive (causal) mask for a sequence of length `seq_len`.
+    Create an autoregressive (causal) mask for a sequence of length ``seq_len``.
 
     The mask allows each position to attend to itself and all previous
     positions, but not to any future positions.
 
-    Args:
-        sz: Target sequence length.
-        device: Device on which to allocate the mask.
+    Args
+    ----
+    seq_len : int
+        Target sequence length.
+    device : torch.device
+        Device on which to allocate the mask.
 
     Returns
     -------
-        Boolean tensor of shape [1, seq_len, seq_len] where True indicates allowed
-        attention positions.
+    torch.Tensor
+        Boolean tensor of shape ``[1, seq_len, seq_len]`` where ``True``
+        indicates allowed attention positions.
     """
-    return torch.triu(torch.ones(1, seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1) == 0
+    return torch.triu(
+        torch.ones(1, seq_len, seq_len, device=device, dtype=torch.bool), 
+        diagonal=1
+    ) == 0
 
 
 def _flatten_spectra(spectra: torch.Tensor) -> torch.Tensor:
     """
-    Flatten spectra into a 2D [B, D] representation for the MLP encoder.
+    Flatten spectra into a 2D ``[B, D]`` representation for the MLP encoder.
 
     Supports either:
-      • [B, 3, W]  → flattened to [B, 3*W]
-      • [B, D]     → returned unchanged
 
-    Args:
-        spectra: Input spectra tensor.
+    - ``[B, 3, W]`` → flattened to ``[B, 3*W]``
+    - ``[B, D]``    → returned unchanged
+
+    Args
+    ----
+    spectra : torch.Tensor
+        Input spectra tensor of shape ``[B, 3, W]`` or ``[B, D]``.
 
     Returns
     -------
-        Flattened spectra tensor of shape [B, D].
+    torch.Tensor
+        Flattened spectra tensor of shape ``[B, D]``.
 
     Raises
     ------
-        ValueError: If the input rank/shape is not supported.
+    ValueError
+        If the input rank or shape is not supported.
     """
     # [B,W,3] -> [B,3W]
     if spectra.dim() == 3 and spectra.size(1) == 3:
@@ -206,6 +269,7 @@ def _flatten_spectra(spectra: torch.Tensor) -> torch.Tensor:
         return spectra.reshape(b, c * w)
     elif spectra.dim() == 2:
         return spectra
+    
     raise ValueError(f"Unexpected spectra shape {tuple(spectra.shape)}")
 
 
@@ -224,7 +288,6 @@ class OriginalDecoderWrapper(nn.Module):
 
     def __init__(
         self,
-        *,
         vocab_size: int,
         d_model: int,
         n_layers: int,
@@ -243,21 +306,36 @@ class OriginalDecoderWrapper(nn.Module):
         """
         Initialize the wrapped OptoGPT-style decoder.
 
-        Args:
-            vocab_size: Size of the token vocabulary.
-            d_model: Transformer hidden size.
-            n_layers: Number of decoder layers.
-            n_heads: Number of attention heads.
-            d_ff: Width of the feed-forward sublayers.
-            dropout: Dropout probability.
-            max_len: Maximum number of generated tokens in a sequence.
-            mask_idx: Index of the special <MASK> token.
-            pad_idx: Index of the <PAD> token.
-            eos_idx: Index of the <EOS> token.
-            spectrum_flat_dim: Flattened spectral feature dimension (input to fc).
-            temperature: Sampling temperature (0.0 = deterministic).
-            top_k: Top-k sampling cutoff.
-            top_p: Top-p (nucleus) sampling cutoff.
+        Args
+        ----
+        vocab_size : int
+            Size of the token vocabulary.
+        d_model : int
+            Transformer hidden size.
+        n_layers : int
+            Number of decoder layers.
+        n_heads : int
+            Number of attention heads.
+        d_ff : int
+            Width of the feed-forward sublayers.
+        dropout : float
+            Dropout probability.
+        max_len : int
+            Maximum number of generated tokens in a sequence.
+        mask_idx : int
+            Index of the special ``<MASK>`` token.
+        pad_idx : int
+            Index of the ``<PAD>`` token.
+        eos_idx : int
+            Index of the ``<EOS>`` token.
+        spectrum_flat_dim : int
+            Flattened spectral feature dimension (input to ``fc``).
+        temperature : float
+            Sampling temperature (``0.0`` = deterministic).
+        top_k : int
+            Top-k sampling cutoff.
+        top_p : float
+            Top-p (nucleus) sampling cutoff.
         """
         super().__init__()
         self.vocab = vocab_size
@@ -285,13 +363,17 @@ class OriginalDecoderWrapper(nn.Module):
         """
         Run the decoder stack and return raw logits for target tokens.
 
-        Args:
-            memory: Encoded spectrum features, shape [B, 1, D].
-            tgt_tokens: Target token ids, shape [B, S].
+        Args
+        ----
+        memory : torch.Tensor
+            Encoded spectrum features, shape ``[B, 1, D]``.
+        tgt_tokens : torch.Tensor
+            Target token ids, shape ``[B, S]``.
 
         Returns
         -------
-            Logits over the vocabulary, shape [B, S, V].
+        torch.Tensor
+            Logits over the vocabulary, shape ``[B, S, V]``.
         """
         # memory: [B,1,D], tgt_tokens: [B,S]
         x = self.tgt_embed(tgt_tokens)
@@ -301,23 +383,26 @@ class OriginalDecoderWrapper(nn.Module):
 
     def forward(
         self, spectra: torch.Tensor, stacks: torch.Tensor = None
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """
         Forward pass in either teacher-forcing or autoregressive mode.
 
-        Args:
-            spectra: Conditioning spectra, shape [B, 3, W] or [B, D_flat].
-            stacks: Optional ground-truth token stacks, shape [B, S].
-                If provided, teacher forcing is used and logits for the full
-                sequence are returned. If None, tokens are generated step by
-                step until `max_len`.
+        Args
+        ----
+        spectra : torch.Tensor
+            Conditioning spectra, shape ``[B, 3, W]`` or ``[B, D_flat]``.
+        stacks : torch.Tensor, optional
+            Ground-truth token stacks, shape ``[B, S]``. If provided,
+            teacher forcing is used and logits for the full sequence are
+            returned. If ``None``, tokens are generated step by step until
+            ``max_len``.
 
         Returns
         -------
-            If `stacks` is not None:
-                Logits of shape [B, S, V].
-            If `stacks` is None:
-                A tuple (logits, None), where logits has shape [B, max_len, V].
+        torch.Tensor or tuple[torch.Tensor, None]
+            If ``stacks`` is not ``None``: logits of shape ``[B, S, V]``.
+            If ``stacks`` is ``None``: a tuple ``(logits, None)`` where
+            ``logits`` has shape ``[B, max_len, V]``.
         """
         # 1) spectrum -> flatten -> fc -> memory [B,1,D]
         src_vec = _flatten_spectra(spectra)
