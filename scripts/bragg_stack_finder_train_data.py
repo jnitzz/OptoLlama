@@ -1,14 +1,14 @@
 import os
 from safetensors import safe_open
-from optollama.utils.utils import init_tokenmaps
-from optollama.utils.bragg_stack_finder import parse_tokens, detect_Bragg, detect_Bragg_continued, detect_Bragg_only_length_3
+from optollama.data.token import init_tokens
+from optollama.data.bragg_stack_finder import parse_tokens, detect_Bragg, detect_Bragg_continued, detect_Bragg_only_length_3
 
 
 def find_Bragg_stacks_in_train_data(total_Bragg_count, includes_Bragg, index, option, count_dict):
 
     data_path = "./data/TF_safetensors/"
     file_path = os.path.join(data_path, f"train-{index}.safetensors")
-    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = init_tokenmaps(data_path)
+    tokens, token_to_idx, idx_to_token, EOS_TOKEN, PAD_TOKEN, MSK_TOKEN, eos_idx, pad_idx, msk_idx = init_tokens(os.path.join(data_path, f"tokens.json"))
 
     with safe_open(file_path, framework="pt") as f:
         print("Keys:", f.keys())
