@@ -36,24 +36,22 @@ def init_distributed() -> tuple[str, int, int, int]:
 
     if dist.is_available() and not dist.is_initialized() and world_size > 1:
         ddp = True
-        slurm_addr = os.environ.get("SLURM_LAUNCH_NODE_IPADDR", "127.0.0.1")
+        slurm_addr = os.environ["SLURM_JOB_NODELIST"]
         os.environ["MASTER_ADDR"] = slurm_addr
-        os.environ["MASTER_PORT"] = "29500"
-        
+        os.environ["MASTER_PORT"] = "12345"
+
         dist.init_process_group(
             backend=backend,
             rank=rank,
             world_size=world_size,
             device_id=device,
-            init_method="env://",
         )
 
-    if rank == 0:
-        print(
-            f"[DDP={ddp}] backend={backend} world={world_size} rank={rank} "
-            f"local_rank={local_rank} "
-            f"device={device}"
-        )
+    print(
+        f"[DDP={ddp}] backend={backend} world={world_size} rank={rank} "
+        f"local_rank={local_rank} "
+        f"device={device}"
+    )
 
     return device, local_rank, rank, world_size
 

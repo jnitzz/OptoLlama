@@ -30,7 +30,7 @@ class SpectraDataset(torch.utils.data.Dataset):
 
         spectra_list, stacks_list = [], []
         for fp in paths:
-            data = safetensors.torch.load_file(fp)
+            data = safetensors.torch.load_file(fp, device="cpu")
             spectra_list.append(data["spectra"].to(torch.float32))
             stacks_list.append(data["thin_films"].long())
 
