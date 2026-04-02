@@ -37,7 +37,7 @@ Alternatively, you can install ``OptoLlama`` locally. To achieve this, there are
 If you want to contribute to Propulate as a developer, you need to install the required dependencies with the package.
 
 ```bash
-pip install -e ."[dev]"
+pip install -e ".[dev]"
 ```
   
 ## Data and model checkpoints
