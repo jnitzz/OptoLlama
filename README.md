@@ -59,8 +59,8 @@ You can also download the data and trained model using provided CLI scripts as f
 ```bash
 git clone git@github.com:jnitzz/OptoLlama.git
 cd OptoLlama
-./scripts/download_data --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
-./scripts/download_checkpoint --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
+python ./scripts/download_data.py --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
+python ./scripts/download_checkpoint.py --dest <YOUR_DESTINATION_PATH> --token <YOUR_HUGGINGFACE_API_TOKEN>
 ```
 
 ## How to contribute
