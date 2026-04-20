@@ -14,14 +14,21 @@ def parse_arguments() -> argparse.Namespace:
         The CLI arguments as a Namespace.
     """
     p = argparse.ArgumentParser()
-    
+
     p.add_argument(
         "--config",
         type=str,
         default="configs/optollama.yaml",
         help=("Path to YAML config file (.yaml/.yml), e.g. configs/config_optollama.yaml"),
     )
-    
+
+    p.add_argument(
+        "--results",
+        type=str,
+        default=None,
+        help=("Path to the results file (JSON format)"),
+    )
+
     return p.parse_args()
 
 
@@ -38,7 +45,7 @@ def load_config_file(path: str) -> dict:
         The configuration as a dictionary.
     """
     cfg = omegaconf.OmegaConf.load(path)
-    
+
     return omegaconf.OmegaConf.to_container(cfg, resolve=True)
 
 
@@ -60,7 +67,7 @@ def load_config(args: argparse.Namespace) -> dict:
     wl_min = int(cfg["WAVELENGTH_MIN"])
     wl_max = int(cfg["WAVELENGTH_MAX"])
     wl_step = int(cfg["WAVELENGTH_STEPS"])
-    
+
     cfg["WAVELENGTHS"] = torch.arange(wl_min, wl_max + 1, wl_step, dtype=torch.int)
 
     return cfg

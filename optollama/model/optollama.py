@@ -623,11 +623,7 @@ class OptoLlama(torch.nn.Module):
         temperature = getattr(self, "temperature", 0.0)
 
         # Greedy fallback: fully deterministic DiT decoding when all sampling knobs are "off"
-        if (
-            (temperature is None or temperature <= 0.0)
-            and (not top_k_val or top_k_val <= 0)
-            and (not top_p_val or top_p_val <= 0.0)
-        ):
+        if (temperature is None or temperature <= 0.0) and (not top_k or top_k <= 0) and (not top_p or top_p <= 0.0):
             return logits.argmax(dim=-1, keepdim=True)  # [B,1]
 
         # Stochastic path

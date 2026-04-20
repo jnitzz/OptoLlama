@@ -181,52 +181,49 @@ def run_mc_batch(
           ``record_all_mc=False``).
     """
     b = spectra.size(0)
+    m = max(1, mc_samples)
 
-    best_mae = torch.full((b,), float("inf"), device=device)
-    best_pred_spectra: Optional[torch.Tensor] = None
-    best_pred_ids: Optional[torch.Tensor] = None
-    best_step_mae_traj: Optional[torch.Tensor] = None
+    # Expand MC draws into the batch dimension so sampling and optional TMM
+    # simulation run in one vectorized pass.
+    spectra_mc = spectra.unsqueeze(1).expand(b, m, *spectra.shape[1:]).reshape(b * m, *spectra.shape[1:])
+    logits_or_ids, mae_traj_s = model(spectra_mc)
+    ids_flat = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
+    ids = ids_flat.view(b, m, -1)
+
+    if do_sim:
+        pred_flat = optollama.evaluation.simulation.simulate_token_sequence(ids_flat, tmm_ctx, eos=eos, pad=pad, msk=msk)
+        mae_flat = optollama.evaluation.metrics.masked_mae_roi(spectra_mc, pred_flat, wl_mask=roi_mask)
+        pred = pred_flat.view(b, m, *pred_flat.shape[1:])
+        mae = mae_flat.view(b, m)
+    else:
+        pred = None
+        mae = torch.zeros((b, m), device=device)
+
+    traj = None
+    if mae_traj_s is not None:
+        traj = mae_traj_s.view(b, m, -1)
 
     draws = {"mae": [], "ids": [], "pred_spectra": [], "traj": []}
-
-    for _ in range(max(1, mc_samples)):
-        logits_or_ids, mae_traj_s = model(spectra)
-        ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
-
-        if do_sim:
-            pred = optollama.evaluation.simulation.simulate_token_sequence(ids, tmm_ctx, eos=eos, pad=pad, msk=msk)
-            mae_s = optollama.evaluation.metrics.masked_mae_roi(spectra, pred, wl_mask=roi_mask)
-        else:
-            pred = None
-            mae_s = torch.zeros(b, device=device)
-
-        if record_all_mc:
-            draws["mae"].append(mae_s.detach().cpu())
-            draws["ids"].append(ids.detach().cpu())
+    if record_all_mc:
+        for sample_idx in range(m):
+            draws["mae"].append(mae[:, sample_idx].detach().cpu())
+            draws["ids"].append(ids[:, sample_idx].detach().cpu())
             if do_sim and record_pred_spectra and pred is not None:
-                draws["pred_spectra"].append(pred.detach().cpu())
-            if mae_traj_s is not None:
-                draws["traj"].append(mae_traj_s.detach().cpu())
+                draws["pred_spectra"].append(pred[:, sample_idx].detach().cpu())
+            if traj is not None:
+                draws["traj"].append(traj[:, sample_idx].detach().cpu())
 
-        # Update best-of-N
-        take = mae_s < best_mae
-        best_mae = torch.where(take, mae_s, best_mae)
+    if do_sim:
+        best_indices = mae.argmin(dim=1)
+    else:
+        # In NO_SIM mode all MAEs are zero, so pick the final MC draw.
+        best_indices = torch.full((b,), m - 1, device=device, dtype=torch.long)
 
-        if best_pred_ids is None:
-            best_pred_ids = ids
-            best_pred_spectra = pred
-        else:
-            best_pred_ids = torch.where(take.view(b, 1), ids, best_pred_ids)
-            if pred is not None and best_pred_spectra is not None:
-                best_pred_spectra = torch.where(take.view(b, 1, 1), pred, best_pred_spectra)
-
-        if mae_traj_s is not None:
-            if best_step_mae_traj is None:
-                best_step_mae_traj = mae_traj_s
-            else:
-                best_step_mae_traj = torch.where(
-                    take.view(b, 1), mae_traj_s, best_step_mae_traj
-                )
+    batch_indices = torch.arange(b, device=device)
+    best_mae = mae[batch_indices, best_indices]
+    best_pred_ids = ids[batch_indices, best_indices]
+    best_pred_spectra = pred[batch_indices, best_indices] if pred is not None else None
+    best_step_mae_traj = traj[batch_indices, best_indices] if traj is not None else None
 
     best = {
         "mae": best_mae,
@@ -416,6 +413,50 @@ def gather_ddp_results(results: list, world_size: int, rank: int) -> list:
     return results
 
 
+def reduce_ddp_metric_sums(
+    total_correct: float,
+    total_tokens: float,
+    total_mae: float,
+    total_mae_examples: float,
+    ddp: bool,
+    device: torch.device,
+) -> tuple[float, float, float, float]:
+    """
+    Reduce metric numerators and denominators across DDP ranks.
+
+    Args
+    ----
+    total_correct : float
+        Local number of correct valid tokens.
+    total_tokens : float
+        Local number of valid tokens.
+    total_mae : float
+        Local sum of per-example MAE values.
+    total_mae_examples : float
+        Local number of examples contributing to MAE.
+    ddp : bool
+        Whether DistributedDataParallel is active.
+    device : torch.device
+        Device on which to allocate the reduction tensor.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        Globally reduced metric sums.
+    """
+    if not ddp:
+        return total_correct, total_tokens, total_mae, total_mae_examples
+
+    totals = torch.tensor(
+        [total_correct, total_tokens, total_mae, total_mae_examples],
+        device=device,
+        dtype=torch.float64,
+    )
+    torch.distributed.all_reduce(totals)
+
+    return tuple(float(v.item()) for v in totals)
+
+
 def assemble_mc_grids(
     all_mc_mae: list,
     all_mc_ids: list,
@@ -563,8 +604,9 @@ def model_prediction(
         mode, tmm_ctx, track_step_mae, model, ddp, rank, gather, record_all_mc
     )
 
-    all_mc_mae, all_mc_ids, all_mc_pred, all_mc_traj, results = [], [], [], [] , []
-    sum_acc, sum_mae, n_batches, running_idx = 0.0, 0.0, 0, 0
+    all_mc_mae, all_mc_ids, all_mc_pred, all_mc_traj, results = [], [], [], [], []
+    total_correct, total_tokens = 0.0, 0.0
+    total_mae, total_mae_examples, running_idx = 0.0, 0.0, 0
 
     for batch in loader:
         spectra, stacks, idxs, running_idx = unpack_batch(batch, running_idx, device)
@@ -585,13 +627,16 @@ def model_prediction(
         stacks_aligned = stacks[:, :len_seq]
         ids_aligned = best["ids"][:, :len_seq]
 
+        correct_count, total_count, _, _ = optollama.evaluation.metrics.token_accuracy_counts(
+            stacks_aligned, ids_aligned, eos, pad, msk
+        )
         acc_g, acc_vec = optollama.evaluation.metrics.token_accuracy(stacks_aligned, ids_aligned, eos, pad, msk)
-        sum_acc += float(acc_g)
+        total_correct += float(correct_count.item())
+        total_tokens += float(total_count.item())
         if do_sim and best["pred_spectra"] is not None:
-            sum_mae += float(
-                optollama.evaluation.metrics.masked_mae_roi(spectra, best["pred_spectra"], wl_mask=roi_mask).mean().item()
-            )
-        n_batches += 1
+            mae_vec = optollama.evaluation.metrics.masked_mae_roi(spectra, best["pred_spectra"], wl_mask=roi_mask)
+            total_mae += float(mae_vec.sum().item())
+            total_mae_examples += float(mae_vec.numel())
 
         for i in range(b):
             results.append(build_example_record(
@@ -603,9 +648,18 @@ def model_prediction(
     if gather and ddp:
         results = gather_ddp_results(results, world_size, rank)
 
+    total_correct, total_tokens, total_mae, total_mae_examples = reduce_ddp_metric_sums(
+        total_correct,
+        total_tokens,
+        total_mae,
+        total_mae_examples,
+        ddp,
+        device,
+    )
+
     out: dict[str, Any] = {
-        "mean_acc": sum_acc / max(n_batches, 1),
-        "mean_mae": (sum_mae / max(n_batches, 1)) if do_sim else None,
+        "mean_acc": total_correct / max(total_tokens, 1.0),
+        "mean_mae": (total_mae / max(total_mae_examples, 1.0)) if do_sim else None,
     }
     if not ddp or rank == 0:
         out["results"] = results

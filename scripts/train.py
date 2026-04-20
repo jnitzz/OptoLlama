@@ -123,6 +123,10 @@ def train(cfg: dict) -> None:
     # ------------------------------ epochs ------------------------------
     epochs = cfg["EPOCHS"]
     for epoch in range(start_epoch, epochs):
+        epoch_loss_sum = 0.0
+        epoch_correct = 0.0
+        epoch_tokens = 0.0
+
         # DDP epoch seeds
         if ddp:
             train_loader.sampler.set_epoch(epoch)
@@ -155,21 +159,33 @@ def train(cfg: dict) -> None:
                     torch.distributed.all_reduce(total_loss)
                     total_loss /= world_size
 
-                train_losses[epoch] += total_loss.item()
+                epoch_loss_sum += total_loss.item()
 
-                acc, _ = optollama.evaluation.token_accuracy(
+                correct_count, total_count, _, _ = optollama.evaluation.token_accuracy_counts(
                     stacks, 
                     logits.argmax(dim=-1), 
                     eos_idx, 
                     pad_idx, 
                     msk_idx
                 )
-                train_acc[epoch] = acc
+                batch_totals = torch.tensor(
+                    [float(correct_count.item()), float(total_count.item())],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                if ddp:
+                    torch.distributed.all_reduce(batch_totals)
+
+                epoch_correct += float(batch_totals[0].item())
+                epoch_tokens += float(batch_totals[1].item())
+
+                train_losses[epoch] = epoch_loss_sum / (i + 1)
+                train_acc[epoch] = epoch_correct / max(epoch_tokens, 1.0)
 
             if rank == 0:
                 pbar.set_postfix(
-                    loss_CE=f"{train_losses[epoch] / (i + 1):.4f}",
-                    acc=f"{train_acc[epoch] / (i + 1) * 100:.4f}%",
+                    loss_CE=f"{train_losses[epoch]:.4f}",
+                    acc=f"{train_acc[epoch] * 100:.4f}%",
                 )
                 pbar.update()
 
@@ -204,7 +220,7 @@ def train(cfg: dict) -> None:
         if rank == 0:
             samples = len(test_output["results"])
             optollama.utils.save_as_json(cfg["SAMPLES_PATH"], test_output["results"])
-            print(f"[rank 0] Saved {samples} samples → {cfg['SAMPLES_PATH']}")
+            print(f"[rank 0] Saved {samples} samples -> {cfg['SAMPLES_PATH']}")
 
             if tmm:
                 print(f"\tmin test MAE: {torch.min(test_mae).item():.6f}")

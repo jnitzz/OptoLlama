@@ -1,6 +1,63 @@
 import torch
 
 
+def token_accuracy_counts(
+    stacks: torch.Tensor,
+    preds: torch.Tensor,
+    eos: int,
+    pad: int,
+    msk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute raw token-accuracy counts after applying the evaluation mask.
+
+    Args
+    ----
+    stacks : torch.Tensor
+        Target token IDs of shape ``[B, L]``.
+    preds : torch.Tensor
+        Either predicted logits of shape ``[B, L, V]`` or predicted token
+        IDs of shape ``[B, L]``.
+    eos : int
+        Token ID for EOS.
+    pad : int
+        Token ID for PAD (ignored in accuracy computation).
+    msk : int
+        Token ID for MSK (ignored in accuracy computation).
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        A 4-tuple of:
+
+        - ``correct_count``: scalar float tensor on CPU with the number of
+          correct valid tokens in the batch.
+        - ``total_count``: scalar float tensor on CPU with the number of
+          valid tokens in the batch.
+        - ``per_correct``: float tensor ``[B]`` with correct-token counts.
+        - ``per_total``: float tensor ``[B]`` with valid-token counts.
+    """
+    if preds.dim() == 3:
+        preds = preds.argmax(dim=-1)
+
+    len_stack = min(stacks.size(1), preds.size(1))
+    stacks = stacks[:, :len_stack]
+    preds = preds[:, :len_stack]
+
+    is_eos = stacks == eos
+    before_first_eos = is_eos.cumsum(dim=1) == 0
+    valid = before_first_eos & (stacks != pad) & (stacks != msk)
+    correct = (stacks == preds) & valid
+
+    per_correct = correct.sum(dim=1).float()
+    per_total = valid.sum(dim=1).float()
+
+    correct_count = per_correct.sum().detach().cpu()
+    total_count = per_total.sum().detach().cpu()
+
+    return correct_count, total_count, per_correct, per_total
+
+
 def token_accuracy(
     stacks: torch.Tensor,
     preds: torch.Tensor,
@@ -33,31 +90,17 @@ def token_accuracy(
         - Scalar (0-D) float tensor on CPU with weighted global accuracy.
         - Float tensor of shape ``[B]`` on CPU with accuracy per batch sample.
     """
-    # Convert logits to token IDs
-    if preds.dim() == 3:
-        preds = preds.argmax(dim=-1)
-
-    len_stack = min(stacks.size(1), preds.size(1))
-    stacks = stacks[:, :len_stack]
-    preds = preds[:, :len_stack]
-
-    # Identify valid evaluation positions (before first EOS)
-    is_eos = stacks == eos
-    before_first_eos = is_eos.cumsum(dim=1) == 0
-
-    # Exclude PAD & MSK tokens
-    valid = before_first_eos & (stacks != pad) & (stacks != msk)
-
-    # Correct predictions at valid positions
-    correct = (stacks == preds) & valid
-
-    # Per-sample accuracy
-    per_correct = correct.sum(dim=1).float()
-    per_total = valid.sum(dim=1).clamp_min(1).float()
+    correct_count, total_count, per_correct, per_total = token_accuracy_counts(
+        stacks,
+        preds,
+        eos,
+        pad,
+        msk,
+    )
+    per_total = per_total.clamp_min(1.0)
     per_sample = (per_correct / per_total).detach().cpu()
 
-    # Global weighted accuracy
-    global_acc = (per_correct.sum() / per_total.sum()).detach().cpu()
+    global_acc = (correct_count / total_count.clamp_min(1.0)).detach().cpu()
 
     return global_acc, per_sample
 

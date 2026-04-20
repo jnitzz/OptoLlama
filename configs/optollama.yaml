@@ -2,7 +2,7 @@ MODEL: "optollama"
 RUN: "MD1"
 
 # --- paths ---
-DATA_PATH: ...
+DATA_PATH: "E:/repos/OptoLlama/data"
 
 TOKENS_PATH: "${DATA_PATH}/tokens.json"
 MATERIALS_PATH: "${DATA_PATH}/materials/"
@@ -24,11 +24,17 @@ OUTPUT_PATH: "${DATA_PATH}/output"
 SAMPLES_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-samples.json"
 GRID_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-grid.json"
 IDS_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-ids.json"
+PLOT_BUNDLE_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-plot-bundle.npz"
+PLOT_SAMPLE_WITH_NN: true
+PLOT_NN_CHUNK_SIZE: 512000
+# Optional override, e.g. "cpu" or "cuda:0"
+PLOT_NN_DEVICE: null
 BEST_CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}.pt"
 LAST_CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-last.pt"
 
 # Optionally:
 # TARGET: "${DATA_PATH}/targets/<YOUR_TARGET>.json"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-thermalreflector_target.csv"
 
 # --- hyperparameters ---
 SEED: 3
@@ -42,14 +48,14 @@ DROPOUT: 0.0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 10
+MC_SAMPLES: 1
 N_TARGETS: 1
 
 EPOCHS: 1000
 DIFFUSION_STEPS: 500
 TRACK_DIFFUSION_STEPS_MAE: false
 NUM_SAMPLES_TRAIN: 10000000
-NUM_SAMPLES_TEST: 3000
+NUM_SAMPLES_TEST: 1000
 TRAIN_BATCH_SIZE: 256
 TEST_BATCH_SIZE: 256
 
@@ -90,11 +96,11 @@ INCIDENCE_ANGLE: 0
 ROI_MIN: 300
 ROI_MAX: 2000
 
-MAX_EMIT_LEN: ${MAX_SEQ_LEN}  # if smaller than MAX_SEQ_LEN, forces an early EOS at given position, PAD after
+MAX_EMIT_LEN: ${MAX_SEQ_LEN} # if smaller than MAX_SEQ_LEN, forces an early EOS at given position, PAD after
 
 TOKEN_FILTER_ENABLED: false
-TOKEN_FILTER_MODE: "allow"  # "exclude" or "allow"
-TOKEN_FILTER_GROUPS: []  # One or more of: ["metals", "semiconductors", "dielectrics"]
+TOKEN_FILTER_MODE: "allow" # "exclude" or "allow"
+TOKEN_FILTER_GROUPS: [] # One or more of: ["metals", "semiconductors", "dielectrics"]
 # Optional explicit token strings (or ids):
 TOKEN_FILTER_EXCLUDE_TOKENS: [] # e.g. ["Ag", "TiN"]
-TOKEN_FILTER_ALLOW_TOKENS: ["SiO2", "Ta2O5", "MgO"]  # used mainly with TOKEN_FILTER_MODE="allow"
+TOKEN_FILTER_ALLOW_TOKENS: ["SiO2", "Ta2O5", "MgO"] # used mainly with TOKEN_FILTER_MODE="allow"

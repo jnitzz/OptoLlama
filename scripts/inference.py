@@ -10,6 +10,7 @@ import torch
 import optollama.data
 import optollama.evaluation
 import optollama.model
+import optollama.plotting
 import optollama.utils
 
 
@@ -215,26 +216,25 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
 
     # ---- validation ----
     model.eval()
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
-        test_output = optollama.evaluation.model_prediction(
-            model,
-            test_loader,
-            device=device,
-            mode=cfg["VALID_SIM"],
-            eos=eos_idx,
-            pad=pad_idx,
-            msk=msk_idx,
-            idx_to_token=idx_to_token,
-            tmm_ctx=tmm_ctx,
-            mc_samples=cfg["MC_SAMPLES"],
-            rank=rank,
-            world_size=world_size,
-            gather=True,
-            track_step_mae=cfg["TRACK_DIFFUSION_STEPS_MAE"],
-            roi_mask=optollama.data.spectra.wavelength_mask(cfg["WAVELENGTHS"], cfg["ROI_MIN"], cfg["ROI_MAX"], device),
-            record_all_mc=True,
-            record_pred_spectra=True,
-        )
+    test_output = optollama.evaluation.model_prediction(
+        model,
+        test_loader,
+        device=device,
+        mode=cfg["VALID_SIM"],
+        eos=eos_idx,
+        pad=pad_idx,
+        msk=msk_idx,
+        idx_to_token=idx_to_token,
+        tmm_ctx=tmm_ctx,
+        mc_samples=cfg["MC_SAMPLES"],
+        rank=rank,
+        world_size=world_size,
+        gather=True,
+        track_step_mae=cfg["TRACK_DIFFUSION_STEPS_MAE"],
+        roi_mask=optollama.data.spectra.wavelength_mask(cfg["WAVELENGTHS"], cfg["ROI_MIN"], cfg["ROI_MAX"], device),
+        record_all_mc=True,
+        record_pred_spectra=True,
+    )
 
     # --- save outputs to disk ---
     if rank == 0:
@@ -242,13 +242,26 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
 
         samples = len(test_output["results"])
         optollama.utils.save_as_json(cfg["SAMPLES_PATH"], test_output["results"])
-        print(f"[rank 0] Saved {samples} samples → {cfg['SAMPLES_PATH']}")
+        print(f"[rank 0] Saved {samples} samples -> {cfg['SAMPLES_PATH']}")
 
         grid = test_output.get("mae_grid", [])
-        optollama.utils.save_as_json(cfg["GRID_PATH"], grid.numpy().tolist())
+        if torch.is_tensor(grid):
+            optollama.utils.save_as_json(cfg["GRID_PATH"], grid.numpy().tolist())
 
         ids = test_output.get("ids_grid", [])
-        optollama.utils.save_as_json(cfg["IDS_PATH"], ids.numpy().tolist())
+        if torch.is_tensor(ids):
+            optollama.utils.save_as_json(cfg["IDS_PATH"], ids.numpy().tolist())
+
+        plot_bundle_path = cfg.get("PLOT_BUNDLE_PATH")
+        if plot_bundle_path:
+            optollama.plotting.save_plot_bundle(
+                plot_bundle_path,
+                test_output,
+                wavelengths=cfg["WAVELENGTHS"],
+                roi_min=cfg.get("ROI_MIN"),
+                roi_max=cfg.get("ROI_MAX"),
+            )
+            print(f"[rank 0] Saved plot bundle -> {plot_bundle_path}")
 
         accuracy = test_output["mean_acc"]
         mae = test_output.get("mean_mae", 0.0)

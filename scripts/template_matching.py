@@ -289,7 +289,7 @@ def find_nearest_neighbors(
     results = []
 
     # Loop over test points
-    for test_idx in tqdm.tqdm(range(n_test), desc="Matching test → train"):
+    for test_idx in tqdm.tqdm(range(n_test), desc="Matching test -> train"):
         print(f"Processing test index {test_idx + 1}/{n_test}", end="\r")
         spec_test = test_spectra[test_idx].unsqueeze(0).to(device_t)  # [1, 3, W]
 
@@ -421,7 +421,7 @@ def main() -> None:
     out_path = os.path.join(args.out_dir, args.name + ".json")
     os.makedirs(args.out_dir, exist_ok=True)
     save_as_json(out_path, results)
-    print(f"Saved {len(results)} test→train mappings to '{out_path}'")
+    print(f"Saved {len(results)} test->train mappings to '{out_path}'")
 
 
 if __name__ == "__main__":
