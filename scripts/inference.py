@@ -2,6 +2,7 @@
 
 import os
 
+# ruff: noqa: N806
 from typing import Any
 
 import torch
@@ -10,8 +11,6 @@ import optollama.data
 import optollama.evaluation
 import optollama.model
 import optollama.utils
-
-# ruff: noqa: N806
 
 
 @torch.no_grad()
@@ -48,6 +47,41 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
     filename of the form ``results_{cfg.RUN_NAME}_{tag}.json`` where
     ``tag`` is ``"valid"`` or ``"target"``.
     """
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cudnn.benchmark = True
+    """
+    Run model inference / validation for a given configuration.
+
+    This function sets up the runtime, builds the model, optionally loads a
+    checkpoint, constructs the appropriate data loader (validation split or a
+    user-provided target spectrum), and finally calls :func:`evaluate.validate_model`.
+
+    Args
+    ----
+    cfg: dict
+        Configuration object
+
+    Returns
+    -------
+    tuple[dict[str, Any], dict[int, str], int, int, int]
+        A 5-tuple of ``(out, idx_to_token, eos_idx, pad_idx, msk_idx)``
+        where ``out`` is a dictionary with at least:
+
+        - ``"mean_acc"`` (float): mean token accuracy.
+        - ``"mean_mae"`` (float or None): mean spectrum MAE (``None`` when
+          not simulating).
+        - ``"results"`` (list[dict]): per-example records (rank 0 only in
+          DDP; always present in single-process runs).
+
+    Notes
+    -----
+    Handles both single-process and DDP runs via
+    :func:`runner.setup_run` and :func:`runner._is_ddp`. Per-example
+    results are saved as JSON in ``cfg.PATH_SAVED`` (if set) with a
+    filename of the form ``results_{cfg.RUN_NAME}_{tag}.json`` where
+    ``tag`` is ``"valid"`` or ``"target"``.
+    """
+
     # --- distributed computation setup ---
     device, _, rank, world_size = optollama.utils.setup_run(cfg, make_dirs=True)
 
@@ -56,13 +90,10 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
 
     # --- data source ---
     target = cfg.get("TARGET")
-    
-    if target is None: # no target defined, load a validation dataset
+
+    if target is None:  # no target defined, load a validation dataset
         test_ds, test_loader, _ = optollama.data.SpectraDataset.make_loader(
-            cfg, 
-            split="test", 
-            subset_n=cfg["NUM_SAMPLES_TEST"], 
-            ddp=False
+            cfg, split="test", subset_n=cfg["NUM_SAMPLES_TEST"], ddp=False
         )
     else:
         if target == "random":
@@ -70,7 +101,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         else:
             spectrum = optollama.utils.load_spectra(target, cfg).to(device)
 
-        test_ds, test_loader, _ = optollama.data.RepeatedSpectrumDataset.make_loader(
+        test_ds, test_loader = optollama.data.RepeatedSpectrumDataset.make_loader(
             spectrum,
             cfg=cfg,
             msk_idx=msk_idx,
@@ -78,7 +109,12 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
 
     # --- model ---
     vocab_size = len(idx_to_token)
-    example_spectrum = test_ds.dataset.spectra[0] if isinstance(test_ds, torch.utils.data.Subset) else test_ds.spectra[0]
+    if isinstance(test_ds, torch.utils.data.Subset):
+        example_spectrum = test_ds.dataset.spectra[0]
+    elif hasattr(test_ds, "spectra"):
+        example_spectrum = test_ds.spectra[0]
+    else:
+        example_spectrum = test_ds.spectrum
 
     model = optollama.model.build_model(
         model_type=cfg["MODEL"],
@@ -104,12 +140,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
     checkpoint = cfg["BEST_CHECKPOINT_PATH"]
     if checkpoint and os.path.exists(checkpoint):
         print(f"Resuming from checkpoint {checkpoint}")
-        start_epoch, blob = optollama.utils.load_checkpoint(
-            checkpoint, 
-            model, 
-            map_location="cpu", 
-            strict=True
-        )
+        start_epoch, blob = optollama.utils.load_checkpoint(checkpoint, model, map_location="cpu", strict=True)
     else:
         print(f"Checkpoint path set to {checkpoint} does not exist.")
 
@@ -128,7 +159,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         for group in groups:
             if group not in material_groups:
                 raise ValueError(f"Unknown TOKEN_FILTER_GROUPS entry: {group!r}. Use one of {list(material_groups.keys())}.")
-            
+
             # In allow mode, groups are treated as allowlists. In exclude mode, treated as blocklists.
             (allow_group_ids if mode == "allow" else exclude_group_ids).append(material_groups[group])
 
@@ -161,8 +192,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         # Apply to model if supported (OptoLlama)
         try:
             model.set_token_constraints(
-                allow_ids=allow_ids if allowed_count > 0 else None,
-                exclude_ids=exclude_ids if excluded_count > 0 else None
+                allow_ids=allow_ids if allowed_count > 0 else None, exclude_ids=exclude_ids if excluded_count > 0 else None
             )
             print(f"Token constraints enabled (mode={mode}, allow={allowed_count}, exclude={excluded_count}).")
         except AttributeError:
@@ -173,38 +203,38 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
     try:
         model.set_max_emit_len(max_emit_len)
         print(f"MAX_EMIT_LEN enabled: {max_emit_len}")
-    except: pass
+    except:
+        pass
 
     # --- TMM simulation ---
-    tmm_ctx = optollama.evaluation.simulation.TMMContext.make(
-        cfg=cfg,
-        idx_to_token=idx_to_token,
-        device=device
-    ) if cfg["VALID_SIM"] == "TMM_FAST" else None
+    tmm_ctx = (
+        optollama.evaluation.simulation.TMMContext.make(cfg=cfg, idx_to_token=idx_to_token, device=device)
+        if cfg["VALID_SIM"] == "TMM_FAST"
+        else None
+    )
 
     # ---- validation ----
     model.eval()
-    test_output = optollama.evaluation.model_prediction(
-        model,
-        test_loader,
-        device=device,
-        mode=cfg["VALID_SIM"],
-        eos=eos_idx,
-        pad=pad_idx,
-        msk=msk_idx,
-        idx_to_token=idx_to_token,
-        tmm_ctx=tmm_ctx,
-        mc_samples=cfg["MC_SAMPLES"],
-        rank=rank,
-        world_size=world_size,
-        gather=True,
-        track_step_mae=cfg["TRACK_DIFFUSION_STEPS_MAE"],
-        roi_mask=optollama.data.spectra.wavelength_mask(
-            cfg["WAVELENGTHS"], cfg["ROI_MIN"], cfg["ROI_MAX"], device
-        ),
-        record_all_mc=True,
-        record_pred_spectra=True,
-    )
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        test_output = optollama.evaluation.model_prediction(
+            model,
+            test_loader,
+            device=device,
+            mode=cfg["VALID_SIM"],
+            eos=eos_idx,
+            pad=pad_idx,
+            msk=msk_idx,
+            idx_to_token=idx_to_token,
+            tmm_ctx=tmm_ctx,
+            mc_samples=cfg["MC_SAMPLES"],
+            rank=rank,
+            world_size=world_size,
+            gather=True,
+            track_step_mae=cfg["TRACK_DIFFUSION_STEPS_MAE"],
+            roi_mask=optollama.data.spectra.wavelength_mask(cfg["WAVELENGTHS"], cfg["ROI_MIN"], cfg["ROI_MAX"], device),
+            record_all_mc=True,
+            record_pred_spectra=True,
+        )
 
     # --- save outputs to disk ---
     if rank == 0:
@@ -221,7 +251,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         optollama.utils.save_as_json(cfg["IDS_PATH"], ids.numpy().tolist())
 
         accuracy = test_output["mean_acc"]
-        mae = test_output.get("mean_acc", 0.0)
+        mae = test_output.get("mean_mae", 0.0)
 
         print(f"\tmean token accuracy: {accuracy:.2f}%")
         print(f"\ttest MAE: {mae:.6f}")

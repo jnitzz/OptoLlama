@@ -1,13 +1,12 @@
 import re
-
 from typing import Any, Optional, Self, Union
 
 import safetensors.torch
 import torch
-
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 
 import optollama.data.spectra
+
 # ruff: noqa: E731
 
 
@@ -19,6 +18,7 @@ class SpectraDataset(torch.utils.data.Dataset):
       - 'spectra'    : float tensor of shape [N, 3, W]
       - 'thin_films' : long tensor of shape [N, S]
     """
+
     def __init__(self, paths: list[str] | str):
         super().__init__()
 
@@ -41,7 +41,7 @@ class SpectraDataset(torch.utils.data.Dataset):
 
         if self.spectra.size(0) != self.stacks.size(0):
             raise RuntimeError("Mismatched number of samples between spectra and thin_films.")
-            
+
     @staticmethod
     def indices_of_unique_equidistant_subset(start: int, stop: int, amount: int) -> torch.Tensor:
         """
@@ -88,12 +88,12 @@ class SpectraDataset(torch.utils.data.Dataset):
     def shard_sort_key(path: str) -> tuple[str, int]:
         """
         Sorting lambda that sort file name lexicographic for their path prefixes and integer-based for their suffixes.
-        
+
         Args
         ----
         path: str
             The path name to convert into a sorting key.
-        
+
         Returns
         -------
         tuple[str, int]
@@ -102,14 +102,20 @@ class SpectraDataset(torch.utils.data.Dataset):
         m = re.match(r"^(.*?)(\d+)$", path)
         if m:
             prefix, num = m.groups()
-            return (prefix, int(num),)
-            
-        return (path, float("inf"),)
+            return (
+                prefix,
+                int(num),
+            )
+
+        return (
+            path,
+            float("inf"),
+        )
 
     def __len__(self) -> int:
         """
         Return the length of the dataset.
-        
+
         Returns
         -------
         int
@@ -119,7 +125,7 @@ class SpectraDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Return specra, stacks and index.
-        
+
         Args
         ----
         index: int
@@ -131,9 +137,11 @@ class SpectraDataset(torch.utils.data.Dataset):
             Spectrum of shape [3,W] in float32 and stack tokens of shape [S] as longs and the passed index number.
         """
         return self.spectra[index], self.stacks[index], index
-        
+
     @classmethod
-    def make_loader(cls, cfg: dict, split: str, subset_n: int = None, ddp: bool = False) -> tuple[Union[Self, Subset[Self]], DataLoader, DistributedSampler]:
+    def make_loader(
+        cls, cfg: dict, split: str, subset_n: int = None, ddp: bool = False
+    ) -> tuple[Union[Self, Subset[Self]], DataLoader, DistributedSampler]:
         """
         Build dataset, optional subset, sampler, and DataLoader in train/test.
 
@@ -160,7 +168,7 @@ class SpectraDataset(torch.utils.data.Dataset):
         split_lower = split.lower()
         if split_lower not in ("train", "test"):
             raise ValueError(f"Unknown data split {split_lower}, expected 'train' or 'test'")
-    
+
         search_string = "DATA_PATH_TRAIN" if split_lower == "train" else "DATA_PATH_TEST"
         dataset_path = sorted([cfg[k] for k in cfg.keys() if k.startswith(search_string)])
 
@@ -222,13 +230,8 @@ class RepeatedSpectrumDataset(Dataset):
     msk_idx : int
         Token index used to fill the placeholder stack sequence.
     """
-    def __init__(
-        self,
-        spectrum: torch.Tensor,
-        n_targets: int,
-        cfg: dict,
-        msk_idx: int
-    ):
+
+    def __init__(self, spectrum: torch.Tensor, n_targets: int, cfg: dict, msk_idx: int):
         self.spectrum = spectrum.detach().clone()  # untouched template
         self.n_targets = n_targets
         self.cfg = cfg
@@ -278,12 +281,10 @@ class RepeatedSpectrumDataset(Dataset):
 
         # Zeroth index: exact original, no stochastic filling
         if index == 0 and self.cfg["FILL_OUTSIDE_ROI"]["SKIP_INDEX_0"]:
-            spectrum = optollama.data.spectra.redistribute_mismatch(
-                spectrum, 
-                mismatch_order, 
-                target_sum=1.0
-            )
+            spectrum = optollama.data.spectra.redistribute_mismatch(spectrum, mismatch_order, target_sum=1.0)
 
+            # Ensure spectrum is on CPU for DataLoader pinning
+            spectrum = spectrum.cpu() if spectrum.is_cuda else spectrum
             return spectrum, stack
 
         # --- vary outside ROI first (keeps ROI untouched) ---
@@ -298,25 +299,16 @@ class RepeatedSpectrumDataset(Dataset):
         )
 
         # --- optionally also apply noise/smoothing (if enabled) ---
-        spectrum = optollama.data.spectra.apply_noise(
-            spectrum, 
-            self.cfg["NOISE"], 
-            wavelengths
-        )
-        spectrum = optollama.data.spectra.apply_smoothing(
-            spectrum, 
-            self.cfg["SMOOTH"]
-        )
+        spectrum = optollama.data.spectra.apply_noise(spectrum, self.cfg["NOISE"], wavelengths)
+        spectrum = optollama.data.spectra.apply_smoothing(spectrum, self.cfg["SMOOTH"])
 
         # --- enforce sum-to-1 ---
-        spectrum = optollama.data.spectra.redistribute_mismatch(
-            spectrum, 
-            mismatch_order, 
-            target_sum=1.0
-        )
+        spectrum = optollama.data.spectra.redistribute_mismatch(spectrum, mismatch_order, target_sum=1.0)
 
+        # Ensure spectrum is on CPU for DataLoader pinning
+        spectrum = spectrum.cpu() if spectrum.is_cuda else spectrum
         return spectrum, stack
-    
+
     @classmethod
     def make_loader(
         cls,
@@ -358,10 +350,7 @@ class RepeatedSpectrumDataset(Dataset):
         dataset = RepeatedSpectrumDataset(spectrum, n_targets, cfg, msk_idx)
 
         loader = DataLoader(
-            dataset, 
-            batch_size=min(n_targets, cfg["TEST_BATCH_SIZE"]), 
-            shuffle=False,
-            pin_memory=not torch.mps.is_available()
+            dataset, batch_size=min(n_targets, cfg["TEST_BATCH_SIZE"]), shuffle=False, pin_memory=not torch.mps.is_available()
         )
-        
+
         return dataset, loader

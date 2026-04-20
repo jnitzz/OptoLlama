@@ -1,12 +1,10 @@
 import math
-
 from typing import Optional
 
 import torch
 
 import optollama.evaluation
 import optollama.model
-
 from optollama.evaluation.simulation import TMMContext
 
 # ruff: noqa: D102, D105, D107
@@ -329,7 +327,7 @@ class OptoLlama(torch.nn.Module):
     top_p : float
         Top-p (nucleus) sampling cutoff.
     """
-    
+
     def __init__(
         self,
         spectra_dim: int,
@@ -522,7 +520,7 @@ class OptoLlama(torch.nn.Module):
         cond = cond.squeeze(1)  # [B, 1024]
 
         for block in self.blocks:
-            predicted_stacks = block(predicted_stacks, embedded_spectra, cond=cond)
+            predicted_stacks = block(predicted_stacks, embedded_spectra, cond)
 
         predicted_stacks = self.projection(predicted_stacks)
 
@@ -614,7 +612,8 @@ class OptoLlama(torch.nn.Module):
             # If any token is forbidden, mask them out.
             if (~mask).any():
                 # Use a very negative number instead of -inf to avoid NaNs in some kernels.
-                logits = logits.masked_fill(~mask.unsqueeze(0), -1e9)
+                # Use -65504 for FP16 compatibility (smallest finite FP16 value).
+                logits = logits.masked_fill(~mask.unsqueeze(0), -65504.0)
 
         # defaults from model if not provided
         if top_k is None:
@@ -624,7 +623,11 @@ class OptoLlama(torch.nn.Module):
         temperature = getattr(self, "temperature", 0.0)
 
         # Greedy fallback: fully deterministic DiT decoding when all sampling knobs are "off"
-        if (temperature is None or temperature <= 0.0) and (not top_k or top_k <= 0) and (not top_p or top_p <= 0.0):
+        if (
+            (temperature is None or temperature <= 0.0)
+            and (not top_k_val or top_k_val <= 0)
+            and (not top_p_val or top_p_val <= 0.0)
+        ):
             return logits.argmax(dim=-1, keepdim=True)  # [B,1]
 
         # Stochastic path
@@ -634,11 +637,7 @@ class OptoLlama(torch.nn.Module):
             logits = logits / temperature
 
         # apply top-k / top-p if requested
-        logits = optollama.model.sampling.top_k_top_p_filtering(
-            logits, 
-            top_k=int(top_k or 0), 
-            top_p=float(top_p or 0.0)
-        )
+        logits = optollama.model.sampling.top_k_top_p_filtering(logits, top_k=int(top_k or 0), top_p=float(top_p or 0.0))
 
         probs = torch.softmax(logits, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0)
@@ -727,7 +726,6 @@ class OptoLlama(torch.nn.Module):
 
             # ---- optional per-step MAE tracking ----
             if track_mae:
-                assert self._step_mae_ctx is not None
                 pred_spec = optollama.evaluation.simulation.simulate_token_sequence(
                     stacks,
                     self._step_mae_ctx,
