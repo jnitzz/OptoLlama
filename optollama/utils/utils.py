@@ -159,6 +159,103 @@ def load_checkpoint(
 
 
 @torch.no_grad()
+def load_checkpoint_weights_for_init(
+    path: str,
+    model: torch.nn.Module,
+    map_location: str = "cpu",
+    strict: bool = True,
+    fallback_filter: bool = True,
+) -> dict[str, Any]:
+    """
+    Load checkpoint weights as model initialization, without optimizer state.
+
+    This is intended for fine-tuning runs where the model architecture may be
+    slightly different from the checkpoint run. It first attempts a normal
+    ``load_state_dict``. If that fails and ``fallback_filter=True``, it loads
+    only keys that exist in the current model and have matching tensor shapes.
+
+    Args
+    ----
+    path : str
+        Checkpoint path, either ``.pt`` or weights-only ``.safetensors``.
+    model : torch.nn.Module
+        Target model.
+    map_location : str
+        Device string used for ``torch.load``.
+    strict : bool
+        Whether the first load attempt should be strict.
+    fallback_filter : bool
+        Whether to fall back to shape-compatible filtered loading.
+
+    Returns
+    -------
+    dict[str, Any]
+        Load report with loaded/skipped keys and the first error, if any.
+    """
+    if path.lower().endswith(".safetensors"):
+        sd = load_file(path)
+        blob: dict[str, Any] = {"model_state": sd}
+    else:
+        blob = torch.load(path, map_location=map_location, weights_only=False)
+        sd = None
+        if isinstance(blob, dict):
+            if "model_state" in blob and isinstance(blob["model_state"], dict):
+                sd = blob["model_state"]
+            elif "model" in blob and isinstance(blob["model"], dict):
+                sd = blob["model"]
+
+        if sd is None:
+            if isinstance(blob, dict) and any(torch.is_tensor(v) for v in blob.values()):
+                sd = blob
+            else:
+                raise RuntimeError("Unrecognized checkpoint layout; expected dict with 'model_state' (or 'model').")
+
+    core = model.module if isinstance(model, DistributedDataParallel) else model
+    sd = _strip_module_prefix(sd)
+    if "allowed_vocab_mask" not in sd and hasattr(core, "allowed_vocab_mask"):
+        sd["allowed_vocab_mask"] = core.allowed_vocab_mask.detach().clone()
+
+    report: dict[str, Any] = {
+        "path": path,
+        "mode": "strict" if strict else "non_strict",
+        "fallback_used": False,
+        "loaded_keys": len(sd),
+        "skipped_keys": [],
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "first_error": None,
+    }
+
+    try:
+        incompatible = core.load_state_dict(sd, strict=strict)
+        report["missing_keys"] = list(getattr(incompatible, "missing_keys", []))
+        report["unexpected_keys"] = list(getattr(incompatible, "unexpected_keys", []))
+        return report
+    except RuntimeError as exc:
+        report["first_error"] = str(exc)
+        if not fallback_filter:
+            raise
+
+    current = core.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in sd.items():
+        if key in current and tuple(current[key].shape) == tuple(value.shape):
+            compatible[key] = value
+        else:
+            skipped.append(key)
+
+    incompatible = core.load_state_dict(compatible, strict=False)
+    report["mode"] = "filtered_non_strict"
+    report["fallback_used"] = True
+    report["loaded_keys"] = len(compatible)
+    report["skipped_keys"] = skipped
+    report["missing_keys"] = list(getattr(incompatible, "missing_keys", []))
+    report["unexpected_keys"] = list(getattr(incompatible, "unexpected_keys", []))
+    return report
+
+
+@torch.no_grad()
 def save_checkpoint(
     path: str,
     model: torch.nn.Module,

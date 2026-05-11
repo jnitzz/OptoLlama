@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 from typing import Any, Optional, Self, Union
 
 import safetensors.torch
@@ -26,7 +27,17 @@ class SpectraDataset(torch.utils.data.Dataset):
         if isinstance(paths, str):
             paths = [paths]
 
-        paths = sorted(paths, key=SpectraDataset.shard_sort_key)
+        expanded_paths: list[str] = []
+        for item in paths:
+            path = Path(item)
+            if path.is_dir():
+                expanded_paths.extend(str(fp) for fp in sorted(path.glob("*.safetensors")))
+            else:
+                expanded_paths.append(str(path))
+
+        paths = sorted(expanded_paths, key=SpectraDataset.shard_sort_key)
+        if not paths:
+            raise FileNotFoundError("No .safetensors files found for SpectraDataset.")
 
         spectra_list, stacks_list = [], []
         for fp in paths:

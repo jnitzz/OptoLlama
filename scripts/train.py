@@ -86,8 +86,33 @@ def train(cfg: dict) -> None:
             output_device=local_rank
         )
 
+    # --- optional initialization from an older checkpoint for fine-tuning ---
+    init_checkpoint = cfg.get("INIT_CHECKPOINT_PATH")
+    init_report = None
+    resume_enabled = bool(cfg.get("RESUME_CHECKPOINT", True))
+    if init_checkpoint and (not resume_enabled or not os.path.exists(cfg["LAST_CHECKPOINT_PATH"])):
+        if not os.path.exists(init_checkpoint):
+            raise FileNotFoundError(f"INIT_CHECKPOINT_PATH does not exist: {init_checkpoint}")
+        if rank == 0:
+            print(f"Initializing model weights from {init_checkpoint}")
+        init_report = optollama.utils.load_checkpoint_weights_for_init(
+            init_checkpoint,
+            model,
+            map_location="cpu",
+            strict=bool(cfg.get("INIT_CHECKPOINT_STRICT", True)),
+            fallback_filter=bool(cfg.get("INIT_CHECKPOINT_FALLBACK_FILTER", True)),
+        )
+        if rank == 0:
+            print(
+                "Initialization load: "
+                f"mode={init_report['mode']}, "
+                f"fallback={init_report['fallback_used']}, "
+                f"loaded={init_report['loaded_keys']}, "
+                f"skipped={len(init_report['skipped_keys'])}"
+            )
+
     # --- optimizer ---
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.get("LEARNING_RATE", 1e-4)))
 
     # --- metric buffers / resume bookkeeping ---
     train_losses = torch.zeros(cfg["EPOCHS"])
@@ -101,7 +126,7 @@ def train(cfg: dict) -> None:
     best_test_mae = torch.inf
     start_epoch = 0
 
-    if checkpoint and os.path.exists(checkpoint):
+    if resume_enabled and checkpoint and os.path.exists(checkpoint):
         print(f"Resuming from checkpoint {checkpoint}")
         start_epoch, blob = optollama.utils.load_checkpoint(
             checkpoint, 
@@ -262,7 +287,8 @@ def train(cfg: dict) -> None:
                             "temperature": cfg["TEMPERATURE"],
                             "top_k": cfg["TOP_K"],
                             "top_p": cfg["TOP_P"],
-                        }
+                        },
+                        "init_checkpoint": init_report,
                     },
                 )
 

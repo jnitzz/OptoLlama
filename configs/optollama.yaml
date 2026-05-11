@@ -35,6 +35,11 @@ LAST_CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-last.pt"
 # Optionally:
 # TARGET: "${DATA_PATH}/targets/<YOUR_TARGET>.json"
 # TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/example-thermalreflector_target.csv"
+# TARGET: "d:/Profile/a3536/Eigene Dateien/GitHub/OptoLlama/data/targets/transmission_400_1200_target.csv"
+# TARGET: "${DATA_PATH}/targets/transmission_400_1200_target.csv"
+# TARGET: "${DATA_PATH}/targets/transmission_400_1200_relaxed_target.csv"
+# TARGET: "${DATA_PATH}/targets/chlorophyll_filter_target.csv"
+TARGET: "${DATA_PATH}/targets/chlorophyll_filter_target_reverse.csv"
 
 # --- hyperparameters ---
 SEED: 3
@@ -48,16 +53,16 @@ DROPOUT: 0.0
 TEMPERATURE: 0.65
 TOP_K: 0
 TOP_P: 0.90
-MC_SAMPLES: 1
-N_TARGETS: 1
+MC_SAMPLES: 10
+N_TARGETS: 100
 
 EPOCHS: 1000
 DIFFUSION_STEPS: 500
 TRACK_DIFFUSION_STEPS_MAE: false
 NUM_SAMPLES_TRAIN: 10000000
-NUM_SAMPLES_TEST: 1000
+NUM_SAMPLES_TEST: 100
 TRAIN_BATCH_SIZE: 256
-TEST_BATCH_SIZE: 256
+TEST_BATCH_SIZE: 16
 
 WAVELENGTH_MIN: 300
 WAVELENGTH_MAX: 2000
@@ -77,7 +82,7 @@ NOISE:
 SMOOTH:
   ENABLED: false
   METHOD: "gaussian"
-  WIN: 25
+  WIN: 10
   SIGMA: 1.50
 
 MISMATCH_FILL_ORDER: "R>T>A"
@@ -85,12 +90,12 @@ MISMATCH_FILL_ORDER: "R>T>A"
 FILL_OUTSIDE_ROI:
   ENABLED: false
   SKIP_INDEX_0: true
-  MODE: "prior_plus_noise"
-  STRENGTH: 0.95
-  KERNEL_SIZE: 50
+  MODE: "smooth_random"
+  STRENGTH: 0.65
+  KERNEL_SIZE: 20
 
 # --- evaluation ----
-PLOT_NK: false
+PLOT_NK: true
 VALID_SIM: "TMM_FAST"
 INCIDENCE_ANGLE: 0
 ROI_MIN: 300
