@@ -3,7 +3,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import safetensors.torch
 import torch
@@ -76,6 +76,80 @@ def resolve_arg(args: argparse.Namespace, cfg: dict, name: str, default: Optiona
         return cli_value
     cfg_key = name.upper().replace("-", "_")
     return cfg.get(cfg_key, default)
+
+
+def resolve_source_shards(cfg: dict, split: str) -> list[Path]:
+    """
+    Resolve configured source split paths without loading tensors into memory.
+    """
+    prefix = "DATA_PATH_TRAIN" if split == "train" else "DATA_PATH_TEST"
+    raw_paths = sorted([cfg[key] for key in cfg if key.startswith(prefix)])
+    files: list[Path] = []
+
+    for raw_path in raw_paths:
+        path = Path(raw_path)
+        if path.is_dir():
+            files.extend(sorted(path.glob("*.safetensors")))
+        elif path.suffix == ".safetensors":
+            files.append(path)
+
+    if not files:
+        raise FileNotFoundError(f"No .safetensors source shards found for split {split!r}.")
+
+    return sorted(files, key=lambda item: optollama.data.SpectraDataset.shard_sort_key(str(item.with_suffix(""))))
+
+
+def iter_source_batches(
+    cfg: dict,
+    split: str,
+    max_samples: int,
+    batch_size: int,
+    generator: torch.Generator,
+) -> tuple[Iterator[tuple[torch.Tensor, torch.Tensor]], int]:
+    """
+    Stream source spectra/stack batches shard by shard.
+
+    ``SpectraDataset`` concatenates all configured shards before subsetting,
+    which is too memory-hungry for the length-101 data. This iterator keeps
+    only one source shard and one mini-batch in memory at a time.
+    """
+    files = resolve_source_shards(cfg, split)
+    if bool(cfg.get("WORLD_SHUFFLE_SOURCE_SHARDS", False)):
+        order = torch.randperm(len(files), generator=generator).tolist()
+        files = [files[int(i)] for i in order]
+
+    target_samples = max(1, int(max_samples))
+    expected_batches = (target_samples + int(batch_size) - 1) // int(batch_size)
+
+    def _iterator():
+        emitted = 0
+        for shard_path in files:
+            if emitted >= target_samples:
+                break
+
+            data = safetensors.torch.load_file(str(shard_path), device="cpu")
+            spectra = data["spectra"].to(torch.float32)
+            stacks = data["thin_films"].long()
+
+            remaining = target_samples - emitted
+            take = min(remaining, int(spectra.size(0)))
+            if take <= 0:
+                continue
+
+            if bool(cfg.get("WORLD_SHUFFLE_SOURCE_ROWS", False)):
+                rows = torch.randperm(int(spectra.size(0)), generator=generator)[:take]
+                spectra = spectra[rows]
+                stacks = stacks[rows]
+            else:
+                spectra = spectra[:take]
+                stacks = stacks[:take]
+
+            for start in range(0, take, int(batch_size)):
+                end = min(start + int(batch_size), take)
+                emitted += end - start
+                yield spectra[start:end], stacks[start:end]
+
+    return _iterator(), expected_batches
 
 
 def simulate_in_chunks(
@@ -374,38 +448,28 @@ def main() -> None:
         )
         apply_token_constraints_if_configured(proposal_model, cfg, tokens, token_to_idx)
 
-    original_train_batch = cfg.get("TRAIN_BATCH_SIZE")
-    original_test_batch = cfg.get("TEST_BATCH_SIZE")
-    cfg["TRAIN_BATCH_SIZE"] = batch_size
-    cfg["TEST_BATCH_SIZE"] = batch_size
-    try:
-        _, loader, _ = optollama.data.SpectraDataset.make_loader(
-            cfg,
-            split=source_split,
-            subset_n=num_base_samples,
-            ddp=False,
-        )
-    finally:
-        if original_train_batch is not None:
-            cfg["TRAIN_BATCH_SIZE"] = original_train_batch
-        if original_test_batch is not None:
-            cfg["TEST_BATCH_SIZE"] = original_test_batch
-
     output_seq_len = int(cfg.get("WORLD_OUTPUT_SEQ_LEN", cfg["MAX_SEQ_LEN"]))
     max_layers = int(cfg.get("WORLD_MAX_LAYERS", output_seq_len - 1))
+    source_batches, expected_batches = iter_source_batches(
+        cfg,
+        split=source_split,
+        max_samples=num_base_samples,
+        batch_size=batch_size,
+        generator=generator,
+    )
 
     buffers: dict[str, list[torch.Tensor]] = {key: [] for key in optollama.data.WORLD_TRANSITION_KEYS}
     rows_in_buffer = 0
     total_rows = 0
     shard_idx = 0
 
-    pbar = tqdm.tqdm(loader, desc="world transitions")
-    for batch in pbar:
+    pbar = tqdm.tqdm(source_batches, total=expected_batches, desc="world transitions")
+    for spectra_cpu, stacks_cpu in pbar:
         if total_rows >= num_transitions:
             break
 
-        targets = batch[0].to(device, non_blocking=True).to(torch.float32)
-        base_stacks = batch[1].to(device, non_blocking=True).long()
+        targets = spectra_cpu.to(device, non_blocking=True).to(torch.float32)
+        base_stacks = stacks_cpu.to(device, non_blocking=True).long()
         base_stacks, _ = optollama.data.reencode_stacks_for_output(
             base_stacks,
             output_seq_len=output_seq_len,
