@@ -154,16 +154,23 @@ def _choose_operation(
     material_prob: float,
     thickness_prob: float,
     delete_prob: float,
+    pair_insert_prob: float,
+    swap_prob: float,
+    scale_prob: float,
     generator: torch.Generator,
 ) -> str:
     ops: list[tuple[str, float]] = []
     if len(layers) < max_layers:
         ops.append(("insert", max(0.0, insertion_prob)))
+    if len(layers) + 1 < max_layers:
+        ops.append(("pair_insert", max(0.0, pair_insert_prob)))
     if layers:
         ops.append(("material", max(0.0, material_prob)))
         ops.append(("thickness", max(0.0, thickness_prob)))
+        ops.append(("scale", max(0.0, scale_prob)))
     if len(layers) > 1:
         ops.append(("delete", max(0.0, delete_prob)))
+        ops.append(("swap", max(0.0, swap_prob)))
 
     ops = [(name, weight) for name, weight in ops if weight > 0.0]
     if not ops:
@@ -184,10 +191,14 @@ def _mutate_layers(
     index: TokenMutationIndex,
     max_layers: int,
     thickness_deltas: Sequence[int],
+    thickness_scale_factors: Sequence[float],
     insertion_prob: float,
     material_prob: float,
     thickness_prob: float,
     delete_prob: float,
+    pair_insert_prob: float,
+    swap_prob: float,
+    scale_prob: float,
     generator: torch.Generator,
 ) -> list[int]:
     op = _choose_operation(
@@ -197,6 +208,9 @@ def _mutate_layers(
         material_prob=material_prob,
         thickness_prob=thickness_prob,
         delete_prob=delete_prob,
+        pair_insert_prob=pair_insert_prob,
+        swap_prob=swap_prob,
+        scale_prob=scale_prob,
         generator=generator,
     )
 
@@ -205,9 +219,24 @@ def _mutate_layers(
         pos = _randint(generator, len(out) + 1)
         token_id = _sample_from(index.allowed_token_id_list, generator)
         out.insert(pos, token_id)
+    elif op == "pair_insert":
+        pos = _randint(generator, len(out) + 1)
+        first = _sample_from(index.allowed_token_id_list, generator)
+        second = _sample_from(index.allowed_token_id_list, generator)
+        for _ in range(6):
+            if index.token_materials[first] != index.token_materials[second]:
+                break
+            second = _sample_from(index.allowed_token_id_list, generator)
+        out[pos:pos] = [first, second]
     elif op == "delete":
         pos = _randint(generator, len(out))
         del out[pos]
+    elif op == "swap":
+        i = _randint(generator, len(out))
+        j = _randint(generator, len(out) - 1)
+        if j >= i:
+            j += 1
+        out[i], out[j] = out[j], out[i]
     elif op == "material":
         pos = _randint(generator, len(out))
         old_token = out[pos]
@@ -234,6 +263,18 @@ def _mutate_layers(
             new_token = _nearest_token_for_thickness(material, int(thickness) + int(delta), index)
             if new_token is not None:
                 out[pos] = new_token
+    elif op == "scale" and thickness_scale_factors:
+        factor = float(thickness_scale_factors[_randint(generator, len(thickness_scale_factors))])
+        scaled: list[int] = []
+        for old_token in out:
+            material = index.token_materials[old_token]
+            thickness = index.token_thicknesses[old_token]
+            if material is None or thickness is None:
+                scaled.append(old_token)
+                continue
+            new_token = _nearest_token_for_thickness(material, int(round(float(thickness) * factor)), index)
+            scaled.append(old_token if new_token is None else new_token)
+        out = scaled
 
     return out[:max_layers]
 
@@ -253,7 +294,11 @@ def perturb_stack_candidates(
     material_prob: float = 0.25,
     thickness_prob: float = 0.45,
     delete_prob: float = 0.05,
+    pair_insert_prob: float = 0.0,
+    swap_prob: float = 0.0,
+    scale_prob: float = 0.0,
     thickness_deltas: Sequence[int] = (-50, -40, -30, -20, -10, 10, 20, 30, 40, 50),
+    thickness_scale_factors: Sequence[float] = (0.85, 0.9, 0.95, 1.05, 1.1, 1.15),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Generate local perturbations of candidate stacks.
@@ -278,8 +323,13 @@ def perturb_stack_candidates(
         Number of stochastic edit operations per perturbed variant.
     insertion_prob, material_prob, thickness_prob, delete_prob : float
         Relative probabilities for mutation operation selection.
+    pair_insert_prob, swap_prob, scale_prob : float
+        Relative probabilities for higher-level layer-pair insertion, layer
+        order swap, and global thickness-scaling operations.
     thickness_deltas : Sequence[int]
         Candidate thickness changes in nm.
+    thickness_scale_factors : Sequence[float]
+        Multiplicative factors used by the global scale operation.
 
     Returns
     -------
@@ -307,10 +357,14 @@ def perturb_stack_candidates(
                     index=index,
                     max_layers=max_layers,
                     thickness_deltas=thickness_deltas,
+                    thickness_scale_factors=thickness_scale_factors,
                     insertion_prob=insertion_prob,
                     material_prob=material_prob,
                     thickness_prob=thickness_prob,
                     delete_prob=delete_prob,
+                    pair_insert_prob=pair_insert_prob,
+                    swap_prob=swap_prob,
+                    scale_prob=scale_prob,
                     generator=generator,
                 )
             variants.append(_encode_layers(layers, output_seq_len, eos=eos, pad=pad, device=device))

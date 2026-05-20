@@ -224,11 +224,12 @@ def predict_costs_in_chunks(
     current_stacks: torch.Tensor,
     next_stacks: torch.Tensor,
     batch_size: int,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """
-    Predict candidate costs in bounded batches.
+    Predict candidate costs and deltas in bounded batches.
     """
-    out: list[torch.Tensor] = []
+    costs: list[torch.Tensor] = []
+    deltas: list[torch.Tensor] = []
     for start in range(0, next_stacks.size(0), batch_size):
         end = min(start + batch_size, next_stacks.size(0))
         pred = world_model(
@@ -237,8 +238,9 @@ def predict_costs_in_chunks(
             current_stacks[start:end],
             next_stacks[start:end],
         )
-        out.append(pred["cost_after"])
-    return torch.cat(out, dim=0)
+        costs.append(pred["cost_after"])
+        deltas.append(pred["delta_mae"])
+    return {"cost_after": torch.cat(costs, dim=0), "delta_mae": torch.cat(deltas, dim=0)}
 
 
 def top_rows_per_target(scores: torch.Tensor, target_indices: torch.Tensor, keep: int) -> torch.Tensor:
@@ -251,6 +253,64 @@ def top_rows_per_target(scores: torch.Tensor, target_indices: torch.Tensor, keep
         order = scores[rows].argsort()
         selected.append(rows[order[:keep]])
     return torch.cat(selected, dim=0) if selected else torch.empty((0,), device=scores.device, dtype=torch.long)
+
+
+def mutation_kwargs_from_cfg(cfg: dict) -> dict:
+    """
+    Return mutation-proposal weights from config.
+    """
+    return {
+        "insertion_prob": float(cfg.get("WORLD_MUTATION_INSERT_PROB", 0.25)),
+        "material_prob": float(cfg.get("WORLD_MUTATION_MATERIAL_PROB", 0.25)),
+        "thickness_prob": float(cfg.get("WORLD_MUTATION_THICKNESS_PROB", 0.45)),
+        "delete_prob": float(cfg.get("WORLD_MUTATION_DELETE_PROB", 0.05)),
+        "pair_insert_prob": float(cfg.get("WORLD_MUTATION_PAIR_INSERT_PROB", 0.10)),
+        "swap_prob": float(cfg.get("WORLD_MUTATION_SWAP_PROB", 0.05)),
+        "scale_prob": float(cfg.get("WORLD_MUTATION_SCALE_PROB", 0.10)),
+        "thickness_deltas": cfg.get("WORLD_MUTATION_THICKNESS_DELTAS", [-50, -40, -30, -20, -10, 10, 20, 30, 40, 50]),
+        "thickness_scale_factors": cfg.get("WORLD_MUTATION_SCALE_FACTORS", [0.85, 0.9, 0.95, 1.05, 1.1, 1.15]),
+    }
+
+
+def select_verification_rows(
+    combined_score: torch.Tensor,
+    predicted_cost: torch.Tensor,
+    implied_delta_cost: torch.Tensor,
+    target_indices: torch.Tensor,
+    keep: int,
+    explore: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """
+    Select rows by a union of absolute-cost, delta-cost, combined, and random rankings.
+    """
+    selected: list[torch.Tensor] = []
+    explore = max(0, int(explore))
+    ranked_keep = max(1, int(keep) - explore)
+    per_head = max(1, ranked_keep // 3)
+
+    for target_idx in torch.unique(target_indices).tolist():
+        rows = (target_indices == int(target_idx)).nonzero(as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
+            continue
+
+        picked: list[torch.Tensor] = []
+        picked.append(rows[combined_score[rows].argsort()[:ranked_keep]])
+        picked.append(rows[predicted_cost[rows].argsort()[:per_head]])
+        picked.append(rows[implied_delta_cost[rows].argsort()[:per_head]])
+
+        merged = torch.unique(torch.cat(picked, dim=0))
+        if explore > 0 and rows.numel() > merged.numel():
+            mask = torch.ones(rows.numel(), dtype=torch.bool, device=rows.device)
+            for row in merged.tolist():
+                mask &= rows != int(row)
+            remaining = rows[mask]
+            if remaining.numel():
+                order = torch.randperm(remaining.numel(), generator=generator, device="cpu").to(remaining.device)
+                merged = torch.unique(torch.cat([merged, remaining[order[:explore]]], dim=0))
+        selected.append(merged)
+
+    return torch.cat(selected, dim=0) if selected else torch.empty((0,), device=combined_score.device, dtype=torch.long)
 
 
 def assemble_plot_grids(
@@ -347,6 +407,10 @@ def main() -> None:
     world_batch_size = int(cfg.get("WORLD_PLANNER_BATCH_SIZE", 1024))
     output_seq_len = int(cfg.get("WORLD_OUTPUT_SEQ_LEN", cfg["MAX_SEQ_LEN"]))
     max_layers = int(cfg.get("WORLD_MAX_LAYERS", output_seq_len - 1))
+    score_cost_weight = float(cfg.get("WORLD_PLANNER_SCORE_COST_WEIGHT", 0.5))
+    score_delta_weight = float(cfg.get("WORLD_PLANNER_SCORE_DELTA_WEIGHT", 0.5))
+    explore_per_target = int(cfg.get("WORLD_PLANNER_EXPLORE_PER_TARGET", 4))
+    mutation_kwargs = mutation_kwargs_from_cfg(cfg)
 
     beam_stacks, beam_targets, beam_spectra, beam_mae, target_indices = sample_initial_candidates(
         opto_model,
@@ -374,13 +438,15 @@ def main() -> None:
             num_perturbations=num_perturbations,
             generator=generator,
             edits_per_perturbation=int(cfg.get("WORLD_PLANNER_EDITS_PER_PERTURBATION", 1)),
+            **mutation_kwargs,
         )
         variant_targets = beam_targets[source_idx]
         variant_current_spectra = beam_spectra[source_idx]
         variant_current_stacks = beam_stacks[source_idx]
+        variant_current_mae = beam_mae[source_idx]
         variant_target_indices = target_indices[source_idx]
 
-        predicted_cost = predict_costs_in_chunks(
+        predictions = predict_costs_in_chunks(
             world_model,
             variant_targets,
             variant_current_spectra,
@@ -388,7 +454,18 @@ def main() -> None:
             variants,
             batch_size=world_batch_size,
         )
-        verify_rows = top_rows_per_target(predicted_cost, variant_target_indices, keep=verify_per_target)
+        predicted_cost = predictions["cost_after"]
+        implied_delta_cost = variant_current_mae + predictions["delta_mae"]
+        combined_score = score_cost_weight * predicted_cost + score_delta_weight * implied_delta_cost
+        verify_rows = select_verification_rows(
+            combined_score,
+            predicted_cost,
+            implied_delta_cost,
+            variant_target_indices,
+            keep=verify_per_target,
+            explore=explore_per_target,
+            generator=generator,
+        )
         if verify_rows.numel() == 0:
             continue
 
