@@ -11,6 +11,7 @@ import tqdm
 import optollama.data
 import optollama.evaluation
 import optollama.model
+import optollama.plotting
 import optollama.utils
 
 
@@ -252,6 +253,46 @@ def top_rows_per_target(scores: torch.Tensor, target_indices: torch.Tensor, keep
     return torch.cat(selected, dim=0) if selected else torch.empty((0,), device=scores.device, dtype=torch.long)
 
 
+def assemble_plot_grids(
+    stacks: torch.Tensor,
+    spectra: torch.Tensor,
+    mae: torch.Tensor,
+    target_indices: torch.Tensor,
+    num_targets: int,
+    keep: int,
+    pad_value: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Assemble beam rows into plotting grids shaped like standard MC outputs.
+    """
+    stack_grid = torch.full(
+        (num_targets, keep, stacks.size(1)),
+        int(pad_value),
+        dtype=stacks.dtype,
+        device=stacks.device,
+    )
+    spec_grid = torch.full(
+        (num_targets, keep, *spectra.shape[1:]),
+        float("nan"),
+        dtype=spectra.dtype,
+        device=spectra.device,
+    )
+    mae_grid = torch.full((num_targets, keep), float("nan"), dtype=mae.dtype, device=mae.device)
+
+    for target_idx in range(num_targets):
+        rows = (target_indices == target_idx).nonzero(as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
+            continue
+        order = mae[rows].argsort()
+        rows = rows[order[:keep]]
+        n_rows = int(rows.numel())
+        stack_grid[target_idx, :n_rows] = stacks[rows]
+        spec_grid[target_idx, :n_rows] = spectra[rows]
+        mae_grid[target_idx, :n_rows] = mae[rows]
+
+    return mae_grid, stack_grid, spec_grid
+
+
 def stack_to_tokens(stack: torch.Tensor, idx_to_token: dict[int, str], eos: int, pad: int, msk: int) -> list[str]:
     """
     Convert a token-id stack to visible layer tokens.
@@ -379,24 +420,69 @@ def main() -> None:
         final_mae = float(beam_mae[row].item())
         records.append(
             {
+                "dataset_index": target_idx,
                 "target_index": target_idx,
                 "initial_best_mae": init_mae,
                 "final_mae": final_mae,
+                "mae": final_mae,
                 "improvement": None if init_mae is None else init_mae - final_mae,
+                "rat_target": beam_targets[row].detach().cpu().numpy().tolist(),
+                "rat_pred": beam_spectra[row].detach().cpu().numpy().tolist(),
+                "stack_target_tokens": [],
                 "stack_pred_tokens": stack_to_tokens(beam_stacks[row], idx_to_token, eos_idx, pad_idx, msk_idx),
             }
         )
+
+    mae_grid, ids_grid, pred_spectra_grid = assemble_plot_grids(
+        beam_stacks,
+        beam_spectra,
+        beam_mae,
+        target_indices,
+        num_targets=int(targets.size(0)),
+        keep=beam_size,
+        pad_value=pad_idx,
+    )
 
     out = {
         "mean_final_mae": sum(item["final_mae"] for item in records) / max(len(records), 1),
         "mean_improvement": sum(item["improvement"] for item in records if item["improvement"] is not None) / max(len(records), 1),
         "tmm_calls": tmm_calls,
         "records": records,
+        "mean_mae": sum(item["mae"] for item in records) / max(len(records), 1),
+        "results": records,
     }
     out_path = Path(args.out_path or cfg.get("WORLD_PLANNER_OUTPUT_PATH", "data/output/world-planner-results.json"))
     os.makedirs(out_path.parent, exist_ok=True)
     optollama.utils.save_as_json(str(out_path), out)
     print(f"Saved world-planner results -> {out_path}")
+
+    samples_path = cfg.get("SAMPLES_PATH")
+    if samples_path:
+        optollama.utils.save_as_json(samples_path, records)
+        print(f"Saved plot-compatible samples -> {samples_path}")
+
+    grid_path = cfg.get("GRID_PATH")
+    if grid_path:
+        optollama.utils.save_as_json(grid_path, mae_grid.detach().cpu().numpy().tolist())
+
+    ids_path = cfg.get("IDS_PATH")
+    if ids_path:
+        optollama.utils.save_as_json(ids_path, ids_grid.detach().cpu().numpy().tolist())
+
+    plot_bundle_path = cfg.get("PLOT_BUNDLE_PATH")
+    if plot_bundle_path:
+        optollama.plotting.save_plot_bundle(
+            plot_bundle_path,
+            {
+                "mae_grid": mae_grid,
+                "ids_grid": ids_grid,
+                "pred_spectra_grid": pred_spectra_grid,
+            },
+            wavelengths=cfg["WAVELENGTHS"],
+            roi_min=cfg.get("ROI_MIN"),
+            roi_max=cfg.get("ROI_MAX"),
+        )
+        print(f"Saved plot bundle -> {plot_bundle_path}")
 
 
 if __name__ == "__main__":

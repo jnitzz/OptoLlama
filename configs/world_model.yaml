@@ -20,6 +20,13 @@ DATA_PATH_TEST: "${DATA_PATH}/test/test.safetensors"
 
 OUTPUT_PATH: "${DATA_PATH}/output"
 BEST_CHECKPOINT_PATH: "${OUTPUT_PATH}/${MODEL}.pt"
+SAMPLES_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-samples.json"
+GRID_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-grid.json"
+IDS_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-ids.json"
+PLOT_BUNDLE_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-plot-bundle.npz"
+PLOT_SAMPLE_WITH_NN: false
+PLOT_NN_CHUNK_SIZE: 512000
+PLOT_NN_DEVICE: null
 
 # Optional target for planner runs.
 TARGET: "${DATA_PATH}/targets/chlorophyll_filter_target_reverse.csv"
@@ -121,7 +128,7 @@ WORLD_CHECKPOINT_PATH: "${OUTPUT_PATH}/world-edit-scorer.pt"
 WORLD_LAST_CHECKPOINT_PATH: "${OUTPUT_PATH}/world-edit-scorer-last.pt"
 
 # --- planner ---
-WORLD_PLANNER_OUTPUT_PATH: "${OUTPUT_PATH}/world-planner-results.json"
+WORLD_PLANNER_OUTPUT_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-world-planner.json"
 WORLD_PLANNER_MAX_TARGETS: 1
 WORLD_PLANNER_MC_SAMPLES: 10
 WORLD_PLANNER_BEAM_SIZE: 4
