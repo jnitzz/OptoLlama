@@ -213,6 +213,12 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         if cfg["VALID_SIM"] == "TMM_FAST"
         else None
     )
+    if tmm_ctx is not None and tmm_ctx.realistic_enabled:
+        print(
+            "REALISTIC_TMM enabled: "
+            f"{len(tmm_ctx.average_thetas)} angles x {len(tmm_ctx.polarizations)} polarizations x "
+            f"{tmm_ctx.jitter_realizations} jitter realizations, +/-{tmm_ctx.thickness_jitter_nm:g} nm"
+        )
 
     # ---- validation ----
     model.eval()

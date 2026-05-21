@@ -1,4 +1,4 @@
-from typing import Any, NamedTuple, Self, Union
+from typing import Any, NamedTuple, Self, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -92,6 +92,7 @@ class TMMSpectrum(nn.Module):
         pad: int,
         msk: int,
         pol: str = "s",
+        thickness_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute R, A, T spectra for a batch of stacks.
@@ -114,6 +115,10 @@ class TMMSpectrum(nn.Module):
             MSK token ID; kept for API compatibility, used to mask mixtures in soft mode.
         pol : str, optional
             Polarization string for `coh_tmm`, typically "s" or "p".
+        thickness_override : torch.Tensor, optional
+            Continuous layer thicknesses in nm for hard-token stacks, shape
+            ``[B, S]``. This is useful for simulating manufacturing jitter
+            while keeping the saved stack tokenized.
 
         Returns
         -------
@@ -122,6 +127,9 @@ class TMMSpectrum(nn.Module):
         """
         # ---- 1. Build per-layer n, t for each sequence ----
         if stacks.dim() == 3:
+            if thickness_override is not None:
+                raise ValueError("thickness_override is only supported for hard token-id stacks.")
+
             # Soft / straight-through path: stacks ~ mixture over tokens [B, S, V]
             nk_per_token = self.nk_table[self.mat_idx_table]  # [V, W]
 
@@ -159,10 +167,20 @@ class TMMSpectrum(nn.Module):
             token_ids = stacks.to(torch.long)
             is_eos = token_ids == eos
             active = is_eos.cumsum(dim=1) == 0  # [B, S] True before EOS, False at/after
+            valid_layer = active & (token_ids != pad) & (token_ids != msk)
 
             n_base = self.nk_table[self.mat_idx_table[token_ids]]  # [B, S, W]
             # Zero thickness at/after EOS; keep n as defined for clarity
-            t_base = self.thickness[token_ids] * active.to(self.thickness.dtype)  # [B, S]
+            if thickness_override is None:
+                t_base = self.thickness[token_ids] * active.to(self.thickness.dtype)  # [B, S]
+            else:
+                if thickness_override.shape != token_ids.shape:
+                    raise ValueError(
+                        "thickness_override must have the same shape as hard token stacks "
+                        f"({tuple(token_ids.shape)}), got {tuple(thickness_override.shape)}."
+                    )
+                t_base = thickness_override.to(device=token_ids.device, dtype=torch.complex128)
+                t_base = t_base * valid_layer.to(t_base.dtype)
 
         # ---- 2. Prepend/append semi-infinite media (air front & back) ----
         b, _, w = n_base.shape
@@ -272,10 +290,102 @@ def simulate_token_sequence(ids: torch.Tensor, tmm_ctx: "TMMContext", eos: int, 
         Simulated RAT spectra of shape ``[B, 3, W]``, float32, clamped to
         ``[0, 1]``.
     """
-    tmm, wl, theta = tmm_ctx
-    out = tmm(ids, wl, theta, eos=eos, pad=pad, msk=msk)  # [B, 3, W]
+    if tmm_ctx.realistic_enabled:
+        out = simulate_token_sequence_averaged(
+            ids,
+            tmm=tmm_ctx.tmm,
+            wavelengths=tmm_ctx.wl,
+            angle_thetas=tmm_ctx.average_thetas,
+            angle_weights=tmm_ctx.angle_weights,
+            polarizations=tmm_ctx.polarizations,
+            jitter_realizations=tmm_ctx.jitter_realizations,
+            thickness_jitter_nm=tmm_ctx.thickness_jitter_nm,
+            eos=eos,
+            pad=pad,
+            msk=msk,
+        )
+    else:
+        out = tmm_ctx.tmm(ids, tmm_ctx.wl, tmm_ctx.theta, eos=eos, pad=pad, msk=msk)  # [B, 3, W]
 
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
+
+
+def active_layer_mask(stacks: torch.Tensor, eos: int, pad: int, msk: int) -> torch.Tensor:
+    """
+    Return a boolean mask for material layers before EOS.
+    """
+    token_ids = stacks.to(torch.long)
+    is_eos = token_ids == eos
+    before_eos = is_eos.cumsum(dim=1) == 0
+    return before_eos & (token_ids != pad) & (token_ids != msk)
+
+
+@torch.no_grad()
+def simulate_token_sequence_averaged(
+    ids: torch.Tensor,
+    tmm: torch.nn.Module,
+    wavelengths: torch.Tensor,
+    angle_thetas: Sequence[torch.Tensor],
+    angle_weights: Sequence[float],
+    polarizations: Sequence[str],
+    jitter_realizations: int,
+    thickness_jitter_nm: float,
+    eos: int,
+    pad: int,
+    msk: int,
+) -> torch.Tensor:
+    """
+    Simulate token stacks with angle, polarization, and thickness-jitter averaging.
+    """
+    if len(angle_thetas) != len(angle_weights):
+        raise ValueError("angle_thetas and angle_weights must have the same length.")
+    if len(polarizations) == 0:
+        raise ValueError("At least one polarization is required.")
+    if jitter_realizations <= 0:
+        raise ValueError("jitter_realizations must be positive.")
+
+    token_ids = ids.to(torch.long)
+    valid = active_layer_mask(token_ids, eos=eos, pad=pad, msk=msk)
+    nominal = tmm.thickness[token_ids].real.float() * valid.float()
+    out = torch.zeros((token_ids.size(0), 3, wavelengths.numel()), device=token_ids.device, dtype=torch.float32)
+
+    normalizer = float(sum(float(v) for v in angle_weights) * len(polarizations) * int(jitter_realizations))
+    if normalizer <= 0.0:
+        raise ValueError("Averaging weights must have positive total weight.")
+
+    for _ in range(int(jitter_realizations)):
+        if thickness_jitter_nm > 0.0:
+            jitter = (torch.rand(nominal.shape, device=token_ids.device) * 2.0 - 1.0) * float(thickness_jitter_nm)
+            thickness = (nominal + jitter).clamp_min(0.0) * valid.float()
+        else:
+            thickness = nominal
+
+        for theta, angle_weight in zip(angle_thetas, angle_weights):
+            for pol in polarizations:
+                simulated = tmm(
+                    token_ids,
+                    wavelengths,
+                    theta,
+                    eos=eos,
+                    pad=pad,
+                    msk=msk,
+                    pol=pol,
+                    thickness_override=thickness,
+                )
+                out.add_(simulated, alpha=float(angle_weight))
+
+    return (out / normalizer).clamp_(0.0, 1.0)
+
+
+def _realistic_tmm_config(cfg: dict) -> dict:
+    block = cfg.get("REALISTIC_TMM") or {}
+    if not bool(block.get("ENABLED", False)):
+        return {}
+
+    fallback = cfg.get("REALISTIC_DATASET") or {}
+    merged = dict(fallback)
+    merged.update(block)
+    return merged
 
 
 class TMMContext(NamedTuple):
@@ -290,10 +400,32 @@ class TMMContext(NamedTuple):
         Wavelength tensor [W], complex128.
     theta : torch.Tensor
         Incidence angle tensor [], [1], or broadcastable, complex128.
+    average_thetas : tuple[torch.Tensor, ...] or None
+        Optional incidence-angle tensors used for realistic averaging.
+    angle_weights : tuple[float, ...]
+        Weights for ``average_thetas``.
+    polarizations : tuple[str, ...]
+        Polarizations to average when ``average_thetas`` is set.
+    jitter_realizations : int
+        Number of thickness-jitter realizations used in averaging.
+    thickness_jitter_nm : float
+        Uniform per-layer thickness jitter range in nm.
     """
     tmm: torch.nn.Module
     wl: torch.Tensor
     theta: torch.Tensor
+    average_thetas: tuple[torch.Tensor, ...] | None = None
+    angle_weights: tuple[float, ...] = (1.0,)
+    polarizations: tuple[str, ...] = ("s",)
+    jitter_realizations: int = 1
+    thickness_jitter_nm: float = 0.0
+
+    @property
+    def realistic_enabled(self) -> bool:
+        """
+        Whether this context uses realistic averaged TMM simulation.
+        """
+        return self.average_thetas is not None
 
     @staticmethod
     @torch.no_grad()
@@ -330,5 +462,28 @@ class TMMContext(NamedTuple):
             path_materials=cfg["MATERIALS_PATH"],
             idx_to_token=idx_to_token,
         )
+
+        realistic_cfg = _realistic_tmm_config(cfg)
+        if realistic_cfg:
+            angles = tuple(float(v) for v in realistic_cfg.get("ANGLES", [cfg["INCIDENCE_ANGLE"]]))
+            angle_weights = tuple(float(v) for v in realistic_cfg.get("ANGLE_WEIGHTS", [1.0] * len(angles)))
+            polarizations = tuple(str(v) for v in realistic_cfg.get("POLARIZATIONS", ["s", "p"]))
+            if len(angles) != len(angle_weights):
+                raise ValueError("REALISTIC_TMM.ANGLES and REALISTIC_TMM.ANGLE_WEIGHTS must have the same length.")
+
+            average_thetas = tuple(
+                torch.tensor(angle * torch.pi / 180.0, device=device, dtype=torch.complex128).unsqueeze(0)
+                for angle in angles
+            )
+            return TMMContext(
+                tmm=tmm,
+                wl=wl_tensor,
+                theta=theta,
+                average_thetas=average_thetas,
+                angle_weights=angle_weights,
+                polarizations=polarizations,
+                jitter_realizations=int(realistic_cfg.get("JITTER_REALIZATIONS", 1)),
+                thickness_jitter_nm=float(realistic_cfg.get("THICKNESS_JITTER_NM", 0.0)),
+            )
 
         return TMMContext(tmm=tmm, wl=wl_tensor, theta=theta)
