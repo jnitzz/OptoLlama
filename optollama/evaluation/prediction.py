@@ -1,12 +1,23 @@
+import time
+
 from typing import Any, Optional
 
 import torch
+import tqdm
 # ruff: noqa: F401
 
 import optollama.evaluation
 import optollama.utils
 
 from optollama.evaluation.simulation import TMMContext
+
+
+def sync_for_timing(device: torch.device, enabled: bool) -> None:
+    """
+    Synchronize CUDA work when wall-clock timing is requested.
+    """
+    if enabled and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def validate_and_setup(
@@ -133,7 +144,9 @@ def run_mc_batch(
     record_all_mc: bool,
     record_pred_spectra: bool,
     device: torch.device,
-) -> tuple[dict, dict]:
+    deduplicate_stacks: bool = False,
+    profile_timing: bool = False,
+) -> tuple[dict, dict, dict[str, float]]:
     """
     Run the Monte-Carlo sampling loop for a single batch.
 
@@ -167,11 +180,16 @@ def run_mc_batch(
         Whether to include predicted spectra in the MC recording.
     device : torch.device
         Device for intermediate tensors.
+    deduplicate_stacks : bool
+        Whether to simulate unique predicted stacks only and scatter spectra
+        back to duplicate MC entries.
+    profile_timing : bool
+        Whether to synchronize CUDA and record coarse timing.
 
     Returns
     -------
-    tuple[dict, dict]
-        ``(best, draws)`` where:
+    tuple[dict, dict, dict[str, float]]
+        ``(best, draws, timing)`` where:
 
         - ``best`` contains ``"mae"``, ``"ids"``, ``"pred_spectra"``
           (or ``None``), and ``"step_mae_traj"`` (or ``None``) for the
@@ -182,16 +200,52 @@ def run_mc_batch(
     """
     b = spectra.size(0)
     m = max(1, mc_samples)
+    timing = {
+        "model_s": 0.0,
+        "tmm_s": 0.0,
+        "record_s": 0.0,
+        "dedup_input": 0.0,
+        "dedup_unique": 0.0,
+    }
 
     # Expand MC draws into the batch dimension so sampling and optional TMM
     # simulation run in one vectorized pass.
     spectra_mc = spectra.unsqueeze(1).expand(b, m, *spectra.shape[1:]).reshape(b * m, *spectra.shape[1:])
+    sync_for_timing(device, profile_timing)
+    t0 = time.perf_counter()
     logits_or_ids, mae_traj_s = model(spectra_mc)
     ids_flat = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
     ids = ids_flat.view(b, m, -1)
+    sync_for_timing(device, profile_timing)
+    timing["model_s"] = time.perf_counter() - t0
 
     if do_sim:
-        pred_flat = optollama.evaluation.simulation.simulate_token_sequence(ids_flat, tmm_ctx, eos=eos, pad=pad, msk=msk)
+        sync_for_timing(device, profile_timing)
+        t0 = time.perf_counter()
+        if deduplicate_stacks:
+            unique_ids, inverse = torch.unique(ids_flat, dim=0, return_inverse=True)
+            pred_unique = optollama.evaluation.simulation.simulate_token_sequence(
+                unique_ids,
+                tmm_ctx,
+                eos=eos,
+                pad=pad,
+                msk=msk,
+            )
+            pred_flat = pred_unique[inverse]
+            timing["dedup_input"] = float(ids_flat.size(0))
+            timing["dedup_unique"] = float(unique_ids.size(0))
+        else:
+            pred_flat = optollama.evaluation.simulation.simulate_token_sequence(
+                ids_flat,
+                tmm_ctx,
+                eos=eos,
+                pad=pad,
+                msk=msk,
+            )
+            timing["dedup_input"] = float(ids_flat.size(0))
+            timing["dedup_unique"] = float(ids_flat.size(0))
+        sync_for_timing(device, profile_timing)
+        timing["tmm_s"] = time.perf_counter() - t0
         mae_flat = optollama.evaluation.metrics.masked_mae_roi(spectra_mc, pred_flat, wl_mask=roi_mask)
         pred = pred_flat.view(b, m, *pred_flat.shape[1:])
         mae = mae_flat.view(b, m)
@@ -205,6 +259,8 @@ def run_mc_batch(
 
     draws = {"mae": [], "ids": [], "pred_spectra": [], "traj": []}
     if record_all_mc:
+        sync_for_timing(device, profile_timing)
+        t0 = time.perf_counter()
         for sample_idx in range(m):
             draws["mae"].append(mae[:, sample_idx].detach().cpu())
             draws["ids"].append(ids[:, sample_idx].detach().cpu())
@@ -212,6 +268,8 @@ def run_mc_batch(
                 draws["pred_spectra"].append(pred[:, sample_idx].detach().cpu())
             if traj is not None:
                 draws["traj"].append(traj[:, sample_idx].detach().cpu())
+        sync_for_timing(device, profile_timing)
+        timing["record_s"] = time.perf_counter() - t0
 
     if do_sim:
         best_indices = mae.argmin(dim=1)
@@ -232,7 +290,7 @@ def run_mc_batch(
         "step_mae_traj": best_step_mae_traj,
     }
 
-    return best, draws
+    return best, draws, timing
 
 
 def accumulate_mc_draws(
@@ -533,6 +591,9 @@ def model_prediction(
     rank: int = 0,
     world_size: int = 1,
     gather: bool = True,
+    show_progress: bool = False,
+    profile_timing: bool = False,
+    deduplicate_stacks: bool = False,
 ) -> dict[str, Any]:
     """
     Prediction routine with optional Monte-Carlo best-of-N and DDP gathering.
@@ -579,6 +640,13 @@ def model_prediction(
         Total number of DDP processes (default: ``1``).
     gather : bool
         If ``True``, gather results onto rank 0 (default: ``True``).
+    show_progress : bool
+        Whether to show a tqdm progress bar on rank 0.
+    profile_timing : bool
+        Whether to collect coarse model/TMM/recording timings.
+    deduplicate_stacks : bool
+        Whether to simulate unique predicted stacks only before scattering
+        spectra back to duplicate MC entries.
 
     Returns
     -------
@@ -607,15 +675,37 @@ def model_prediction(
     all_mc_mae, all_mc_ids, all_mc_pred, all_mc_traj, results = [], [], [], [], []
     total_correct, total_tokens = 0.0, 0.0
     total_mae, total_mae_examples, running_idx = 0.0, 0.0, 0
+    timing_totals = {
+        "model_s": 0.0,
+        "tmm_s": 0.0,
+        "record_s": 0.0,
+        "post_s": 0.0,
+        "dedup_input": 0.0,
+        "dedup_unique": 0.0,
+    }
 
-    for batch in loader:
+    iterator = tqdm.tqdm(
+        loader,
+        total=len(loader) if hasattr(loader, "__len__") else None,
+        desc="inference",
+        disable=(not show_progress) or rank != 0,
+    )
+
+    for batch in iterator:
         spectra, stacks, idxs, running_idx = unpack_batch(batch, running_idx, device)
         b = spectra.size(0)
 
-        best, draws = run_mc_batch(
+        best, draws, timing = run_mc_batch(
             model, spectra, mc_samples, do_sim, tmm_ctx,
             eos, pad, msk, roi_mask, record_all_mc, record_pred_spectra, device,
+            deduplicate_stacks=deduplicate_stacks,
+            profile_timing=profile_timing,
         )
+        for key in timing_totals:
+            timing_totals[key] += float(timing.get(key, 0.0))
+
+        sync_for_timing(device, profile_timing)
+        t0 = time.perf_counter()
 
         if record_all_mc:
             accumulate_mc_draws(
@@ -645,6 +735,18 @@ def model_prediction(
                 spectra, idx_to_token, eos, pad, msk, do_sim,
             ))
 
+        sync_for_timing(device, profile_timing)
+        timing_totals["post_s"] += time.perf_counter() - t0
+
+        if show_progress and rank == 0 and profile_timing:
+            postfix = {
+                "model": f"{timing['model_s']:.2f}s",
+                "tmm": f"{timing['tmm_s']:.2f}s",
+            }
+            if timing.get("dedup_input", 0.0) > 0.0:
+                postfix["unique"] = f"{int(timing['dedup_unique'])}/{int(timing['dedup_input'])}"
+            iterator.set_postfix(postfix)
+
     if gather and ddp:
         results = gather_ddp_results(results, world_size, rank)
 
@@ -661,6 +763,11 @@ def model_prediction(
         "mean_acc": total_correct / max(total_tokens, 1.0),
         "mean_mae": (total_mae / max(total_mae_examples, 1.0)) if do_sim else None,
     }
+    if profile_timing:
+        timing_out = dict(timing_totals)
+        if timing_totals["dedup_input"] > 0.0:
+            timing_out["dedup_ratio"] = timing_totals["dedup_unique"] / timing_totals["dedup_input"]
+        out["timing"] = timing_out
     if not ddp or rank == 0:
         out["results"] = results
         if record_all_mc:

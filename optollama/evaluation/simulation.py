@@ -349,30 +349,44 @@ def simulate_token_sequence_averaged(
     nominal = tmm.thickness[token_ids].real.float() * valid.float()
     out = torch.zeros((token_ids.size(0), 3, wavelengths.numel()), device=token_ids.device, dtype=torch.float32)
 
-    normalizer = float(sum(float(v) for v in angle_weights) * len(polarizations) * int(jitter_realizations))
+    normalizer = float(sum(float(v) for v in angle_weights) * len(polarizations))
     if normalizer <= 0.0:
         raise ValueError("Averaging weights must have positive total weight.")
 
-    for _ in range(int(jitter_realizations)):
-        if thickness_jitter_nm > 0.0:
-            jitter = (torch.rand(nominal.shape, device=token_ids.device) * 2.0 - 1.0) * float(thickness_jitter_nm)
-            thickness = (nominal + jitter).clamp_min(0.0) * valid.float()
-        else:
-            thickness = nominal
+    if thickness_jitter_nm > 0.0 and int(jitter_realizations) > 1:
+        b, s = token_ids.shape
+        jr = int(jitter_realizations)
+        sim_ids = token_ids.unsqueeze(0).expand(jr, b, s).reshape(jr * b, s)
+        sim_valid = valid.unsqueeze(0).expand(jr, b, s).reshape(jr * b, s)
+        sim_nominal = nominal.unsqueeze(0).expand(jr, b, s).reshape(jr * b, s)
+        jitter = (torch.rand((jr * b, s), device=token_ids.device) * 2.0 - 1.0) * float(thickness_jitter_nm)
+        sim_thickness = (sim_nominal + jitter).clamp_min(0.0) * sim_valid.float()
+    elif thickness_jitter_nm > 0.0:
+        sim_ids = token_ids
+        jitter = (torch.rand(nominal.shape, device=token_ids.device) * 2.0 - 1.0) * float(thickness_jitter_nm)
+        sim_thickness = nominal + jitter
+        sim_thickness = sim_thickness.clamp_min(0.0) * valid.float()
+        jr = 1
+    else:
+        sim_ids = token_ids
+        sim_thickness = nominal
+        jr = 1
 
-        for theta, angle_weight in zip(angle_thetas, angle_weights):
-            for pol in polarizations:
-                simulated = tmm(
-                    token_ids,
-                    wavelengths,
-                    theta,
-                    eos=eos,
-                    pad=pad,
-                    msk=msk,
-                    pol=pol,
-                    thickness_override=thickness,
-                )
-                out.add_(simulated, alpha=float(angle_weight))
+    for theta, angle_weight in zip(angle_thetas, angle_weights):
+        for pol in polarizations:
+            simulated = tmm(
+                sim_ids,
+                wavelengths,
+                theta,
+                eos=eos,
+                pad=pad,
+                msk=msk,
+                pol=pol,
+                thickness_override=sim_thickness,
+            )
+            if jr > 1:
+                simulated = simulated.view(jr, token_ids.size(0), *simulated.shape[1:]).mean(dim=0)
+            out.add_(simulated, alpha=float(angle_weight))
 
     return (out / normalizer).clamp_(0.0, 1.0)
 

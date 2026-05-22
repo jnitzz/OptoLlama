@@ -222,6 +222,18 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
 
     # ---- validation ----
     model.eval()
+    record_all_mc = bool(cfg.get("INFERENCE_RECORD_ALL_MC", True))
+    record_pred_spectra = bool(cfg.get("INFERENCE_RECORD_PRED_SPECTRA", True))
+    show_progress = bool(cfg.get("INFERENCE_SHOW_PROGRESS", True))
+    profile_timing = bool(cfg.get("INFERENCE_PROFILE_TIMING", False))
+    deduplicate_stacks = bool(cfg.get("INFERENCE_DEDUP_STACKS", False))
+    if rank == 0:
+        print(
+            "Inference options: "
+            f"record_all_mc={record_all_mc}, record_pred_spectra={record_pred_spectra}, "
+            f"deduplicate_stacks={deduplicate_stacks}, profile_timing={profile_timing}"
+        )
+
     test_output = optollama.evaluation.model_prediction(
         model,
         test_loader,
@@ -238,8 +250,11 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         gather=True,
         track_step_mae=cfg["TRACK_DIFFUSION_STEPS_MAE"],
         roi_mask=optollama.data.spectra.wavelength_mask(cfg["WAVELENGTHS"], cfg["ROI_MIN"], cfg["ROI_MAX"], device),
-        record_all_mc=True,
-        record_pred_spectra=True,
+        record_all_mc=record_all_mc,
+        record_pred_spectra=record_pred_spectra,
+        show_progress=show_progress,
+        profile_timing=profile_timing,
+        deduplicate_stacks=deduplicate_stacks,
     )
 
     # --- save outputs to disk ---
@@ -274,6 +289,21 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
 
         print(f"\tmean token accuracy: {accuracy:.2f}%")
         print(f"\ttest MAE: {mae:.6f}")
+        timing = test_output.get("timing")
+        if timing:
+            print(
+                "\ttiming: "
+                f"model={timing.get('model_s', 0.0):.2f}s, "
+                f"tmm={timing.get('tmm_s', 0.0):.2f}s, "
+                f"record={timing.get('record_s', 0.0):.2f}s, "
+                f"post={timing.get('post_s', 0.0):.2f}s"
+            )
+            if "dedup_ratio" in timing:
+                print(
+                    "\tdedup: "
+                    f"unique/input={timing['dedup_ratio']:.3f} "
+                    f"({int(timing.get('dedup_unique', 0))}/{int(timing.get('dedup_input', 0))})"
+                )
 
     return test_output, idx_to_token, eos_idx, pad_idx, msk_idx
 

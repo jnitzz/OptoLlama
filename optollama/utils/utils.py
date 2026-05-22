@@ -372,7 +372,7 @@ def load_spectra(path: str, cfg: dict) -> torch.Tensor:
         x = torch.as_tensor(data["spectra"], dtype=torch.float32)
 
     else:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             rows = [[float(v) for v in row] for row in csv.reader(f) if row]
         x = torch.tensor(rows, dtype=torch.float32).T  # [3, W]
 
