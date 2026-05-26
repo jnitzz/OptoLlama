@@ -141,6 +141,8 @@ def run_mc_batch(
     pad: int,
     msk: int,
     roi_mask: Optional[torch.Tensor],
+    source_wavelengths: Optional[torch.Tensor],
+    common_mae_wavelengths: Optional[torch.Tensor],
     record_all_mc: bool,
     record_pred_spectra: bool,
     device: torch.device,
@@ -174,6 +176,11 @@ def run_mc_batch(
         MASK token id.
     roi_mask : torch.Tensor or None
         Boolean wavelength mask for ROI-restricted MAE.
+    source_wavelengths : torch.Tensor or None
+        Native wavelength grid for the input/predicted spectra.
+    common_mae_wavelengths : torch.Tensor or None
+        Optional comparison grid used to compute MAE independent of the
+        native config wavelength spacing.
     record_all_mc : bool
         Whether to record every MC draw.
     record_pred_spectra : bool
@@ -247,22 +254,34 @@ def run_mc_batch(
         sync_for_timing(device, profile_timing)
         timing["tmm_s"] = time.perf_counter() - t0
         mae_flat = optollama.evaluation.metrics.masked_mae_roi(spectra_mc, pred_flat, wl_mask=roi_mask)
+        mae_common_flat = None
+        if source_wavelengths is not None and common_mae_wavelengths is not None:
+            mae_common_flat = optollama.evaluation.metrics.resampled_mae(
+                spectra_mc,
+                pred_flat,
+                source_wavelengths=source_wavelengths,
+                target_wavelengths=common_mae_wavelengths,
+            )
         pred = pred_flat.view(b, m, *pred_flat.shape[1:])
         mae = mae_flat.view(b, m)
+        mae_common = mae_common_flat.view(b, m) if mae_common_flat is not None else None
     else:
         pred = None
         mae = torch.zeros((b, m), device=device)
+        mae_common = None
 
     traj = None
     if mae_traj_s is not None:
         traj = mae_traj_s.view(b, m, -1)
 
-    draws = {"mae": [], "ids": [], "pred_spectra": [], "traj": []}
+    draws = {"mae": [], "mae_common": [], "ids": [], "pred_spectra": [], "traj": []}
     if record_all_mc:
         sync_for_timing(device, profile_timing)
         t0 = time.perf_counter()
         for sample_idx in range(m):
             draws["mae"].append(mae[:, sample_idx].detach().cpu())
+            if mae_common is not None:
+                draws["mae_common"].append(mae_common[:, sample_idx].detach().cpu())
             draws["ids"].append(ids[:, sample_idx].detach().cpu())
             if do_sim and record_pred_spectra and pred is not None:
                 draws["pred_spectra"].append(pred[:, sample_idx].detach().cpu())
@@ -279,12 +298,14 @@ def run_mc_batch(
 
     batch_indices = torch.arange(b, device=device)
     best_mae = mae[batch_indices, best_indices]
+    best_mae_common = mae_common[batch_indices, best_indices] if mae_common is not None else None
     best_pred_ids = ids[batch_indices, best_indices]
     best_pred_spectra = pred[batch_indices, best_indices] if pred is not None else None
     best_step_mae_traj = traj[batch_indices, best_indices] if traj is not None else None
 
     best = {
         "mae": best_mae,
+        "mae_common": best_mae_common,
         "ids": best_pred_ids,
         "pred_spectra": best_pred_spectra,
         "step_mae_traj": best_step_mae_traj,
@@ -300,6 +321,7 @@ def accumulate_mc_draws(
     record_pred_spectra: bool,
     track_step_mae: bool,
     all_mc_mae: list,
+    all_mc_mae_common: list,
     all_mc_ids: list,
     all_mc_pred: list,
     all_mc_traj: list,
@@ -321,6 +343,8 @@ def accumulate_mc_draws(
         Whether step-wise MAE trajectories were recorded.
     all_mc_mae : list
         Global accumulator for MAE draws (mutated in-place).
+    all_mc_mae_common : list
+        Global accumulator for common-grid MAE draws (mutated in-place).
     all_mc_ids : list
         Global accumulator for id draws (mutated in-place).
     all_mc_pred : list
@@ -340,6 +364,13 @@ def accumulate_mc_draws(
             f"got mae={len(draws['mae'])} ids={len(draws['ids'])}"
         )
     all_mc_mae.append(draws["mae"])
+    if draws.get("mae_common"):
+        if len(draws["mae_common"]) != m:
+            raise RuntimeError(
+                f"MC common-MAE recording mismatch: expected m={m}, "
+                f"got mae_common={len(draws['mae_common'])}"
+            )
+        all_mc_mae_common.append(draws["mae_common"])
     all_mc_ids.append(draws["ids"])
 
     if do_sim and record_pred_spectra:
@@ -361,6 +392,7 @@ def build_example_record(
     ids_aligned: torch.Tensor,
     acc_vec: torch.Tensor,
     best_mae: torch.Tensor,
+    best_mae_common: Optional[torch.Tensor],
     best_pred_spectra: Optional[torch.Tensor],
     best_step_mae_traj: Optional[torch.Tensor],
     spectra: torch.Tensor,
@@ -387,6 +419,8 @@ def build_example_record(
         Per-example token accuracy, shape ``[B]``.
     best_mae : torch.Tensor
         Per-example best MAE, shape ``[B]``.
+    best_mae_common : torch.Tensor or None
+        Per-example best common-grid MAE, shape ``[B]``, or ``None``.
     best_pred_spectra : torch.Tensor or None
         Best predicted spectra, shape ``[B, 3, W]``, or ``None``.
     best_step_mae_traj : torch.Tensor or None
@@ -435,6 +469,8 @@ def build_example_record(
             "rat_target": spectra[i].detach().cpu().numpy().tolist(),
             "rat_pred": best_pred_spectra[i].detach().cpu().numpy().tolist(),
         })
+        if best_mae_common is not None:
+            rec["mae_common"] = float(best_mae_common[i].item())
 
     if best_step_mae_traj is not None:
         rec["mae_traj"] = best_step_mae_traj[i].detach().cpu().tolist()
@@ -476,9 +512,11 @@ def reduce_ddp_metric_sums(
     total_tokens: float,
     total_mae: float,
     total_mae_examples: float,
+    total_mae_common: float,
+    total_mae_common_examples: float,
     ddp: bool,
     device: torch.device,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     """
     Reduce metric numerators and denominators across DDP ranks.
 
@@ -492,6 +530,10 @@ def reduce_ddp_metric_sums(
         Local sum of per-example MAE values.
     total_mae_examples : float
         Local number of examples contributing to MAE.
+    total_mae_common : float
+        Local sum of per-example common-grid MAE values.
+    total_mae_common_examples : float
+        Local number of examples contributing to common-grid MAE.
     ddp : bool
         Whether DistributedDataParallel is active.
     device : torch.device
@@ -503,10 +545,17 @@ def reduce_ddp_metric_sums(
         Globally reduced metric sums.
     """
     if not ddp:
-        return total_correct, total_tokens, total_mae, total_mae_examples
+        return total_correct, total_tokens, total_mae, total_mae_examples, total_mae_common, total_mae_common_examples
 
     totals = torch.tensor(
-        [total_correct, total_tokens, total_mae, total_mae_examples],
+        [
+            total_correct,
+            total_tokens,
+            total_mae,
+            total_mae_examples,
+            total_mae_common,
+            total_mae_common_examples,
+        ],
         device=device,
         dtype=torch.float64,
     )
@@ -517,6 +566,7 @@ def reduce_ddp_metric_sums(
 
 def assemble_mc_grids(
     all_mc_mae: list,
+    all_mc_mae_common: list,
     all_mc_ids: list,
     all_mc_pred: list,
     all_mc_traj: list,
@@ -532,6 +582,9 @@ def assemble_mc_grids(
     ----
     all_mc_mae : list
         List over batches; each element is a list of ``m`` tensors ``[B]``.
+    all_mc_mae_common : list
+        List over batches; each element is a list of ``m`` common-grid MAE
+        tensors ``[B]``.
     all_mc_ids : list
         List over batches; each element is a list of ``m`` tensors ``[B, S]``.
     all_mc_pred : list
@@ -563,6 +616,9 @@ def assemble_mc_grids(
         "ids_grid": _concat_and_stack(all_mc_ids).to(torch.long),
     }
 
+    if all_mc_mae_common:
+        grids["mae_common_grid"] = _concat_and_stack(all_mc_mae_common).to(torch.float32)
+
     if do_sim and record_pred_spectra and all_mc_pred:
         grids["pred_spectra_grid"] = _concat_and_stack(all_mc_pred).to(torch.float32)
 
@@ -586,6 +642,8 @@ def model_prediction(
     mc_samples: int = 1,
     track_step_mae: bool = False,
     roi_mask: Optional[torch.Tensor] = None,
+    source_wavelengths: Optional[torch.Tensor] = None,
+    common_mae_wavelengths: Optional[torch.Tensor] = None,
     record_all_mc: bool = False,
     record_pred_spectra: bool = True,
     rank: int = 0,
@@ -630,6 +688,11 @@ def model_prediction(
         ``mode="TMM_FAST"``).
     roi_mask : torch.Tensor, optional
         Boolean wavelength mask for ROI-restricted MAE computation.
+    source_wavelengths : torch.Tensor, optional
+        Native wavelength grid for spectra passed through ``loader``.
+    common_mae_wavelengths : torch.Tensor, optional
+        Fixed comparison grid used for ``mae_common`` and
+        ``mean_mae_common``.
     record_all_mc : bool
         If ``True``, store raw ids and MAE for every MC draw.
     record_pred_spectra : bool
@@ -654,13 +717,18 @@ def model_prediction(
         Dictionary with keys:
 
         - ``"mean_acc"`` (float): mean token accuracy.
-        - ``"mean_mae"`` (float or None): mean MAE; ``None`` when
-          ``mode="NO_SIM"``.
+        - ``"mean_mae"`` (float or None): mean native/ROI MAE; ``None``
+          when ``mode="NO_SIM"``.
+        - ``"mean_mae_common"`` (float or None): mean MAE after resampling
+          to ``common_mae_wavelengths``; ``None`` when no common grid is
+          configured or ``mode="NO_SIM"``.
         - ``"results"`` (list[dict]): per-example records (rank 0 only).
 
         Optional keys (rank 0 only) when ``record_all_mc=True``:
 
-        - ``"mae_grid"`` — shape ``[N, m]``, float.
+        - ``"mae_grid"`` — shape ``[N, m]``, native/ROI MAE, float.
+        - ``"mae_common_grid"`` — shape ``[N, m]``, common-grid MAE, float
+          (only when a common grid is configured).
         - ``"ids_grid"`` — shape ``[N, m, S]``, long.
         - ``"pred_spectra_grid"`` — shape ``[N, m, 3, W]``, float
           (only when ``do_sim`` and ``record_pred_spectra``).
@@ -672,9 +740,10 @@ def model_prediction(
         mode, tmm_ctx, track_step_mae, model, ddp, rank, gather, record_all_mc
     )
 
-    all_mc_mae, all_mc_ids, all_mc_pred, all_mc_traj, results = [], [], [], [], []
+    all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj, results = [], [], [], [], [], []
     total_correct, total_tokens = 0.0, 0.0
     total_mae, total_mae_examples, running_idx = 0.0, 0.0, 0
+    total_mae_common, total_mae_common_examples = 0.0, 0.0
     timing_totals = {
         "model_s": 0.0,
         "tmm_s": 0.0,
@@ -697,7 +766,8 @@ def model_prediction(
 
         best, draws, timing = run_mc_batch(
             model, spectra, mc_samples, do_sim, tmm_ctx,
-            eos, pad, msk, roi_mask, record_all_mc, record_pred_spectra, device,
+            eos, pad, msk, roi_mask, source_wavelengths, common_mae_wavelengths,
+            record_all_mc, record_pred_spectra, device,
             deduplicate_stacks=deduplicate_stacks,
             profile_timing=profile_timing,
         )
@@ -710,7 +780,7 @@ def model_prediction(
         if record_all_mc:
             accumulate_mc_draws(
                 draws, mc_samples, do_sim, record_pred_spectra, track_step_mae,
-                all_mc_mae, all_mc_ids, all_mc_pred, all_mc_traj,
+                all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj,
             )
 
         len_seq = min(stacks.size(1), best["ids"].size(1))
@@ -727,11 +797,14 @@ def model_prediction(
             mae_vec = optollama.evaluation.metrics.masked_mae_roi(spectra, best["pred_spectra"], wl_mask=roi_mask)
             total_mae += float(mae_vec.sum().item())
             total_mae_examples += float(mae_vec.numel())
+            if best["mae_common"] is not None:
+                total_mae_common += float(best["mae_common"].sum().item())
+                total_mae_common_examples += float(best["mae_common"].numel())
 
         for i in range(b):
             results.append(build_example_record(
                 i, idxs, stacks_aligned, ids_aligned, acc_vec,
-                best["mae"], best["pred_spectra"], best["step_mae_traj"],
+                best["mae"], best["mae_common"], best["pred_spectra"], best["step_mae_traj"],
                 spectra, idx_to_token, eos, pad, msk, do_sim,
             ))
 
@@ -750,11 +823,20 @@ def model_prediction(
     if gather and ddp:
         results = gather_ddp_results(results, world_size, rank)
 
-    total_correct, total_tokens, total_mae, total_mae_examples = reduce_ddp_metric_sums(
+    (
         total_correct,
         total_tokens,
         total_mae,
         total_mae_examples,
+        total_mae_common,
+        total_mae_common_examples,
+    ) = reduce_ddp_metric_sums(
+        total_correct,
+        total_tokens,
+        total_mae,
+        total_mae_examples,
+        total_mae_common,
+        total_mae_common_examples,
         ddp,
         device,
     )
@@ -762,7 +844,14 @@ def model_prediction(
     out: dict[str, Any] = {
         "mean_acc": total_correct / max(total_tokens, 1.0),
         "mean_mae": (total_mae / max(total_mae_examples, 1.0)) if do_sim else None,
+        "mean_mae_common": (
+            total_mae_common / max(total_mae_common_examples, 1.0)
+            if do_sim and total_mae_common_examples > 0.0
+            else None
+        ),
     }
+    if common_mae_wavelengths is not None:
+        out["common_mae_wavelengths"] = torch.as_tensor(common_mae_wavelengths).detach().cpu()
     if profile_timing:
         timing_out = dict(timing_totals)
         if timing_totals["dedup_input"] > 0.0:
@@ -772,7 +861,7 @@ def model_prediction(
         out["results"] = results
         if record_all_mc:
             out.update(assemble_mc_grids(
-                all_mc_mae, all_mc_ids, all_mc_pred, all_mc_traj,
+                all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj,
                 max(1, mc_samples), do_sim, record_pred_spectra, track_step_mae,
             ))
 

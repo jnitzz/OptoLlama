@@ -43,14 +43,17 @@ def parse_arguments() -> argparse.Namespace:
     sample = subparsers.add_parser("sample", help="Plot one target/prediction sample.")
     sample.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     sample.add_argument("--index", type=int, default=None, help="Result index to plot. Defaults to the best-MAE sample.")
+    sample.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
     sample.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
-    sample.add_argument("--save", type=str, default=None, help="Optional output path for the figure.")
+    sample.add_argument("--save", type=str, default=None, help="Output file for single-target mode, output directory for multi-target mode.")
 
     dashboard = subparsers.add_parser("dashboard", help="Plot the MC dashboard over all saved samples.")
     dashboard.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     dashboard.add_argument("--topk", type=int, default=4, help="Number of best grid cells to detail below the heatmap.")
+    dashboard.add_argument("--mae", choices=("native", "common"), default="native", help="MAE grid to display.")
+    dashboard.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
     dashboard.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
-    dashboard.add_argument("--save", type=str, default=None, help="Optional output path for the figure.")
+    dashboard.add_argument("--save", type=str, default=None, help="Output file for single-target mode, output directory for multi-target mode.")
 
     nn_scatter = subparsers.add_parser("nn-scatter", help="Plot model-vs-nearest-neighbor MAE scatter.")
     nn_scatter.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
@@ -81,6 +84,9 @@ def ensure_plot_dir(cfg: dict) -> str:
 
 def save_figure(fig: plt.Figure, path: str, show: bool) -> None:
     """Save the figure, optionally display it, then close it."""
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
     print(f"Saved plot to {path}")
     if show:
@@ -88,7 +94,49 @@ def save_figure(fig: plt.Figure, path: str, show: bool) -> None:
     plt.close(fig)
 
 
-def sample_command(cfg: dict, args: argparse.Namespace) -> None:
+def _target_matches(spec: optollama.utils.TargetSpec, query: str) -> bool:
+    """Return whether a target selector matches a resolved target."""
+    query_lower = query.lower()
+    choices = {
+        spec.name.lower(),
+        Path(spec.target).stem.lower(),
+        str(spec.target).lower(),
+    }
+    return query_lower in choices
+
+
+def _plot_target_entries(
+    cfg: dict,
+    target_selector: str | None,
+) -> tuple[list[tuple[optollama.utils.TargetSpec | None, dict]], bool]:
+    """Return target-specific plotting configs when multi-target mode is configured."""
+    entries, multi_target = optollama.utils.target_cfgs(cfg)
+    if not entries:
+        return [(None, cfg)], False
+    if not multi_target:
+        return [(entries[0][0], entries[0][1])], False
+
+    if target_selector is not None:
+        entries = [(spec, target_cfg) for spec, target_cfg in entries if _target_matches(spec, target_selector)]
+        if not entries:
+            raise ValueError(f"No configured target matched --target {target_selector!r}.")
+
+    return entries, True
+
+
+def _multi_plot_path(cfg: dict, save_dir: str | None, spec: optollama.utils.TargetSpec, filename: str) -> str:
+    """Build a central multi-target plot path."""
+    plot_dir = Path(save_dir) if save_dir else Path(cfg["OUTPUT_PATH"]) / "plots"
+    return str(plot_dir / f"{spec.name}_{filename}")
+
+
+def _sample_one(
+    cfg: dict,
+    args: argparse.Namespace,
+    *,
+    title_prefix: str | None = None,
+    save_path: str | None = None,
+) -> None:
     """Render a single-sample comparison plot from inference outputs."""
     results = optollama.plotting.load_results(cfg["SAMPLES_PATH"])
     if not results:
@@ -149,6 +197,7 @@ def sample_command(cfg: dict, args: argparse.Namespace) -> None:
         target_tokens=sample.get("stack_target_tokens", []),
         sample_acc=sample.get("acc"),
         sample_mae=sample.get("mae"),
+        sample_mae_common=sample.get("mae_common"),
         mc_samples=cfg.get("MC_SAMPLES"),
         roi_min=cfg.get("ROI_MIN"),
         roi_max=cfg.get("ROI_MAX"),
@@ -156,15 +205,35 @@ def sample_command(cfg: dict, args: argparse.Namespace) -> None:
         nn_tokens=nn_tokens,
         nn_id=nn_id,
         nn_mae=nn_mae,
-        title=f"Sample {sample_index}",
+        title=f"{title_prefix} sample {sample_index}" if title_prefix else f"Sample {sample_index}",
     )
 
-    plot_dir = ensure_plot_dir(cfg)
-    save_path = args.save or os.path.join(plot_dir, f"sample_{sample_index}.pdf")
+    if save_path is None and args.save is None:
+        save_path = os.path.join(ensure_plot_dir(cfg), f"sample_{sample_index}.pdf")
+    else:
+        save_path = save_path or args.save
     save_figure(fig, save_path, args.show)
 
 
-def dashboard_command(cfg: dict, args: argparse.Namespace) -> None:
+def sample_command(cfg: dict, args: argparse.Namespace) -> None:
+    """Render one sample plot, or one plot per configured target."""
+    entries, multi_target = _plot_target_entries(cfg, args.target)
+    if not multi_target:
+        _sample_one(entries[0][1], args)
+        return
+
+    for spec, target_cfg in entries:
+        save_path = _multi_plot_path(cfg, args.save, spec, "sample.pdf")
+        _sample_one(target_cfg, args, title_prefix=spec.name, save_path=save_path)
+
+
+def _dashboard_one(
+    cfg: dict,
+    args: argparse.Namespace,
+    *,
+    title_prefix: str | None = None,
+    save_path: str | None = None,
+) -> None:
     """Render the MC dashboard plot from the saved plot bundle."""
     bundle_path = cfg.get("PLOT_BUNDLE_PATH")
     if not bundle_path or not os.path.exists(bundle_path):
@@ -173,8 +242,9 @@ def dashboard_command(cfg: dict, args: argparse.Namespace) -> None:
         )
 
     bundle = optollama.plotting.load_plot_bundle(bundle_path)
-    if bundle.mae_grid is None:
-        raise RuntimeError(f"No mae_grid found in plot bundle {bundle_path}")
+    mae_grid = bundle.mae_common_grid if args.mae == "common" else bundle.mae_grid
+    if mae_grid is None:
+        raise RuntimeError(f"No {args.mae} MAE grid found in plot bundle {bundle_path}")
 
     results = optollama.plotting.load_results(cfg["SAMPLES_PATH"])
     target_spec = optollama.plotting.results_target_spectra(results)
@@ -197,18 +267,36 @@ def dashboard_command(cfg: dict, args: argparse.Namespace) -> None:
     )
 
     fig = optollama.plotting.plot_mc_dashboard(
-        mae_grid=bundle.mae_grid,
+        mae_grid=mae_grid,
         target_spec=target_spec,
         pred_spec_grid=bundle.pred_spectra_grid,
         pred_tokens_grid=pred_tokens_grid,
         wavelengths=wavelengths,
         topk=args.topk,
-        title=f"{cfg['MODEL']} {cfg['RUN']} dashboard",
+        title=(
+            f"{cfg['MODEL']} {cfg['RUN']} {title_prefix} dashboard ({args.mae} MAE)"
+            if title_prefix
+            else f"{cfg['MODEL']} {cfg['RUN']} dashboard ({args.mae} MAE)"
+        ),
     )
 
-    plot_dir = ensure_plot_dir(cfg)
-    save_path = args.save or os.path.join(plot_dir, "dashboard.pdf")
+    if save_path is None and args.save is None:
+        save_path = os.path.join(ensure_plot_dir(cfg), "dashboard.pdf")
+    else:
+        save_path = save_path or args.save
     save_figure(fig, save_path, args.show)
+
+
+def dashboard_command(cfg: dict, args: argparse.Namespace) -> None:
+    """Render one dashboard, or one dashboard per configured target."""
+    entries, multi_target = _plot_target_entries(cfg, args.target)
+    if not multi_target:
+        _dashboard_one(entries[0][1], args)
+        return
+
+    for spec, target_cfg in entries:
+        save_path = _multi_plot_path(cfg, args.save, spec, "dashboard.pdf")
+        _dashboard_one(target_cfg, args, title_prefix=spec.name, save_path=save_path)
 
 
 def nn_scatter_command(cfg: dict, args: argparse.Namespace) -> None:

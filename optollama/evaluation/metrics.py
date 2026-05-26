@@ -178,3 +178,84 @@ def masked_mae_roi(
     den = valid.sum(dim=1).sum(dim=1).clamp_min(1)
 
     return num / den
+
+
+def interpolate_spectra_to_wavelengths(
+    spectra: torch.Tensor,
+    source_wavelengths: torch.Tensor,
+    target_wavelengths: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Linearly interpolate spectra from one wavelength grid to another.
+
+    Args
+    ----
+    spectra : torch.Tensor
+        Spectra with shape ``[B, C, W]``.
+    source_wavelengths : torch.Tensor
+        Monotonic wavelength grid of shape ``[W]`` for ``spectra``.
+    target_wavelengths : torch.Tensor
+        Target wavelength grid of shape ``[W2]``.
+
+    Returns
+    -------
+    torch.Tensor
+        Interpolated spectra with shape ``[B, C, W2]``.
+    """
+    if spectra.dim() != 3:
+        raise ValueError(f"Expected spectra shape [B, C, W], got {tuple(spectra.shape)}")
+
+    device = spectra.device
+    dtype = torch.float32
+    source = torch.as_tensor(source_wavelengths, device=device, dtype=dtype)
+    target = torch.as_tensor(target_wavelengths, device=device, dtype=dtype)
+    spectra = spectra.to(dtype)
+
+    if source.numel() != spectra.size(-1):
+        raise ValueError(
+            f"Source wavelength count ({source.numel()}) does not match spectra width ({spectra.size(-1)})."
+        )
+    if source.numel() < 2:
+        raise ValueError("At least two source wavelengths are required for interpolation.")
+    if target.numel() == 0:
+        raise ValueError("Target wavelength grid is empty.")
+    if torch.any(source[1:] <= source[:-1]):
+        raise ValueError("Source wavelengths must be strictly increasing.")
+
+    if source.numel() == target.numel() and torch.allclose(source, target):
+        return spectra
+
+    if torch.any(target < source[0]) or torch.any(target > source[-1]):
+        raise ValueError(
+            "Target wavelengths must be inside the source wavelength range "
+            f"({float(source[0]):g}-{float(source[-1]):g} nm)."
+        )
+
+    idx_hi = torch.searchsorted(source, target).clamp(1, source.numel() - 1)
+    idx_lo = idx_hi - 1
+
+    src_lo = source.index_select(0, idx_lo)
+    src_hi = source.index_select(0, idx_hi)
+    denom = (src_hi - src_lo).clamp_min(torch.finfo(dtype).eps)
+    weight = ((target - src_lo) / denom).view(1, 1, -1)
+
+    y_lo = spectra.index_select(-1, idx_lo)
+    y_hi = spectra.index_select(-1, idx_hi)
+    return y_lo + (y_hi - y_lo) * weight
+
+
+def resampled_mae(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    source_wavelengths: torch.Tensor,
+    target_wavelengths: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute MAE after resampling both spectra to a common wavelength grid.
+
+    The same finite-prediction masking as :func:`masked_mae` is used after
+    interpolation.
+    """
+    x_resampled = interpolate_spectra_to_wavelengths(x, source_wavelengths, target_wavelengths)
+    y_resampled = interpolate_spectra_to_wavelengths(y, source_wavelengths, target_wavelengths)
+    return masked_mae(x_resampled, y_resampled)

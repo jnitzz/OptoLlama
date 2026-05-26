@@ -14,9 +14,11 @@ import optollama.utils
 @dataclass
 class PlotBundle:
     wavelengths: Optional[np.ndarray] = None
+    common_mae_wavelengths: Optional[np.ndarray] = None
     roi_min: Optional[float] = None
     roi_max: Optional[float] = None
     mae_grid: Optional[np.ndarray] = None
+    mae_common_grid: Optional[np.ndarray] = None
     ids_grid: Optional[np.ndarray] = None
     pred_spectra_grid: Optional[np.ndarray] = None
     mae_traj_grid: Optional[np.ndarray] = None
@@ -69,12 +71,14 @@ def save_plot_bundle(
 
     if _has_value(wavelengths):
         arrays["wavelengths"] = _to_numpy(wavelengths).astype(np.float32)
+    if _has_value(output.get("common_mae_wavelengths")):
+        arrays["common_mae_wavelengths"] = _to_numpy(output["common_mae_wavelengths"]).astype(np.float32)
     if roi_min is not None:
         arrays["roi_min"] = np.asarray([roi_min], dtype=np.float32)
     if roi_max is not None:
         arrays["roi_max"] = np.asarray([roi_max], dtype=np.float32)
 
-    for key in ("mae_grid", "ids_grid", "pred_spectra_grid", "mae_traj_grid"):
+    for key in ("mae_grid", "mae_common_grid", "ids_grid", "pred_spectra_grid", "mae_traj_grid"):
         value = output.get(key)
         if _has_value(value):
             arrays[key] = _to_numpy(value)
@@ -103,9 +107,11 @@ def load_plot_bundle(path: str) -> PlotBundle:
     with np.load(path, allow_pickle=False) as payload:
         return PlotBundle(
             wavelengths=payload["wavelengths"] if "wavelengths" in payload else None,
+            common_mae_wavelengths=payload["common_mae_wavelengths"] if "common_mae_wavelengths" in payload else None,
             roi_min=float(payload["roi_min"][0]) if "roi_min" in payload else None,
             roi_max=float(payload["roi_max"][0]) if "roi_max" in payload else None,
             mae_grid=payload["mae_grid"] if "mae_grid" in payload else None,
+            mae_common_grid=payload["mae_common_grid"] if "mae_common_grid" in payload else None,
             ids_grid=payload["ids_grid"] if "ids_grid" in payload else None,
             pred_spectra_grid=payload["pred_spectra_grid"] if "pred_spectra_grid" in payload else None,
             mae_traj_grid=payload["mae_traj_grid"] if "mae_traj_grid" in payload else None,
@@ -189,4 +195,3 @@ def select_best_result_index(results: list[dict[str, Any]]) -> int:
     if not results:
         raise ValueError("Cannot select a result from an empty list.")
     return 0
-

@@ -105,6 +105,7 @@ def plot_sample_comparison(
     target_tokens: Sequence[str],
     sample_acc: Optional[float] = None,
     sample_mae: Optional[float] = None,
+    sample_mae_common: Optional[float] = None,
     mc_samples: Optional[int] = None,
     roi_min: Optional[float] = None,
     roi_max: Optional[float] = None,
@@ -172,6 +173,9 @@ def plot_sample_comparison(
         text_lines_right.append(str(mc_samples))
     text_lines_left.append("MAE:")
     text_lines_right.append(f"{pred_mae_val:.4f}")
+    if sample_mae_common is not None:
+        text_lines_left.append("MAE common:")
+        text_lines_right.append(f"{float(sample_mae_common):.4f}")
     if sample_acc is not None:
         text_lines_left.append("Accuracy:")
         text_lines_right.append(f"{float(sample_acc):.4f}")
@@ -298,4 +302,3 @@ def plot_model_vs_nn_scatter(
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
-
