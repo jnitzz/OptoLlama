@@ -40,6 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8, help="Target spectra per model/TMM batch.")
     parser.add_argument("--num-candidates", type=int, default=64, help="Model samples per target.")
     parser.add_argument(
+        "--sampling-steps",
+        "--diffusion-steps",
+        dest="sampling_steps",
+        type=int,
+        default=None,
+        help="Override diffusion denoising steps used for proposal sampling. Defaults to config DIFFUSION_STEPS.",
+    )
+    parser.add_argument(
         "--rank-candidates",
         type=int,
         default=0,
@@ -298,6 +306,10 @@ def main() -> None:
 
     if args.checkpoint:
         cfg["BEST_CHECKPOINT_PATH"] = args.checkpoint
+    if args.sampling_steps is not None:
+        if int(args.sampling_steps) <= 0:
+            raise ValueError("--sampling-steps must be positive.")
+        cfg["DIFFUSION_STEPS"] = int(args.sampling_steps)
     if args.max_seq_len is not None:
         cfg["MAX_SEQ_LEN"] = int(args.max_seq_len)
         if args.max_emit_len is None:
@@ -308,6 +320,7 @@ def main() -> None:
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
+    print(f"Proposal sampling steps: {int(cfg['DIFFUSION_STEPS'])}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -424,6 +437,7 @@ def main() -> None:
         "target_source": target_source,
         "targets": int(targets_cpu.size(0)),
         "candidate_samples_per_target": int(args.num_candidates),
+        "sampling_steps": int(cfg["DIFFUSION_STEPS"]),
         "ranked_candidates_per_target": int(rank_candidates),
         "keep_per_target": int(args.keep_per_target),
         "saved": int(saved_count),
