@@ -34,6 +34,21 @@ def material_name(token: str) -> str:
     return token.split("_", 1)[0]
 
 
+def layer_token_parts(token: str) -> tuple[str, float] | None:
+    """
+    Parse a layer token into ``(material, thickness_nm)``.
+
+    Returns ``None`` for special tokens and malformed entries.
+    """
+    if token in SPECIAL_TOKENS or "_" not in token:
+        return None
+    material, thickness_text = token.split("_", 1)
+    try:
+        return material, float(thickness_text)
+    except ValueError:
+        return None
+
+
 def make_material_groups(tokens: list[str], token_to_idx: dict[str, int]) -> dict[str, torch.Tensor]:
     """
     Build predefined material-group token-id sets from the vocabulary.
