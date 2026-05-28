@@ -146,6 +146,7 @@ def run_mc_batch(
     record_all_mc: bool,
     record_pred_spectra: bool,
     device: torch.device,
+    score_spectra: Optional[torch.Tensor] = None,
     deduplicate_stacks: bool = False,
     profile_timing: bool = False,
 ) -> tuple[dict, dict, dict[str, float]]:
@@ -187,6 +188,9 @@ def run_mc_batch(
         Whether to include predicted spectra in the MC recording.
     device : torch.device
         Device for intermediate tensors.
+    score_spectra : torch.Tensor, optional
+        Spectra used for MC ranking and MAE reporting. If omitted, the
+        conditioning ``spectra`` are used.
     deduplicate_stacks : bool
         Whether to simulate unique predicted stacks only and scatter spectra
         back to duplicate MC entries.
@@ -217,7 +221,12 @@ def run_mc_batch(
 
     # Expand MC draws into the batch dimension so sampling and optional TMM
     # simulation run in one vectorized pass.
+    score_spectra = spectra if score_spectra is None else score_spectra
     spectra_mc = spectra.unsqueeze(1).expand(b, m, *spectra.shape[1:]).reshape(b * m, *spectra.shape[1:])
+    score_spectra_mc = score_spectra.unsqueeze(1).expand(b, m, *score_spectra.shape[1:]).reshape(
+        b * m,
+        *score_spectra.shape[1:],
+    )
     sync_for_timing(device, profile_timing)
     t0 = time.perf_counter()
     logits_or_ids, mae_traj_s = model(spectra_mc)
@@ -253,11 +262,11 @@ def run_mc_batch(
             timing["dedup_unique"] = float(ids_flat.size(0))
         sync_for_timing(device, profile_timing)
         timing["tmm_s"] = time.perf_counter() - t0
-        mae_flat = optollama.evaluation.metrics.masked_mae_roi(spectra_mc, pred_flat, wl_mask=roi_mask)
+        mae_flat = optollama.evaluation.metrics.masked_mae_roi(score_spectra_mc, pred_flat, wl_mask=roi_mask)
         mae_common_flat = None
         if source_wavelengths is not None and common_mae_wavelengths is not None:
             mae_common_flat = optollama.evaluation.metrics.resampled_mae(
-                spectra_mc,
+                score_spectra_mc,
                 pred_flat,
                 source_wavelengths=source_wavelengths,
                 target_wavelengths=common_mae_wavelengths,
@@ -395,12 +404,13 @@ def build_example_record(
     best_mae_common: Optional[torch.Tensor],
     best_pred_spectra: Optional[torch.Tensor],
     best_step_mae_traj: Optional[torch.Tensor],
-    spectra: torch.Tensor,
+    score_spectra: torch.Tensor,
     idx_to_token: dict[int, str],
     eos: int,
     pad: int,
     msk: int,
     do_sim: bool,
+    conditioning_spectra: Optional[torch.Tensor] = None,
 ) -> dict:
     """
     Build a result record for a single example.
@@ -425,8 +435,8 @@ def build_example_record(
         Best predicted spectra, shape ``[B, 3, W]``, or ``None``.
     best_step_mae_traj : torch.Tensor or None
         Per-step MAE trajectory, shape ``[B, steps]``, or ``None``.
-    spectra : torch.Tensor
-        Target spectra, shape ``[B, 3, W]``.
+    score_spectra : torch.Tensor
+        Spectra used for MC ranking and MAE reporting, shape ``[B, 3, W]``.
     idx_to_token : dict[int, str]
         Vocabulary mapping.
     eos : int
@@ -437,6 +447,9 @@ def build_example_record(
         MASK token id.
     do_sim : bool
         Whether simulation was active.
+    conditioning_spectra : torch.Tensor, optional
+        Spectra passed to the model. Stored only when it differs from the
+        scoring target.
 
     Returns
     -------
@@ -466,11 +479,13 @@ def build_example_record(
     if do_sim and best_pred_spectra is not None:
         rec.update({
             "mae": float(best_mae[i].item()),
-            "rat_target": spectra[i].detach().cpu().numpy().tolist(),
+            "rat_target": score_spectra[i].detach().cpu().numpy().tolist(),
             "rat_pred": best_pred_spectra[i].detach().cpu().numpy().tolist(),
         })
         if best_mae_common is not None:
             rec["mae_common"] = float(best_mae_common[i].item())
+        if conditioning_spectra is not None:
+            rec["rat_conditioning"] = conditioning_spectra[i].detach().cpu().numpy().tolist()
 
     if best_step_mae_traj is not None:
         rec["mae_traj"] = best_step_mae_traj[i].detach().cpu().tolist()
@@ -644,6 +659,7 @@ def model_prediction(
     roi_mask: Optional[torch.Tensor] = None,
     source_wavelengths: Optional[torch.Tensor] = None,
     common_mae_wavelengths: Optional[torch.Tensor] = None,
+    score_spectrum: Optional[torch.Tensor] = None,
     record_all_mc: bool = False,
     record_pred_spectra: bool = True,
     rank: int = 0,
@@ -693,6 +709,10 @@ def model_prediction(
     common_mae_wavelengths : torch.Tensor, optional
         Fixed comparison grid used for ``mae_common`` and
         ``mean_mae_common``.
+    score_spectrum : torch.Tensor, optional
+        Spectrum used for MC ranking and MAE reporting. This allows target
+        inference to condition on a physicalized target while ranking against
+        the original file target.
     record_all_mc : bool
         If ``True``, store raw ids and MAE for every MC draw.
     record_pred_spectra : bool
@@ -763,11 +783,28 @@ def model_prediction(
     for batch in iterator:
         spectra, stacks, idxs, running_idx = unpack_batch(batch, running_idx, device)
         b = spectra.size(0)
+        score_spectra = spectra
+        conditioning_spectra = None
+        if score_spectrum is not None:
+            score_spectrum_d = torch.as_tensor(score_spectrum, dtype=spectra.dtype, device=device)
+            if score_spectrum_d.dim() == 2:
+                score_spectra = score_spectrum_d.unsqueeze(0).expand(b, -1, -1)
+            elif score_spectrum_d.dim() == 3 and score_spectrum_d.size(0) == b:
+                score_spectra = score_spectrum_d
+            elif score_spectrum_d.dim() == 3 and score_spectrum_d.size(0) == 1:
+                score_spectra = score_spectrum_d.expand(b, -1, -1)
+            else:
+                raise ValueError(
+                    "score_spectrum must have shape [3,W], [1,3,W], or [B,3,W], "
+                    f"got {tuple(score_spectrum_d.shape)} for batch size {b}"
+                )
+            conditioning_spectra = spectra
 
         best, draws, timing = run_mc_batch(
             model, spectra, mc_samples, do_sim, tmm_ctx,
             eos, pad, msk, roi_mask, source_wavelengths, common_mae_wavelengths,
             record_all_mc, record_pred_spectra, device,
+            score_spectra=score_spectra,
             deduplicate_stacks=deduplicate_stacks,
             profile_timing=profile_timing,
         )
@@ -794,7 +831,7 @@ def model_prediction(
         total_correct += float(correct_count.item())
         total_tokens += float(total_count.item())
         if do_sim and best["pred_spectra"] is not None:
-            mae_vec = optollama.evaluation.metrics.masked_mae_roi(spectra, best["pred_spectra"], wl_mask=roi_mask)
+            mae_vec = optollama.evaluation.metrics.masked_mae_roi(score_spectra, best["pred_spectra"], wl_mask=roi_mask)
             total_mae += float(mae_vec.sum().item())
             total_mae_examples += float(mae_vec.numel())
             if best["mae_common"] is not None:
@@ -805,7 +842,8 @@ def model_prediction(
             results.append(build_example_record(
                 i, idxs, stacks_aligned, ids_aligned, acc_vec,
                 best["mae"], best["mae_common"], best["pred_spectra"], best["step_mae_traj"],
-                spectra, idx_to_token, eos, pad, msk, do_sim,
+                score_spectra, idx_to_token, eos, pad, msk, do_sim,
+                conditioning_spectra=conditioning_spectra,
             ))
 
         sync_for_timing(device, profile_timing)

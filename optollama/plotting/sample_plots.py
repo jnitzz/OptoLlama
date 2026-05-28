@@ -110,6 +110,7 @@ def plot_sample_comparison(
     roi_min: Optional[float] = None,
     roi_max: Optional[float] = None,
     target_mean: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    conditioning_spectrum: Optional[Union[np.ndarray, torch.Tensor]] = None,
     nn_spectrum: Optional[Union[np.ndarray, torch.Tensor]] = None,
     nn_tokens: Optional[Sequence[str]] = None,
     nn_id: Optional[int] = None,
@@ -123,9 +124,11 @@ def plot_sample_comparison(
     predicted = _to_numpy(predicted_spectrum)
     wavelengths_np = _to_numpy(wavelengths).astype(float)
     target_mean_np = _to_numpy(target_mean) if target_mean is not None else None
+    conditioning_np = _to_numpy(conditioning_spectrum) if conditioning_spectrum is not None else None
     nn_np = _to_numpy(nn_spectrum) if nn_spectrum is not None else None
 
     plot_nn = nn_np is not None and nn_tokens is not None
+    plot_conditioning = conditioning_np is not None
 
     roi_mask = None
     if roi_min is not None and roi_max is not None:
@@ -155,6 +158,16 @@ def plot_sample_comparison(
     for idx, channel in enumerate(labels):
         color = colors[channel]
         ax_spec.plot(wavelengths_np, target[idx], color=color, label=f"Target {channel}", lw=1.5)
+        if plot_conditioning:
+            ax_spec.plot(
+                wavelengths_np,
+                conditioning_np[idx],
+                color=color,
+                ls="-.",
+                label=f"Cond {channel}",
+                lw=1.1,
+                alpha=0.85,
+            )
         ax_spec.plot(wavelengths_np, predicted[idx], color=color, ls="--", label=f"Pred {channel}", lw=1.4)
         if plot_nn:
             ax_spec.plot(wavelengths_np, nn_np[idx], color=color, ls=":", label=f"NN {channel}", lw=1.2, alpha=0.9)

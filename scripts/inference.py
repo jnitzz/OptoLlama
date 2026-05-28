@@ -31,11 +31,39 @@ def _common_mae_wavelengths(cfg: dict[str, Any], device: torch.device) -> torch.
     return torch.arange(wl_min, wl_max + 1, wl_step, dtype=torch.float32, device=device)
 
 
-def _load_target_spectrum(target: str, cfg: dict[str, Any], device: torch.device) -> torch.Tensor:
-    """Load one configured target spectrum."""
+def _selection_target_mode(cfg: dict[str, Any]) -> str:
+    """Return whether MC ranking uses the original or conditioned target."""
+    mode = str((cfg.get("TARGET_PHYSICALIZE") or {}).get("SELECTION_TARGET", "conditioned")).lower()
+    if mode not in {"conditioned", "original"}:
+        raise ValueError("TARGET_PHYSICALIZE.SELECTION_TARGET must be 'conditioned' or 'original'.")
+    return mode
+
+
+def _load_target_spectra(target: str, cfg: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Load one configured target spectrum and optional separate score target."""
     if target == "random":
-        return torch.rand([3, _target_width(cfg)], device=device)
-    return optollama.utils.load_spectra(target, cfg).to(device)
+        original = torch.rand([3, _target_width(cfg)], device=device)
+    else:
+        original = optollama.utils.load_spectra(target, cfg).to(device)
+
+    spectrum, info = optollama.data.physicalize_target_spectrum(original, cfg, device=device)
+    if info.get("enabled"):
+        selection_target = _selection_target_mode(cfg)
+        nn = info.get("nn")
+        if nn:
+            print(
+                "TARGET_PHYSICALIZE enabled: "
+                f"selection_target={selection_target}, "
+                f"NN id={nn['global_index']} mae={nn['mae']:.6f} "
+                f"file={nn['file']}:{nn['local_index']}"
+            )
+        else:
+            print(f"TARGET_PHYSICALIZE enabled: selection_target={selection_target}.")
+
+        if selection_target == "original":
+            return spectrum.to(device), original.to(device)
+
+    return spectrum.to(device), None
 
 
 def _make_target_loader(
@@ -43,14 +71,15 @@ def _make_target_loader(
     cfg: dict[str, Any],
     device: torch.device,
     msk_idx: int,
-) -> tuple[torch.utils.data.Dataset, torch.utils.data.DataLoader]:
+) -> tuple[torch.utils.data.Dataset, torch.utils.data.DataLoader, torch.Tensor | None]:
     """Build the repeated-spectrum loader for one target spectrum."""
-    spectrum = _load_target_spectrum(target, cfg, device)
-    return optollama.data.RepeatedSpectrumDataset.make_loader(
+    spectrum, score_spectrum = _load_target_spectra(target, cfg, device)
+    dataset, loader = optollama.data.RepeatedSpectrumDataset.make_loader(
         spectrum,
         cfg=cfg,
         msk_idx=msk_idx,
     )
+    return dataset, loader, score_spectrum
 
 
 def _example_spectrum(test_ds: torch.utils.data.Dataset) -> torch.Tensor:
@@ -198,7 +227,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
 
     target_entries, multi_target = optollama.utils.target_cfgs(cfg)
-    first_target_loader: tuple[torch.utils.data.Dataset, torch.utils.data.DataLoader] | None = None
+    first_target_loader: tuple[torch.utils.data.Dataset, torch.utils.data.DataLoader, torch.Tensor | None] | None = None
 
     if target_entries:
         first_spec, first_cfg = target_entries[0]
@@ -284,7 +313,11 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
             wl_step = int(cfg.get("COMMON_MAE_WAVELENGTH_STEPS", 10))
             print(f"Common-grid MAE enabled: {wl_min}-{wl_max} nm, {wl_step} nm")
 
-    def run_prediction(run_cfg: dict[str, Any], loader: torch.utils.data.DataLoader) -> dict[str, Any]:
+    def run_prediction(
+        run_cfg: dict[str, Any],
+        loader: torch.utils.data.DataLoader,
+        score_spectrum: torch.Tensor | None,
+    ) -> dict[str, Any]:
         return optollama.evaluation.model_prediction(
             model,
             loader,
@@ -308,6 +341,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
             ),
             source_wavelengths=run_cfg["WAVELENGTHS"],
             common_mae_wavelengths=common_mae_wavelengths,
+            score_spectrum=score_spectrum,
             record_all_mc=record_all_mc,
             record_pred_spectra=record_pred_spectra,
             show_progress=show_progress,
@@ -322,11 +356,11 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
                 print(f"\n[{index + 1}/{len(target_entries)}] Target {spec.name}: {spec.target}")
 
             if index == 0 and first_target_loader is not None:
-                _, loader = first_target_loader
+                _, loader, score_spectrum = first_target_loader
             else:
-                _, loader = _make_target_loader(spec.target, target_cfg, device, msk_idx)
+                _, loader, score_spectrum = _make_target_loader(spec.target, target_cfg, device, msk_idx)
 
-            test_output = run_prediction(target_cfg, loader)
+            test_output = run_prediction(target_cfg, loader, score_spectrum)
             _save_output(target_cfg, test_output, rank)
             outputs[spec.name] = test_output
 
@@ -334,7 +368,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
             return {"target_outputs": outputs}, idx_to_token, eos_idx, pad_idx, msk_idx
         return next(iter(outputs.values())), idx_to_token, eos_idx, pad_idx, msk_idx
 
-    test_output = run_prediction(cfg, test_loader)
+    test_output = run_prediction(cfg, test_loader, None)
     _save_output(cfg, test_output, rank)
     return test_output, idx_to_token, eos_idx, pad_idx, msk_idx
 

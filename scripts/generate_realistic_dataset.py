@@ -15,12 +15,53 @@ import optollama.evaluation
 import optollama.utils
 
 
-FAMILY_WEIGHTS = {
-    "dbr": 0.10,
-    "chirped_dbr": 0.10,
-    "cavity": 0.10,
-    "random_dielectric": 0.35,
-    "random": 0.35,
+SUPPORTED_FAMILIES = (
+    "dbr",
+    "chirped_dbr",
+    "cavity",
+    "symmetric_motif",
+    "rugate",
+    "apodized_dbr",
+    "multi_cavity",
+    "edge_filter",
+    "multi_band_filter",
+    "metal_dielectric_metal",
+    "dielectric_metal_dielectric",
+    "absorber_backed",
+    "hybrid_dbr_metal",
+    "sparse_metal_random",
+    "tco_stack",
+    "random_dielectric",
+    "random",
+)
+
+HYBRID_FAMILIES = {
+    "metal_dielectric_metal",
+    "dielectric_metal_dielectric",
+    "absorber_backed",
+    "hybrid_dbr_metal",
+    "sparse_metal_random",
+    "tco_stack",
+}
+
+DEFAULT_FAMILY_WEIGHTS = {
+    "dbr": 0.055,
+    "chirped_dbr": 0.055,
+    "cavity": 0.055,
+    "symmetric_motif": 0.055,
+    "rugate": 0.055,
+    "apodized_dbr": 0.055,
+    "multi_cavity": 0.055,
+    "edge_filter": 0.055,
+    "multi_band_filter": 0.055,
+    "metal_dielectric_metal": 0.045,
+    "dielectric_metal_dielectric": 0.045,
+    "absorber_backed": 0.045,
+    "hybrid_dbr_metal": 0.045,
+    "sparse_metal_random": 0.045,
+    "tco_stack": 0.045,
+    "random_dielectric": 0.13,
+    "random": 0.105,
 }
 
 
@@ -31,6 +72,7 @@ CONFIG_DEFAULT_MAP = {
     "NUM_SAMPLES": "num_samples",
     "SHARD_SIZE": "shard_size",
     "BATCH_SIZE": "batch_size",
+    "FAMILY_WEIGHTS": "family_weights",
     "SEED": "seed",
     "DEVICE": "device",
     "OVERWRITE": "overwrite",
@@ -40,6 +82,18 @@ CONFIG_DEFAULT_MAP = {
     "DBR_MIN_LAYERS": "dbr_min_layers",
     "CHIRPED_DBR_MIN_LAYERS": "chirped_dbr_min_layers",
     "CAVITY_MIN_LAYERS": "cavity_min_layers",
+    "SYMMETRIC_MOTIF_MIN_LAYERS": "symmetric_motif_min_layers",
+    "RUGATE_MIN_LAYERS": "rugate_min_layers",
+    "APODIZED_DBR_MIN_LAYERS": "apodized_dbr_min_layers",
+    "MULTI_CAVITY_MIN_LAYERS": "multi_cavity_min_layers",
+    "EDGE_FILTER_MIN_LAYERS": "edge_filter_min_layers",
+    "MULTI_BAND_FILTER_MIN_LAYERS": "multi_band_filter_min_layers",
+    "METAL_DIELECTRIC_METAL_MIN_LAYERS": "metal_dielectric_metal_min_layers",
+    "DIELECTRIC_METAL_DIELECTRIC_MIN_LAYERS": "dielectric_metal_dielectric_min_layers",
+    "ABSORBER_BACKED_MIN_LAYERS": "absorber_backed_min_layers",
+    "HYBRID_DBR_METAL_MIN_LAYERS": "hybrid_dbr_metal_min_layers",
+    "SPARSE_METAL_RANDOM_MIN_LAYERS": "sparse_metal_random_min_layers",
+    "TCO_STACK_MIN_LAYERS": "tco_stack_min_layers",
     "CENTER_MIN": "center_min",
     "CENTER_MAX": "center_max",
     "STRUCTURE_JITTER_FRACTION": "structure_jitter_fraction",
@@ -73,6 +127,25 @@ def realistic_defaults_from_config(path: str) -> dict[str, object]:
     return defaults
 
 
+def parse_family_weights(value: str) -> dict[str, float]:
+    """
+    Parse comma-separated family weights, e.g. ``dbr=0.1,random=0.2``.
+    """
+    weights: dict[str, float] = {}
+    for item in str(value).split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError("Family weights must use name=value pairs separated by commas.")
+        family, weight = item.split("=", 1)
+        family = family.strip()
+        try:
+            weights[family] = float(weight)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"Invalid weight for family {family!r}: {weight!r}") from exc
+    return weights
+
+
 def parse_args() -> argparse.Namespace:
     base = argparse.ArgumentParser(add_help=False)
     base.add_argument("--config", type=str, default=CONFIG_DEFAULT, help="Project config YAML.")
@@ -89,6 +162,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-samples", type=int, default=None, help="Total number of samples to write.")
     p.add_argument("--shard-size", type=int, default=100000, help="Samples per safetensors shard.")
     p.add_argument("--batch-size", type=int, default=128, help="Stacks simulated per averaged TMM batch.")
+    p.add_argument(
+        "--family-weights",
+        type=parse_family_weights,
+        default=DEFAULT_FAMILY_WEIGHTS,
+        help=(
+            "Comma-separated generation weights, e.g. "
+            "'dbr=0.08,chirped_dbr=0.08,random_dielectric=0.14,random=0.14'."
+        ),
+    )
     p.add_argument("--seed", type=int, default=None, help="Random seed. Defaults to config SEED.")
     p.add_argument("--device", type=str, default=None, help='Execution device, e.g. "cuda", "cuda:0", or "cpu".')
     p.add_argument("--overwrite", action="store_true", help="Allow overwriting existing realistic shards in out-dir.")
@@ -99,6 +181,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dbr-min-layers", type=int, default=2, help="Minimum layers for DBR samples.")
     p.add_argument("--chirped-dbr-min-layers", type=int, default=2, help="Minimum layers for chirped DBR samples.")
     p.add_argument("--cavity-min-layers", type=int, default=5, help="Minimum layers for cavity samples.")
+    p.add_argument("--symmetric-motif-min-layers", type=int, default=4, help="Minimum layers for symmetric motif samples.")
+    p.add_argument("--rugate-min-layers", type=int, default=8, help="Minimum layers for rugate-like samples.")
+    p.add_argument("--apodized-dbr-min-layers", type=int, default=4, help="Minimum layers for apodized DBR samples.")
+    p.add_argument("--multi-cavity-min-layers", type=int, default=7, help="Minimum layers for multi-cavity samples.")
+    p.add_argument("--edge-filter-min-layers", type=int, default=4, help="Minimum layers for edge-filter samples.")
+    p.add_argument("--multi-band-filter-min-layers", type=int, default=6, help="Minimum layers for multi-band samples.")
+    p.add_argument("--metal-dielectric-metal-min-layers", type=int, default=3, help="Minimum layers for MDM samples.")
+    p.add_argument("--dielectric-metal-dielectric-min-layers", type=int, default=3, help="Minimum layers for DMD samples.")
+    p.add_argument("--absorber-backed-min-layers", type=int, default=2, help="Minimum layers for absorber-backed samples.")
+    p.add_argument("--hybrid-dbr-metal-min-layers", type=int, default=3, help="Minimum layers for hybrid DBR-metal samples.")
+    p.add_argument("--sparse-metal-random-min-layers", type=int, default=3, help="Minimum layers for sparse-metal random samples.")
+    p.add_argument("--tco-stack-min-layers", type=int, default=3, help="Minimum layers for TCO-stack samples.")
     p.add_argument("--center-min", type=float, default=300.0, help="Minimum structured-family design center wavelength.")
     p.add_argument("--center-max", type=float, default=1700.0, help="Maximum structured-family design center wavelength.")
     p.add_argument(
@@ -138,6 +232,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-samples must be set or REALISTIC_DATASET.NUM_SAMPLES must exist in the config.")
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be positive.")
+    validate_family_weights(args.family_weights)
     if args.shard_size <= 0:
         raise ValueError("--shard-size must be positive.")
     if args.batch_size <= 0:
@@ -173,12 +268,43 @@ def validate_args(args: argparse.Namespace) -> None:
         "dbr": args.dbr_min_layers,
         "chirped_dbr": args.chirped_dbr_min_layers,
         "cavity": args.cavity_min_layers,
+        "symmetric_motif": args.symmetric_motif_min_layers,
+        "rugate": args.rugate_min_layers,
+        "apodized_dbr": args.apodized_dbr_min_layers,
+        "multi_cavity": args.multi_cavity_min_layers,
+        "edge_filter": args.edge_filter_min_layers,
+        "multi_band_filter": args.multi_band_filter_min_layers,
+        "metal_dielectric_metal": args.metal_dielectric_metal_min_layers,
+        "dielectric_metal_dielectric": args.dielectric_metal_dielectric_min_layers,
+        "absorber_backed": args.absorber_backed_min_layers,
+        "hybrid_dbr_metal": args.hybrid_dbr_metal_min_layers,
+        "sparse_metal_random": args.sparse_metal_random_min_layers,
+        "tco_stack": args.tco_stack_min_layers,
     }
     for family, min_layers in family_min.items():
         if min_layers < 0:
             raise ValueError(f"--{family.replace('_', '-')}-min-layers must be >= 0.")
         if max(args.min_layers, min_layers) > args.max_layers:
             raise ValueError(f"{family} minimum layers exceed --max-layers.")
+
+
+def validate_family_weights(weights: dict[str, float]) -> None:
+    if not weights:
+        raise ValueError("At least one family weight must be configured.")
+    unknown = sorted(set(weights) - set(SUPPORTED_FAMILIES))
+    if unknown:
+        raise ValueError(f"Unknown family weights: {unknown}. Supported families: {list(SUPPORTED_FAMILIES)}")
+    if any(float(weight) < 0.0 for weight in weights.values()):
+        raise ValueError("Family weights must be non-negative.")
+    if sum(float(weight) for weight in weights.values()) <= 0.0:
+        raise ValueError("At least one family weight must be positive.")
+
+
+def normalized_family_weights(weights: dict[str, float]) -> dict[str, float]:
+    validate_family_weights(weights)
+    ordered = {family: float(weights.get(family, 0.0)) for family in SUPPORTED_FAMILIES}
+    total = sum(ordered.values())
+    return {family: weight / total for family, weight in ordered.items() if weight > 0.0}
 
 
 def load_base_material_order(cfg: dict) -> list[str]:
@@ -215,11 +341,11 @@ def token_maps(tokens: Sequence[str]) -> tuple[dict[str, int], dict[int, str], i
     return token_to_idx, idx_to_token, eos, pad, msk
 
 
-def weighted_family_counts(num_samples: int) -> dict[str, int]:
-    raw = {family: num_samples * weight for family, weight in FAMILY_WEIGHTS.items()}
+def weighted_family_counts(num_samples: int, family_weights: dict[str, float]) -> dict[str, int]:
+    raw = {family: num_samples * weight for family, weight in family_weights.items()}
     counts = {family: int(math.floor(value)) for family, value in raw.items()}
     remainder = num_samples - sum(counts.values())
-    order = sorted(FAMILY_WEIGHTS, key=lambda family: (raw[family] - counts[family], FAMILY_WEIGHTS[family]), reverse=True)
+    order = sorted(family_weights, key=lambda family: (raw[family] - counts[family], family_weights[family]), reverse=True)
     for family in order[:remainder]:
         counts[family] += 1
     return counts
@@ -229,14 +355,19 @@ def _randint(generator: torch.Generator, high: int) -> int:
     return int(torch.randint(high, (1,), generator=generator, device="cpu").item())
 
 
-def draw_family_batch(remaining: dict[str, int], batch_size: int, generator: torch.Generator) -> list[str]:
+def draw_family_batch(
+    remaining: dict[str, int],
+    family_weights: dict[str, float],
+    batch_size: int,
+    generator: torch.Generator,
+) -> list[str]:
     families: list[str] = []
     for _ in range(batch_size):
         total = sum(remaining.values())
         if total <= 0:
             break
         draw = _randint(generator, total)
-        for family in FAMILY_WEIGHTS:
+        for family in family_weights:
             count = remaining[family]
             if draw < count:
                 remaining[family] -= 1
@@ -251,6 +382,18 @@ def family_min_layers(args: argparse.Namespace, family: str) -> int:
         "dbr": int(args.dbr_min_layers),
         "chirped_dbr": int(args.chirped_dbr_min_layers),
         "cavity": int(args.cavity_min_layers),
+        "symmetric_motif": int(args.symmetric_motif_min_layers),
+        "rugate": int(args.rugate_min_layers),
+        "apodized_dbr": int(args.apodized_dbr_min_layers),
+        "multi_cavity": int(args.multi_cavity_min_layers),
+        "edge_filter": int(args.edge_filter_min_layers),
+        "multi_band_filter": int(args.multi_band_filter_min_layers),
+        "metal_dielectric_metal": int(args.metal_dielectric_metal_min_layers),
+        "dielectric_metal_dielectric": int(args.dielectric_metal_dielectric_min_layers),
+        "absorber_backed": int(args.absorber_backed_min_layers),
+        "hybrid_dbr_metal": int(args.hybrid_dbr_metal_min_layers),
+        "sparse_metal_random": int(args.sparse_metal_random_min_layers),
+        "tco_stack": int(args.tco_stack_min_layers),
     }
     return max(int(args.min_layers), defaults.get(family, int(args.min_layers)))
 
@@ -280,7 +423,7 @@ def generate_stack_batch(
     output_seq_len = int(args.output_seq_len or (args.max_layers + 1))
 
     for family in families:
-        library = libraries["all"] if family == "random" else libraries["dielectric"]
+        library = libraries["all"] if family == "random" or family in HYBRID_FAMILIES else libraries["dielectric"]
         layers = optollama.data.generate_long_stack_layers(
             family,
             library=library,
@@ -425,7 +568,8 @@ def main() -> None:
     nk_dict = optollama.utils.load_materials(cfg["MATERIALS_PATH"], wavelengths_real)
     tmm = optollama.evaluation.simulation.TMMSpectrum(nk_dict, idx_to_token, device=device).to(device).eval()
 
-    family_targets = weighted_family_counts(int(args.num_samples))
+    family_weights = normalized_family_weights(args.family_weights)
+    family_targets = weighted_family_counts(int(args.num_samples), family_weights)
     remaining = dict(family_targets)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed + 101)
@@ -433,6 +577,7 @@ def main() -> None:
     print(f"Using device: {device}")
     print(f"Wavelengths: {args.wavelength_min}-{args.wavelength_max} nm step {args.wavelength_step} ({wavelengths.numel()} points)")
     print(f"Vocabulary: {len(tokens)} tokens ({len(materials)} materials, {args.thickness_step} nm thickness grid)")
+    print(f"Family weights: {family_weights}")
     print(f"Family targets: {family_targets}")
     print(
         "Averaging: "
@@ -452,7 +597,7 @@ def main() -> None:
     pbar = tqdm.tqdm(total=int(args.num_samples), desc="realistic-generate")
     while written < int(args.num_samples):
         batch_count = min(int(args.batch_size), int(args.num_samples) - written)
-        batch_families = draw_family_batch(remaining, batch_count, generator)
+        batch_families = draw_family_batch(remaining, family_weights, batch_count, generator)
         if not batch_families:
             break
 
@@ -521,6 +666,7 @@ def main() -> None:
         "tokens_path": str(out_dir / "tokens.json"),
         "vocab_size": len(tokens),
         "materials": materials,
+        "family_weights": family_weights,
         "family_targets": family_targets,
         "family_written": dict(family_written),
         "length_histogram": {str(k): int(v) for k, v in sorted(length_hist.items())},
@@ -531,6 +677,18 @@ def main() -> None:
             "dbr": family_min_layers(args, "dbr"),
             "chirped_dbr": family_min_layers(args, "chirped_dbr"),
             "cavity": family_min_layers(args, "cavity"),
+            "symmetric_motif": family_min_layers(args, "symmetric_motif"),
+            "rugate": family_min_layers(args, "rugate"),
+            "apodized_dbr": family_min_layers(args, "apodized_dbr"),
+            "multi_cavity": family_min_layers(args, "multi_cavity"),
+            "edge_filter": family_min_layers(args, "edge_filter"),
+            "multi_band_filter": family_min_layers(args, "multi_band_filter"),
+            "metal_dielectric_metal": family_min_layers(args, "metal_dielectric_metal"),
+            "dielectric_metal_dielectric": family_min_layers(args, "dielectric_metal_dielectric"),
+            "absorber_backed": family_min_layers(args, "absorber_backed"),
+            "hybrid_dbr_metal": family_min_layers(args, "hybrid_dbr_metal"),
+            "sparse_metal_random": family_min_layers(args, "sparse_metal_random"),
+            "tco_stack": family_min_layers(args, "tco_stack"),
             "random_dielectric": family_min_layers(args, "random_dielectric"),
             "random": family_min_layers(args, "random"),
         },

@@ -201,6 +201,11 @@ def _sample_one(
         mc_samples=cfg.get("MC_SAMPLES"),
         roi_min=cfg.get("ROI_MIN"),
         roi_max=cfg.get("ROI_MAX"),
+        conditioning_spectrum=(
+            np.asarray(sample["rat_conditioning"], dtype=np.float32)
+            if "rat_conditioning" in sample
+            else None
+        ),
         nn_spectrum=nn_spectrum,
         nn_tokens=nn_tokens,
         nn_id=nn_id,

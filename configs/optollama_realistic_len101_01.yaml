@@ -1,0 +1,244 @@
+MODEL: "optollama"
+RUN: "REALISTIC_LEN101_01"
+SEED: 3
+NUM_WORKERS: 4
+
+# --- paths: data, materials, vocabulary ---
+DATA_PATH: "E:/repos/OptoLlama/data"
+MATERIALS_PATH: "${DATA_PATH}/materials/"
+
+# The realistic generator writes this 5 nm vocabulary next to the dataset.
+# Use this config for training only after generating the dataset once.
+TOKENS_PATH: "${DATA_PATH}/realistic_len100_test/tokens.json"
+
+DATA_PATH_TRAIN_0: "${DATA_PATH}/realistic_len100_train"
+DATA_PATH_TEST: "${DATA_PATH}/realistic_len100_test"
+# DATA_PATH_TEST: "${DATA_PATH}/test_len101_short"
+
+# --- paths: outputs and checkpoints ---
+OUTPUT_PATH: "${DATA_PATH}/output_${RUN}"
+SAMPLES_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-samples.json"
+GRID_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-grid.json"
+IDS_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-ids.json"
+PLOT_BUNDLE_PATH: "${OUTPUT_PATH}/${MODEL}-${RUN}-plot-bundle.npz"
+
+BEST_CHECKPOINT_PATH: "${DATA_PATH}/checkpoints/${MODEL}-${RUN}-best.pt"
+LAST_CHECKPOINT_PATH: "${DATA_PATH}/checkpoints/${MODEL}-${RUN}-last.pt"
+
+# Keep null by default because the realistic setup changes both the vocabulary
+# size and spectral input width. Set this manually if you want filtered init
+# from an older checkpoint.
+INIT_CHECKPOINT_PATH: null
+INIT_CHECKPOINT_STRICT: true
+INIT_CHECKPOINT_FALLBACK_FILTER: true
+RESUME_CHECKPOINT: false
+
+# --- spectral grid and sequence length ---
+WAVELENGTH_MIN: 300
+WAVELENGTH_MAX: 1700
+WAVELENGTH_STEPS: 5
+
+MAX_SEQ_LEN: 101
+MAX_EMIT_LEN: ${MAX_SEQ_LEN}
+
+# --- target selection ---
+# TARGET: null
+# TARGET_GLOB: "${DATA_PATH}/targets/plants_realistic/*"
+TARGET: "${DATA_PATH}/targets/target_R_BR_realistic.csv"
+# TARGET: "${DATA_PATH}/targets/target_R_BR.csv"
+N_TARGETS: 1
+
+# --- target ROI and evaluation grid ---
+ROI_MIN: 300
+ROI_MAX: 1200
+
+COMMON_MAE_ENABLED: true
+COMMON_MAE_WAVELENGTH_MIN: 300
+COMMON_MAE_WAVELENGTH_MAX: 1700
+COMMON_MAE_WAVELENGTH_STEPS: 10
+
+# --- model architecture ---
+D_MODEL: 1280
+N_BLOCKS: 8
+N_HEADS: 10
+DROPOUT: 0.0
+DIFFUSION_STEPS: 500
+
+# --- optimization and dataset subset sizes ---
+LEARNING_RATE: 0.0001
+EPOCHS: 1000
+NUM_SAMPLES_TRAIN: 10000
+NUM_SAMPLES_TEST: 32
+TRAIN_BATCH_SIZE: 64
+TEST_BATCH_SIZE: 16
+
+# --- sampling / inference ---
+TEMPERATURE: 0.65
+TOP_K: 0
+TOP_P: 0.90
+MC_SAMPLES: 10
+
+TRACK_DIFFUSION_STEPS_MAE: false
+INFERENCE_RECORD_ALL_MC: true
+INFERENCE_RECORD_PRED_SPECTRA: true
+INFERENCE_SHOW_PROGRESS: true
+INFERENCE_PROFILE_TIMING: true
+INFERENCE_DEDUP_STACKS: true
+
+# --- plotting / nearest-neighbor comparison ---
+PLOT_SAMPLE_WITH_NN: true
+PLOT_NN_CHUNK_SIZE: 512000
+PLOT_NN_DEVICE: null
+PLOT_NK: true
+
+# --- realistic dataset generation ---
+REALISTIC_DATASET:
+  OUT_DIR: "${DATA_PATH}/realistic_var"
+  NUM_SAMPLES: 128
+  SHARD_SIZE: 128
+  BATCH_SIZE: 128
+  FAMILY_WEIGHTS:
+    dbr: 0.055
+    chirped_dbr: 0.055
+    cavity: 0.055
+    symmetric_motif: 0.055
+    rugate: 0.055
+    apodized_dbr: 0.055
+    multi_cavity: 0.055
+    edge_filter: 0.055
+    multi_band_filter: 0.055
+    metal_dielectric_metal: 0.045
+    dielectric_metal_dielectric: 0.045
+    absorber_backed: 0.045
+    hybrid_dbr_metal: 0.045
+    sparse_metal_random: 0.045
+    tco_stack: 0.045
+    random_dielectric: 0.10
+    random: 0.135
+  SEED: ${SEED}
+  DEVICE: "cuda"
+  OVERWRITE: false
+
+  MIN_LAYERS: 0
+  MAX_LAYERS: 100
+  OUTPUT_SEQ_LEN: ${MAX_SEQ_LEN}
+  DBR_MIN_LAYERS: 2
+  CHIRPED_DBR_MIN_LAYERS: 2
+  CAVITY_MIN_LAYERS: 5
+  SYMMETRIC_MOTIF_MIN_LAYERS: 4
+  RUGATE_MIN_LAYERS: 8
+  APODIZED_DBR_MIN_LAYERS: 4
+  MULTI_CAVITY_MIN_LAYERS: 7
+  EDGE_FILTER_MIN_LAYERS: 4
+  MULTI_BAND_FILTER_MIN_LAYERS: 6
+  METAL_DIELECTRIC_METAL_MIN_LAYERS: 3
+  DIELECTRIC_METAL_DIELECTRIC_MIN_LAYERS: 3
+  ABSORBER_BACKED_MIN_LAYERS: 2
+  HYBRID_DBR_METAL_MIN_LAYERS: 3
+  SPARSE_METAL_RANDOM_MIN_LAYERS: 3
+  TCO_STACK_MIN_LAYERS: 3
+  CENTER_MIN: ${WAVELENGTH_MIN}
+  CENTER_MAX: ${WAVELENGTH_MAX}
+  STRUCTURE_JITTER_FRACTION: 0.0
+
+  THICKNESS_MIN: 10
+  THICKNESS_MAX: 500
+  THICKNESS_STEP: 5
+
+  WAVELENGTH_MIN: ${WAVELENGTH_MIN}
+  WAVELENGTH_MAX: ${WAVELENGTH_MAX}
+  WAVELENGTH_STEP: ${WAVELENGTH_STEPS}
+
+  ANGLES: [0.0, 4.0, 8.0]
+  ANGLE_WEIGHTS: [1.0, 1.0, 1.0]
+  POLARIZATIONS: ["s"]
+  JITTER_REALIZATIONS: 5
+  THICKNESS_JITTER_NM: 3.0
+  SAVE_DTYPE: "float16"
+
+# Use the same optical forward model during inference/validation as was used
+# to produce the realistic training spectra.
+REALISTIC_TMM:
+  ENABLED: true
+  ANGLES: ${REALISTIC_DATASET.ANGLES}
+  ANGLE_WEIGHTS: ${REALISTIC_DATASET.ANGLE_WEIGHTS}
+  POLARIZATIONS: ${REALISTIC_DATASET.POLARIZATIONS}
+  JITTER_REALIZATIONS: ${REALISTIC_DATASET.JITTER_REALIZATIONS}
+  THICKNESS_JITTER_NM: ${REALISTIC_DATASET.THICKNESS_JITTER_NM}
+
+# --- target preprocessing: generic perturbations ---
+MISMATCH_FILL_ORDER: "R>T>A"
+
+NOISE:
+  ENABLED: false
+  SIGMA_ABS: 0.01
+  SIGMA_REL: 0.00
+  PER_CHANNEL: [1.0, 0.0, 1.0]
+  WL_MIN: 300
+  WL_MAX: 1700
+  CLIP_0_1: false
+
+SMOOTH:
+  ENABLED: false
+  METHOD: "gaussian"
+  WIN: 10
+  SIGMA: 1.50
+
+FILL_OUTSIDE_ROI:
+  ENABLED: false
+  SKIP_INDEX_0: true
+  MODE: "smooth_random"
+  STRENGTH: 0.65
+  KERNEL_SIZE: 20
+
+# --- target preprocessing: physicalized conditioning target ---
+# Adapts idealized target CSVs toward the realistic TMM dataset distribution
+# before model conditioning. MC ranking can use either this conditioned target
+# or the original file target via SELECTION_TARGET.
+TARGET_PHYSICALIZE:
+  ENABLED: true
+  # "conditioned": rank MC samples against the physicalized model input.
+  # "original": condition on the physicalized target, but rank/report MAE
+  #             against the original target file.
+  SELECTION_TARGET: "original" # "conditioned" or "original"
+
+  EDGE_SMOOTHING:
+    ENABLED: true
+    SIGMA_NM: 30
+    WIN_NM: 100
+
+  LEVEL_RELAXATION:
+    ENABLED: true
+    PASS_VALUE: 0.98
+    STOP_VALUE: 0.02
+    ABS_SCALE: 1.0
+
+  NN_BLEND:
+    ENABLED: true
+    SOURCE_SPLIT: "train"
+    SOURCE_PATHS: []
+    CHUNK_SIZE: 512000
+    DEVICE: null
+
+    METRIC_ROI_MIN: ${ROI_MIN}
+    METRIC_ROI_MAX: ${ROI_MAX}
+    METRIC_CHANNELS: ["R", "T", "A"]
+
+    MODE: "outside_roi"
+    ROI_BLEND: 0.00
+    OUTSIDE_ROI_BLEND: 0.80
+    # Smooth ramp: OUTSIDE_ROI_BLEND -> TRANSITION_BLEND at ROI edge
+    # -> ROI_BLEND inside the ROI, mirrored at ROI_MAX.
+    TRANSITION_BLEND: 0.40
+    TRANSITION_WIDTH_NM: 200
+
+# --- validation / simulation ---
+VALID_SIM: "TMM_FAST"
+INCIDENCE_ANGLE: 0
+
+# --- token constraints for target inference ---
+TOKEN_FILTER_ENABLED: false
+TOKEN_FILTER_MODE: "allow"
+TOKEN_FILTER_GROUPS: []
+TOKEN_FILTER_EXCLUDE_TOKENS: []
+TOKEN_FILTER_ALLOW_TOKENS: []
