@@ -1,14 +1,43 @@
 import re
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any, Optional, Self, Union
 
 import safetensors.torch
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
+from safetensors import safe_open
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, Subset
 
 import optollama.data.spectra
 
 # ruff: noqa: E731
+
+
+def collect_safetensor_paths(paths: list[str] | str) -> list[str]:
+    """Expand configured dataset paths into sorted ``.safetensors`` shard paths."""
+    if isinstance(paths, str):
+        paths = [paths]
+
+    expanded_paths: list[str] = []
+    for item in paths:
+        path = Path(item)
+        if path.is_dir():
+            expanded_paths.extend(str(fp) for fp in sorted(path.glob("*.safetensors")))
+        else:
+            expanded_paths.append(str(path))
+
+    sorted_paths = sorted(expanded_paths, key=SpectraDataset.shard_sort_key)
+    if not sorted_paths:
+        raise FileNotFoundError("No .safetensors files found for SpectraDataset.")
+    return sorted_paths
+
+
+def safetensor_shape(path: str, tensor_name: str) -> tuple[int, ...]:
+    """Read a tensor shape from a safetensors shard without loading its data."""
+    with safe_open(path, framework="pt", device="cpu") as f:
+        if tensor_name not in f.keys():
+            raise KeyError(f"{path} must contain {tensor_name!r} tensor.")
+        return tuple(int(x) for x in f.get_slice(tensor_name).get_shape())
 
 
 class SpectraDataset(torch.utils.data.Dataset):
@@ -23,21 +52,7 @@ class SpectraDataset(torch.utils.data.Dataset):
     def __init__(self, paths: list[str] | str):
         super().__init__()
 
-        # normalize paths (accept dir or list of files)
-        if isinstance(paths, str):
-            paths = [paths]
-
-        expanded_paths: list[str] = []
-        for item in paths:
-            path = Path(item)
-            if path.is_dir():
-                expanded_paths.extend(str(fp) for fp in sorted(path.glob("*.safetensors")))
-            else:
-                expanded_paths.append(str(path))
-
-        paths = sorted(expanded_paths, key=SpectraDataset.shard_sort_key)
-        if not paths:
-            raise FileNotFoundError("No .safetensors files found for SpectraDataset.")
+        paths = collect_safetensor_paths(paths)
 
         spectra_list, stacks_list = [], []
         for fp in paths:
@@ -182,6 +197,37 @@ class SpectraDataset(torch.utils.data.Dataset):
 
         search_string = "DATA_PATH_TRAIN" if split_lower == "train" else "DATA_PATH_TEST"
         dataset_path = sorted([cfg[k] for k in cfg.keys() if k.startswith(search_string)])
+        batch_size = cfg["TRAIN_BATCH_SIZE"] if split_lower == "train" else cfg["TEST_BATCH_SIZE"]
+        num_workers = cfg["NUM_WORKERS"]
+
+        if cfg.get("SHARDED_LOADING", False):
+            if ddp and torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                world_size = torch.distributed.get_world_size()
+            else:
+                rank = 0
+                world_size = 1
+
+            dataset = ShardedSpectraDataset(
+                dataset_path,
+                split=split_lower,
+                subset_n=subset_n,
+                rank=rank,
+                world_size=world_size,
+                seed=int(cfg.get("SEED") or 0),
+                shuffle=(split_lower == "train"),
+            )
+
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=None,
+                num_workers=0,
+                pin_memory=not torch.mps.is_available(),
+                drop_last=(split_lower == "train"),
+            )
+            return dataset, loader, None
 
         # --- build dataset ---
         dataset = cls(dataset_path)
@@ -202,9 +248,6 @@ class SpectraDataset(torch.utils.data.Dataset):
             drop_last = False
 
         # --- build DataLoader ---
-        batch_size = cfg["TRAIN_BATCH_SIZE"] if split == "train" else cfg["TEST_BATCH_SIZE"]
-        num_workers = cfg["NUM_WORKERS"]
-
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -216,6 +259,142 @@ class SpectraDataset(torch.utils.data.Dataset):
         )
 
         return dataset, loader, sampler
+
+
+class ShardedSpectraDataset(IterableDataset):
+    """
+    Iterable dataset that streams one safetensors shard at a time.
+
+    This avoids the eager ``torch.cat`` used by :class:`SpectraDataset`, which
+    is too memory-heavy for multi-million-sample DDP training. DDP ranks receive
+    disjoint contiguous global ranges with equal length so each rank produces
+    the same number of batches.
+    """
+
+    def __init__(
+        self,
+        paths: list[str] | str,
+        *,
+        split: str,
+        subset_n: Optional[int] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+        shuffle: bool = True,
+    ) -> None:
+        super().__init__()
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        if not (0 <= rank < world_size):
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+
+        self.paths = collect_safetensor_paths(paths)
+        self.split = split
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed or 0)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+        self.shard_lengths: list[int] = []
+        self.shard_offsets: list[int] = [0]
+        spectra_shape = None
+        stack_shape = None
+        for path in self.paths:
+            spectra_shape_i = safetensor_shape(path, "spectra")
+            stack_shape_i = safetensor_shape(path, "thin_films")
+            if len(spectra_shape_i) != 3 or spectra_shape_i[1] != 3:
+                raise ValueError(f"'spectra' in {path} must be [N,3,W], got {spectra_shape_i}")
+            if len(stack_shape_i) != 2:
+                raise ValueError(f"'thin_films' in {path} must be [N,S], got {stack_shape_i}")
+            if spectra_shape_i[0] != stack_shape_i[0]:
+                raise RuntimeError(f"Mismatched number of samples in {path}: {spectra_shape_i[0]} vs {stack_shape_i[0]}")
+            if spectra_shape is None:
+                spectra_shape = spectra_shape_i
+                stack_shape = stack_shape_i
+            elif spectra_shape_i[1:] != spectra_shape[1:] or stack_shape_i[1:] != stack_shape[1:]:
+                raise ValueError(
+                    f"Inconsistent shard shapes in {path}: spectra {spectra_shape_i}, thin_films {stack_shape_i}; "
+                    f"expected spectra [N,{spectra_shape[1]},{spectra_shape[2]}] and thin_films [N,{stack_shape[1]}]"
+                )
+
+            n = int(spectra_shape_i[0])
+            self.shard_lengths.append(n)
+            self.shard_offsets.append(self.shard_offsets[-1] + n)
+
+        self.total_available = int(self.shard_offsets[-1])
+        requested_total = self.total_available if subset_n is None else min(int(subset_n), self.total_available)
+        if requested_total <= 0:
+            raise ValueError(f"{split} subset contains no samples: subset_n={subset_n}, available={self.total_available}")
+
+        self.total_samples = int(requested_total)
+        self.samples_per_rank = self.total_samples // self.world_size
+        if self.samples_per_rank <= 0:
+            raise ValueError(
+                f"{split} subset has {self.total_samples} samples, fewer than world_size={self.world_size}; "
+                "increase NUM_SAMPLES_* or reduce DDP world size."
+            )
+        trimmed_total = self.samples_per_rank * self.world_size
+        self.rank_start = self.rank * self.samples_per_rank
+        self.rank_stop = self.rank_start + self.samples_per_rank
+        self.dropped_tail = self.total_samples - trimmed_total
+        self.maximum_depth = int(stack_shape[1])
+        self.spectrum_width = int(spectra_shape[2])
+
+    @property
+    def length_dataset(self) -> int:
+        """Return the number of samples visible to this rank."""
+        return self.samples_per_rank
+
+    def __len__(self) -> int:
+        """Return the number of samples visible to this rank."""
+        return self.samples_per_rank
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch seed used for deterministic per-shard shuffling."""
+        self.epoch = int(epoch)
+
+    def example_spectrum(self) -> torch.Tensor:
+        """Load one representative spectrum without materializing the dataset."""
+        data = safetensors.torch.load_file(self.paths[0], device="cpu")
+        return data["spectra"][0].to(torch.float32)
+
+    def _rank_shard_indices(self) -> list[int]:
+        """Return shard indices that overlap this rank's global sample range."""
+        start_shard = max(0, bisect_right(self.shard_offsets, self.rank_start) - 1)
+        end_shard = max(0, bisect_right(self.shard_offsets, self.rank_stop - 1) - 1)
+        shard_indices = list(range(start_shard, end_shard + 1))
+        if self.shuffle and self.split == "train":
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch * 1_000_003 + self.rank * 97)
+            order = torch.randperm(len(shard_indices), generator=generator).tolist()
+            shard_indices = [shard_indices[i] for i in order]
+        return shard_indices
+
+    def __iter__(self):
+        """Yield ``(spectrum, stack, global_index)`` samples for this rank."""
+        for shard_idx in self._rank_shard_indices():
+            shard_start = self.shard_offsets[shard_idx]
+            shard_stop = self.shard_offsets[shard_idx + 1]
+            local_start = max(self.rank_start, shard_start) - shard_start
+            local_stop = min(self.rank_stop, shard_stop) - shard_start
+            if local_start >= local_stop:
+                continue
+
+            data = safetensors.torch.load_file(self.paths[shard_idx], device="cpu")
+            spectra = data["spectra"].to(torch.float32)
+            stacks = data["thin_films"].long()
+
+            if self.shuffle and self.split == "train":
+                generator = torch.Generator()
+                generator.manual_seed(self.seed + self.epoch * 1_000_003 + shard_idx * 193 + self.rank * 389)
+                indices = torch.randperm(local_stop - local_start, generator=generator) + local_start
+            else:
+                indices = torch.arange(local_start, local_stop)
+
+            for local_idx_t in indices:
+                local_idx = int(local_idx_t.item())
+                yield spectra[local_idx], stacks[local_idx], shard_start + local_idx
 
 
 class RepeatedSpectrumDataset(Dataset):

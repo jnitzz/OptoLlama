@@ -1,9 +1,32 @@
 import os
 import random
+import subprocess
 
 import numpy as np
 import torch
 import torch.distributed as dist
+
+
+def _slurm_master_addr() -> str:
+    """Resolve the first SLURM node as a usable DDP master address."""
+    nodelist = os.getenv("SLURM_JOB_NODELIST")
+    if not nodelist:
+        return "127.0.0.1"
+
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "hostnames", nodelist],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        first = result.stdout.splitlines()[0].strip()
+        if first:
+            return first
+    except Exception:
+        pass
+
+    return nodelist.split(",", 1)[0].split("[", 1)[0]
 
 
 def init_distributed() -> tuple[str, int, int, int]:
@@ -36,16 +59,18 @@ def init_distributed() -> tuple[str, int, int, int]:
 
     if dist.is_available() and not dist.is_initialized() and world_size > 1:
         ddp = True
-        slurm_addr = os.environ["SLURM_JOB_NODELIST"]
-        os.environ["MASTER_ADDR"] = slurm_addr
-        os.environ["MASTER_PORT"] = "12345"
+        os.environ.setdefault("MASTER_ADDR", _slurm_master_addr())
+        os.environ.setdefault("MASTER_PORT", "12345")
 
-        dist.init_process_group(
-            backend=backend,
-            rank=rank,
-            world_size=world_size,
-            device_id=device,
-        )
+        init_kwargs = {
+            "backend": backend,
+            "rank": rank,
+            "world_size": world_size,
+        }
+        if device.type == "cuda":
+            init_kwargs["device_id"] = device
+
+        dist.init_process_group(**init_kwargs)
 
     print(
         f"[DDP={ddp}] backend={backend} world={world_size} rank={rank} "

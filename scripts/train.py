@@ -15,6 +15,37 @@ import optollama.utils
 # ruff: noqa: N806
 
 
+def _set_loader_epoch(loader: torch.utils.data.DataLoader, epoch: int) -> None:
+    """Set deterministic epoch state for either sampler-based or iterable datasets."""
+    dataset = getattr(loader, "dataset", None)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+
+def _example_spectrum(dataset: torch.utils.data.Dataset) -> torch.Tensor:
+    """Return one representative spectrum without assuming eager dataset storage."""
+    if isinstance(dataset, torch.utils.data.Subset):
+        base = dataset.dataset
+        first_idx = int(dataset.indices[0])
+        if hasattr(base, "spectra"):
+            return base.spectra[first_idx]
+        sample = base[first_idx]
+        return sample[0]
+
+    if hasattr(dataset, "example_spectrum"):
+        return dataset.example_spectrum()
+
+    if hasattr(dataset, "spectra"):
+        return dataset.spectra[0]
+
+    sample = next(iter(dataset))
+    return sample[0]
+
+
 def train(cfg: dict) -> None:
     """
     Train and optionally validate OptoLlama (or OptoGPT).
@@ -56,7 +87,7 @@ def train(cfg: dict) -> None:
 
     # --- model ---
     vocab_size = len(idx_to_token)
-    example_spectrum = train_ds.dataset.spectra[0] if isinstance(train_ds, torch.utils.data.Subset) else train_ds.spectra[0]
+    example_spectrum = _example_spectrum(train_ds)
     
     model = optollama.model.build_model(
         model_type=cfg["MODEL"],
@@ -153,9 +184,8 @@ def train(cfg: dict) -> None:
         epoch_tokens = 0.0
 
         # DDP epoch seeds
-        if ddp:
-            train_loader.sampler.set_epoch(epoch)
-            test_loader.sampler.set_epoch(epoch)
+        _set_loader_epoch(train_loader, epoch)
+        _set_loader_epoch(test_loader, epoch)
 
         # ------------------------------ train ------------------------------
         model.train()
