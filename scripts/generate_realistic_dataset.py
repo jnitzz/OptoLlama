@@ -67,49 +67,156 @@ DEFAULT_FAMILY_WEIGHTS = {
 
 CONFIG_DEFAULT = "configs/optollama.yaml"
 
-CONFIG_DEFAULT_MAP = {
-    "OUT_DIR": "out_dir",
-    "NUM_SAMPLES": "num_samples",
-    "SHARD_SIZE": "shard_size",
-    "BATCH_SIZE": "batch_size",
-    "FAMILY_WEIGHTS": "family_weights",
-    "SEED": "seed",
-    "DEVICE": "device",
-    "OVERWRITE": "overwrite",
-    "MIN_LAYERS": "min_layers",
-    "MAX_LAYERS": "max_layers",
-    "OUTPUT_SEQ_LEN": "output_seq_len",
-    "DBR_MIN_LAYERS": "dbr_min_layers",
-    "CHIRPED_DBR_MIN_LAYERS": "chirped_dbr_min_layers",
-    "CAVITY_MIN_LAYERS": "cavity_min_layers",
-    "SYMMETRIC_MOTIF_MIN_LAYERS": "symmetric_motif_min_layers",
-    "RUGATE_MIN_LAYERS": "rugate_min_layers",
-    "APODIZED_DBR_MIN_LAYERS": "apodized_dbr_min_layers",
-    "MULTI_CAVITY_MIN_LAYERS": "multi_cavity_min_layers",
-    "EDGE_FILTER_MIN_LAYERS": "edge_filter_min_layers",
-    "MULTI_BAND_FILTER_MIN_LAYERS": "multi_band_filter_min_layers",
-    "METAL_DIELECTRIC_METAL_MIN_LAYERS": "metal_dielectric_metal_min_layers",
-    "DIELECTRIC_METAL_DIELECTRIC_MIN_LAYERS": "dielectric_metal_dielectric_min_layers",
-    "ABSORBER_BACKED_MIN_LAYERS": "absorber_backed_min_layers",
-    "HYBRID_DBR_METAL_MIN_LAYERS": "hybrid_dbr_metal_min_layers",
-    "SPARSE_METAL_RANDOM_MIN_LAYERS": "sparse_metal_random_min_layers",
-    "TCO_STACK_MIN_LAYERS": "tco_stack_min_layers",
-    "CENTER_MIN": "center_min",
-    "CENTER_MAX": "center_max",
-    "STRUCTURE_JITTER_FRACTION": "structure_jitter_fraction",
-    "THICKNESS_MIN": "thickness_min",
-    "THICKNESS_MAX": "thickness_max",
-    "THICKNESS_STEP": "thickness_step",
-    "WAVELENGTH_MIN": "wavelength_min",
-    "WAVELENGTH_MAX": "wavelength_max",
-    "WAVELENGTH_STEP": "wavelength_step",
-    "ANGLES": "angles",
-    "ANGLE_WEIGHTS": "angle_weights",
-    "POLARIZATIONS": "polarizations",
-    "JITTER_REALIZATIONS": "jitter_realizations",
-    "THICKNESS_JITTER_NM": "thickness_jitter_nm",
-    "SAVE_DTYPE": "save_dtype",
+CONFIG_DEFAULT_PATHS = {
+    "out_dir": (("REALISTIC_DATASET", "OUT_DIR"),),
+    "num_samples": (("REALISTIC_DATASET", "NUM_SAMPLES"),),
+    "shard_size": (("REALISTIC_DATASET", "SHARD_SIZE"),),
+    "batch_size": (("REALISTIC_DATASET", "BATCH_SIZE"),),
+    "family_weights": (("REALISTIC_DATASET", "FAMILY_WEIGHTS"),),
+    "seed": (("REALISTIC_DATASET", "SEED"), ("EXPERIMENT", "SEED"), ("SEED",)),
+    "device": (("REALISTIC_DATASET", "DEVICE"),),
+    "overwrite": (("REALISTIC_DATASET", "OVERWRITE"),),
+    "min_layers": (("REALISTIC_DATASET", "LAYERS", "MIN"), ("REALISTIC_DATASET", "MIN_LAYERS")),
+    "max_layers": (("REALISTIC_DATASET", "LAYERS", "MAX"), ("REALISTIC_DATASET", "MAX_LAYERS")),
+    "output_seq_len": (
+        ("REALISTIC_DATASET", "LAYERS", "OUTPUT_SEQ_LEN"),
+        ("REALISTIC_DATASET", "OUTPUT_SEQ_LEN"),
+        ("SEQUENCE", "MAX_SEQ_LEN"),
+        ("MAX_SEQ_LEN",),
+    ),
+    "dbr_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "DBR"),
+        ("REALISTIC_DATASET", "DBR_MIN_LAYERS"),
+    ),
+    "chirped_dbr_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "CHIRPED_DBR"),
+        ("REALISTIC_DATASET", "CHIRPED_DBR_MIN_LAYERS"),
+    ),
+    "cavity_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "CAVITY"),
+        ("REALISTIC_DATASET", "CAVITY_MIN_LAYERS"),
+    ),
+    "symmetric_motif_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "SYMMETRIC_MOTIF"),
+        ("REALISTIC_DATASET", "SYMMETRIC_MOTIF_MIN_LAYERS"),
+    ),
+    "rugate_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "RUGATE"),
+        ("REALISTIC_DATASET", "RUGATE_MIN_LAYERS"),
+    ),
+    "apodized_dbr_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "APODIZED_DBR"),
+        ("REALISTIC_DATASET", "APODIZED_DBR_MIN_LAYERS"),
+    ),
+    "multi_cavity_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "MULTI_CAVITY"),
+        ("REALISTIC_DATASET", "MULTI_CAVITY_MIN_LAYERS"),
+    ),
+    "edge_filter_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "EDGE_FILTER"),
+        ("REALISTIC_DATASET", "EDGE_FILTER_MIN_LAYERS"),
+    ),
+    "multi_band_filter_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "MULTI_BAND_FILTER"),
+        ("REALISTIC_DATASET", "MULTI_BAND_FILTER_MIN_LAYERS"),
+    ),
+    "metal_dielectric_metal_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "METAL_DIELECTRIC_METAL"),
+        ("REALISTIC_DATASET", "METAL_DIELECTRIC_METAL_MIN_LAYERS"),
+    ),
+    "dielectric_metal_dielectric_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "DIELECTRIC_METAL_DIELECTRIC"),
+        ("REALISTIC_DATASET", "DIELECTRIC_METAL_DIELECTRIC_MIN_LAYERS"),
+    ),
+    "absorber_backed_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "ABSORBER_BACKED"),
+        ("REALISTIC_DATASET", "ABSORBER_BACKED_MIN_LAYERS"),
+    ),
+    "hybrid_dbr_metal_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "HYBRID_DBR_METAL"),
+        ("REALISTIC_DATASET", "HYBRID_DBR_METAL_MIN_LAYERS"),
+    ),
+    "sparse_metal_random_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "SPARSE_METAL_RANDOM"),
+        ("REALISTIC_DATASET", "SPARSE_METAL_RANDOM_MIN_LAYERS"),
+    ),
+    "tco_stack_min_layers": (
+        ("REALISTIC_DATASET", "LAYERS", "FAMILY_MIN_LAYERS", "TCO_STACK"),
+        ("REALISTIC_DATASET", "TCO_STACK_MIN_LAYERS"),
+    ),
+    "center_min": (("REALISTIC_DATASET", "STRUCTURES", "CENTER_MIN"), ("REALISTIC_DATASET", "CENTER_MIN")),
+    "center_max": (("REALISTIC_DATASET", "STRUCTURES", "CENTER_MAX"), ("REALISTIC_DATASET", "CENTER_MAX")),
+    "structure_jitter_fraction": (
+        ("REALISTIC_DATASET", "STRUCTURES", "STRUCTURE_JITTER_FRACTION"),
+        ("REALISTIC_DATASET", "STRUCTURE_JITTER_FRACTION"),
+    ),
+    "thickness_min": (("REALISTIC_DATASET", "THICKNESS", "MIN"), ("REALISTIC_DATASET", "THICKNESS_MIN")),
+    "thickness_max": (("REALISTIC_DATASET", "THICKNESS", "MAX"), ("REALISTIC_DATASET", "THICKNESS_MAX")),
+    "thickness_step": (("REALISTIC_DATASET", "THICKNESS", "STEP"), ("REALISTIC_DATASET", "THICKNESS_STEP")),
+    "wavelength_min": (
+        ("REALISTIC_DATASET", "SPECTRUM", "WAVELENGTH_MIN"),
+        ("REALISTIC_DATASET", "WAVELENGTH_MIN"),
+        ("SPECTRAL_GRID", "WAVELENGTH_MIN"),
+        ("WAVELENGTH_MIN",),
+    ),
+    "wavelength_max": (
+        ("REALISTIC_DATASET", "SPECTRUM", "WAVELENGTH_MAX"),
+        ("REALISTIC_DATASET", "WAVELENGTH_MAX"),
+        ("SPECTRAL_GRID", "WAVELENGTH_MAX"),
+        ("WAVELENGTH_MAX",),
+    ),
+    "wavelength_step": (
+        ("REALISTIC_DATASET", "SPECTRUM", "WAVELENGTH_STEP"),
+        ("REALISTIC_DATASET", "WAVELENGTH_STEP"),
+        ("SPECTRAL_GRID", "WAVELENGTH_STEPS"),
+        ("WAVELENGTH_STEPS",),
+    ),
+    "angles": (("REALISTIC_DATASET", "REALISTIC_AVERAGING", "ANGLES"), ("REALISTIC_DATASET", "ANGLES"), ("REALISTIC_TMM", "ANGLES")),
+    "angle_weights": (
+        ("REALISTIC_DATASET", "REALISTIC_AVERAGING", "ANGLE_WEIGHTS"),
+        ("REALISTIC_DATASET", "ANGLE_WEIGHTS"),
+        ("REALISTIC_TMM", "ANGLE_WEIGHTS"),
+    ),
+    "polarizations": (
+        ("REALISTIC_DATASET", "REALISTIC_AVERAGING", "POLARIZATIONS"),
+        ("REALISTIC_DATASET", "POLARIZATIONS"),
+        ("REALISTIC_TMM", "POLARIZATIONS"),
+    ),
+    "jitter_realizations": (
+        ("REALISTIC_DATASET", "REALISTIC_AVERAGING", "JITTER_REALIZATIONS"),
+        ("REALISTIC_DATASET", "JITTER_REALIZATIONS"),
+        ("REALISTIC_TMM", "JITTER_REALIZATIONS"),
+    ),
+    "thickness_jitter_nm": (
+        ("REALISTIC_DATASET", "REALISTIC_AVERAGING", "THICKNESS_JITTER_NM"),
+        ("REALISTIC_DATASET", "THICKNESS_JITTER_NM"),
+        ("REALISTIC_TMM", "THICKNESS_JITTER_NM"),
+    ),
+    "save_dtype": (("REALISTIC_DATASET", "REALISTIC_AVERAGING", "SAVE_DTYPE"), ("REALISTIC_DATASET", "SAVE_DTYPE")),
 }
+
+
+def get_config_path(cfg: dict, path: Sequence[str], missing: object) -> object:
+    """
+    Return a nested config value or ``missing`` when the path does not exist.
+    """
+    current = cfg
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return missing
+        current = current[key]
+    return current
+
+
+def get_first_config_path(cfg: dict, paths: Sequence[Sequence[str]], missing: object) -> object:
+    """
+    Return the first existing non-null config value from a list of paths.
+    """
+    for path in paths:
+        value = get_config_path(cfg, path, missing)
+        if value is not missing and value is not None:
+            return value
+    return missing
 
 
 def realistic_defaults_from_config(path: str) -> dict[str, object]:
@@ -118,11 +225,12 @@ def realistic_defaults_from_config(path: str) -> dict[str, object]:
         return {}
 
     cfg = optollama.utils.load_config_file(str(cfg_path))
-    block = cfg.get("REALISTIC_DATASET") or {}
     defaults: dict[str, object] = {}
-    for cfg_key, arg_name in CONFIG_DEFAULT_MAP.items():
-        if cfg_key in block:
-            defaults[arg_name] = block[cfg_key]
+    missing = object()
+    for arg_name, paths in CONFIG_DEFAULT_PATHS.items():
+        value = get_first_config_path(cfg, paths, missing)
+        if value is not missing:
+            defaults[arg_name] = value
 
     return defaults
 
