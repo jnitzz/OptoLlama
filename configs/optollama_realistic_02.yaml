@@ -41,6 +41,11 @@ MODEL_ARCH:
   N_HEADS: 10
   DROPOUT: 0.0
   DIFFUSION_STEPS: 500
+SPECTRUM_LATENT:
+  ENABLED: false
+  CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+  MODE: token
+  FREEZE_ENCODER: true
 OPTIMIZATION:
   LEARNING_RATE: 0.0001
   EPOCHS: 1000
@@ -123,6 +128,16 @@ TARGET_PHYSICALIZE:
     PASS_VALUE: 0.98
     STOP_VALUE: 0.02
     ABS_SCALE: 1.0
+  AE_PROJECT:
+    ENABLED: false
+    CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+    DEVICE: null
+    MODE: all
+    BLEND: 1.0
+    ROI_BLEND: 0.0
+    OUTSIDE_ROI_BLEND: 0.8
+    TRANSITION_BLEND: 0.4
+    TRANSITION_WIDTH_NM: 200
   NN_BLEND:
     ENABLED: true
     SOURCE_SPLIT: train

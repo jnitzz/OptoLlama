@@ -49,16 +49,25 @@ def _load_target_spectra(target: str, cfg: dict[str, Any], device: torch.device)
     spectrum, info = optollama.data.physicalize_target_spectrum(original, cfg, device=device)
     if info.get("enabled"):
         selection_target = _selection_target_mode(cfg)
+        ae = info.get("autoencoder")
         nn = info.get("nn")
+        parts = [
+            "TARGET_PHYSICALIZE enabled",
+            f"selection_target={selection_target}",
+        ]
+        if ae:
+            parts.append(
+                "AE "
+                f"mae_to_input={ae['mae_to_input']:.6f} "
+                f"latent_dim={ae['latent_dim']} "
+                f"mode={ae['mode']}"
+            )
         if nn:
-            print(
-                "TARGET_PHYSICALIZE enabled: "
-                f"selection_target={selection_target}, "
+            parts.append(
                 f"NN id={nn['global_index']} mae={nn['mae']:.6f} "
                 f"file={nn['file']}:{nn['local_index']}"
             )
-        else:
-            print(f"TARGET_PHYSICALIZE enabled: selection_target={selection_target}.")
+        print(", ".join(parts) + ".")
 
         if selection_target == "original":
             return spectrum.to(device), original.to(device)
@@ -260,6 +269,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         temperature=cfg["TEMPERATURE"],
         top_k=cfg["TOP_K"],
         top_p=cfg["TOP_P"],
+        spectrum_latent=cfg.get("SPECTRUM_LATENT"),
     ).to(device)
 
     # --- checkpointing ---

@@ -287,6 +287,48 @@ def _apply_nn_blend(
     return _normalize_rat(blended, cfg), match
 
 
+def _apply_autoencoder_projection(
+    spectrum: torch.Tensor,
+    cfg: dict[str, Any],
+    block: dict[str, Any],
+    wavelengths: torch.Tensor,
+    device: torch.device | str | None,
+) -> tuple[torch.Tensor, dict[str, Any] | None]:
+    ae_cfg = block.get("AE_PROJECT") or {}
+    if not bool(ae_cfg.get("ENABLED", False)):
+        return spectrum, None
+
+    checkpoint = ae_cfg.get("CHECKPOINT")
+    if not checkpoint:
+        raise ValueError("TARGET_PHYSICALIZE.AE_PROJECT.CHECKPOINT must be set when AE_PROJECT is enabled.")
+
+    ae_device = ae_cfg.get("DEVICE")
+    if ae_device is None:
+        ae_device = device
+
+    from optollama.model.spectrum_autoencoder import project_spectrum_with_autoencoder
+
+    projected, info = project_spectrum_with_autoencoder(spectrum, checkpoint, device=ae_device)
+    projected = projected.to(spectrum.device, dtype=spectrum.dtype)
+
+    mode = str(ae_cfg.get("MODE", "all")).lower()
+    if mode == "all":
+        weight = torch.full_like(wavelengths, float(ae_cfg.get("BLEND", 1.0)), dtype=torch.float32)
+    elif mode == "outside_roi":
+        ae_cfg = dict(ae_cfg)
+        ae_cfg.setdefault("ROI_MIN", cfg.get("ROI_MIN", float(wavelengths.min())))
+        ae_cfg.setdefault("ROI_MAX", cfg.get("ROI_MAX", float(wavelengths.max())))
+        weight = _blend_weights(wavelengths, ae_cfg)
+    else:
+        raise ValueError(f"Unknown TARGET_PHYSICALIZE.AE_PROJECT.MODE: {mode!r}")
+
+    weight = weight.to(spectrum.device, dtype=spectrum.dtype).view(1, -1)
+    blended = (1.0 - weight) * spectrum + weight * projected
+    info["mode"] = mode
+    info["blend_mean"] = float(weight.mean().item())
+    return _normalize_rat(blended, cfg), info
+
+
 def physicalize_target_spectrum(
     spectrum: torch.Tensor,
     cfg: dict[str, Any],
@@ -308,11 +350,13 @@ def physicalize_target_spectrum(
     conditioned = _normalize_rat(spectrum, cfg)
     conditioned = _apply_level_relaxation(conditioned, block, cfg)
     conditioned = _apply_edge_smoothing(conditioned, wavelengths, block, cfg)
+    conditioned, ae_info = _apply_autoencoder_projection(conditioned, cfg, block, wavelengths, device)
     conditioned, nn_info = _apply_nn_blend(conditioned, cfg, block, wavelengths, device)
     conditioned = _normalize_rat(conditioned, cfg)
 
     info = {
         "enabled": True,
+        "autoencoder": ae_info,
         "nn": None
         if nn_info is None
         else {

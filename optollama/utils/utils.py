@@ -329,7 +329,17 @@ def save_checkpoint(
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp_path = tmp.name
-    os.replace(tmp_path, path)
+    try:
+        os.replace(tmp_path, path)
+    except PermissionError:
+        # Some Windows/sandboxed filesystems allow writing but deny atomic
+        # rename/replace. Fall back to a direct write so smoke tests and local
+        # runs still complete; clusters should keep the atomic path above.
+        torch.save(state, path)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     # ---- 2) atomic write of weights-only .safetensors next to it ----
     base, _ = os.path.splitext(path)
@@ -340,7 +350,14 @@ def save_checkpoint(
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp_safe_path = tmp.name
-    os.replace(tmp_safe_path, safe_path)
+    try:
+        os.replace(tmp_safe_path, safe_path)
+    except PermissionError:
+        save_file(model_state, safe_path)
+        try:
+            os.remove(tmp_safe_path)
+        except OSError:
+            pass
 
 
 def load_spectra(path: str, cfg: dict) -> torch.Tensor:

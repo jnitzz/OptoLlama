@@ -29,7 +29,7 @@ DATA_LOADING:
   NUM_WORKERS: 0
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
-  NUM_SAMPLES_TEST: 512
+  NUM_SAMPLES_TEST: 16 #512
   TRAIN_BATCH_SIZE: 320
   TEST_BATCH_SIZE: 128
 
@@ -48,6 +48,11 @@ MODEL_ARCH:
   N_HEADS: 12
   DROPOUT: 0.0
   DIFFUSION_STEPS: 500
+SPECTRUM_LATENT:
+  ENABLED: false
+  CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+  MODE: token
+  FREEZE_ENCODER: true
 
 OPTIMIZATION:
   LEARNING_RATE: 0.0001
@@ -71,7 +76,7 @@ EVALUATION:
   VALID_SIM: TMM_FAST
   INCIDENCE_ANGLE: 0
   ROI_MIN: 300
-  ROI_MAX: 800
+  ROI_MAX: 1700
   COMMON_MAE:
     ENABLED: true
     WAVELENGTH_MIN: 300
@@ -79,14 +84,15 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  # TARGET_GLOB: ${PATHS.DATA_PATH}/targets/multicolor_realistic/*.csv
+  TARGET_GLOB: ${PATHS.DATA_PATH}/targets/multicolor_realistic/*.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_blue_realistic.csv
-  TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_yellow_realistic.csv
+  # TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_yellow_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_B_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_R_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  # TARGET: null
   N_TARGETS: 1
 
 TARGET_PREPROCESS:
@@ -136,19 +142,29 @@ REALISTIC_TMM:
   THICKNESS_JITTER_NM: ${REALISTIC_DATASET.REALISTIC_AVERAGING.THICKNESS_JITTER_NM}
 
 TARGET_PHYSICALIZE:
-  ENABLED: false
+  ENABLED: true
   SELECTION_TARGET: original
   EDGE_SMOOTHING:
-    ENABLED: true
+    ENABLED: false
     SIGMA_NM: 20
     WIN_NM: 80
   LEVEL_RELAXATION:
-    ENABLED: true
+    ENABLED: false
     PASS_VALUE: 0.98
     STOP_VALUE: 0.02
     ABS_SCALE: 1.0
-  NN_BLEND:
+  AE_PROJECT:
     ENABLED: true
+    CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+    DEVICE: null
+    MODE: all
+    BLEND: 1.0
+    ROI_BLEND: 0.0
+    OUTSIDE_ROI_BLEND: 0.8
+    TRANSITION_BLEND: 0.4
+    TRANSITION_WIDTH_NM: 200
+  NN_BLEND:
+    ENABLED: false
     SOURCE_SPLIT: train
     SOURCE_PATHS: []
     CHUNK_SIZE: 512000

@@ -107,6 +107,7 @@ def train(cfg: dict) -> None:
         temperature=cfg["TEMPERATURE"],
         top_k=cfg["TOP_K"],
         top_p=cfg["TOP_P"],
+        spectrum_latent=cfg.get("SPECTRUM_LATENT"),
     ).to(device)
 
     # --- DDP wrapper ---

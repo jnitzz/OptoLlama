@@ -326,6 +326,8 @@ class OptoLlama(torch.nn.Module):
         Top-k sampling cutoff.
     top_p : float
         Top-p (nucleus) sampling cutoff.
+    spectrum_latent : dict, optional
+        Optional frozen spectrum-autoencoder latent conditioning config.
     """
 
     def __init__(
@@ -345,6 +347,7 @@ class OptoLlama(torch.nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         top_p: float = 0.0,
+        spectrum_latent: Optional[dict] = None,
     ) -> None:
         super().__init__()
 
@@ -359,6 +362,12 @@ class OptoLlama(torch.nn.Module):
         self.idx_to_token = idx_to_token
 
         self.spectrum_embedding = SpectrumEmbedding(spectra_dim, d_model)
+        self.spectrum_latent_enabled = bool((spectrum_latent or {}).get("ENABLED", False))
+        self.spectrum_autoencoder: Optional[torch.nn.Module] = None
+        self.spectrum_latent_embedding: Optional[torch.nn.Module] = None
+        if self.spectrum_latent_enabled:
+            self._init_spectrum_latent_conditioning(spectrum_latent or {}, d_model)
+
         self.stack_embedding = StackEmbedding(vocab_size, d_model)
         self.time_embedding = TimestepEmbedding(d_model)
 
@@ -393,6 +402,46 @@ class OptoLlama(torch.nn.Module):
         # Optional: per-step MAE tracking during sampling
         self._step_mae_enabled: bool = False
         self._step_mae_ctx: Optional[TMMContext] = None
+
+    def _init_spectrum_latent_conditioning(self, cfg: dict, d_model: int) -> None:
+        """Load a frozen spectrum AE encoder and trainable latent projection."""
+        mode = str(cfg.get("MODE", "token")).lower()
+        if mode != "token":
+            raise ValueError(f"Unsupported SPECTRUM_LATENT.MODE={mode!r}; currently only 'token' is implemented.")
+
+        checkpoint = cfg.get("CHECKPOINT")
+        if not checkpoint:
+            raise ValueError("SPECTRUM_LATENT.CHECKPOINT must be set when SPECTRUM_LATENT.ENABLED is true.")
+
+        from optollama.model.spectrum_autoencoder import load_spectrum_autoencoder
+
+        ae, _ = load_spectrum_autoencoder(checkpoint, device="cpu")
+        freeze_encoder = bool(cfg.get("FREEZE_ENCODER", True))
+        if freeze_encoder:
+            for param in ae.parameters():
+                param.requires_grad_(False)
+        ae.eval()
+
+        self.spectrum_autoencoder = ae
+        self.spectrum_latent_embedding = torch.nn.Sequential(
+            torch.nn.Linear(ae.latent_dim, d_model),
+            torch.nn.SiLU(),
+            torch.nn.Linear(d_model, d_model),
+            torch.nn.LayerNorm(d_model),
+        )
+
+    def _spectrum_latent_token(self, spectra: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return one AE latent conditioning token per spectrum, or ``None``."""
+        if not self.spectrum_latent_enabled:
+            return None
+        if self.spectrum_autoencoder is None or self.spectrum_latent_embedding is None:
+            raise RuntimeError("Spectrum latent conditioning is enabled but not initialized.")
+
+        self.spectrum_autoencoder.eval()
+        with torch.no_grad():
+            z = self.spectrum_autoencoder.encode(spectra.to(dtype=torch.float32))
+        z = z.to(device=spectra.device, dtype=spectra.dtype)
+        return self.spectrum_latent_embedding(z).unsqueeze(1)
 
     def set_max_emit_len(self, max_len: Optional[int]) -> None:
         """
@@ -512,6 +561,9 @@ class OptoLlama(torch.nn.Module):
             Predicted logits over tokens, shape ``[B, S, vocab_size]``.
         """
         embedded_spectra = self.spectrum_embedding(spectra)  # [B, 3, d_model]
+        latent_token = self._spectrum_latent_token(spectra)
+        if latent_token is not None:
+            embedded_spectra = torch.cat([embedded_spectra, latent_token], dim=1)
         embedded_spectra += self.positional_encoding(embedded_spectra)
         predicted_stacks = self.stack_embedding(noised_stacks)
         predicted_stacks += self.positional_encoding(predicted_stacks)

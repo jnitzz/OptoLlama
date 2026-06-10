@@ -23,6 +23,7 @@ def build_model(
     temperature: float = 0.0,
     top_k: int = 0,
     top_p: float = 0.0,
+    spectrum_latent: dict | None = None,
 ) -> nn.Module:
     """
     Build and return the configured sequence model (OptoGPT or OptoLlama).
@@ -65,6 +66,8 @@ def build_model(
     top_p : float
         Top-p (nucleus) sampling cutoff (``0.0`` = disabled; default:
         ``0.0``).
+    spectrum_latent : dict, optional
+        Optional frozen spectrum-autoencoder latent conditioning config.
 
     Returns
     -------
@@ -93,6 +96,7 @@ def build_model(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                spectrum_latent=spectrum_latent,
             )
             .to(torch.float32)
             .to(device)
