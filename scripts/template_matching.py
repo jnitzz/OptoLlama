@@ -7,11 +7,51 @@ from typing import Any, Optional, Union
 
 import torch
 import tqdm
+from safetensors import safe_open
 from optollama.data.dataset import SpectraDataset
 from optollama.evaluation.metrics import masked_mae_roi
-from safetensors.torch import load_file
 from optollama.data.spectra import ensure_3w
 from optollama.utils.utils import save_as_json
+from safetensors.torch import load_file
+
+
+def collect_safetensor_files(paths: Union[list[str], str]) -> list[Path]:
+    """Collect safetensor shards from directories/files using dataset-compatible sorting."""
+    if isinstance(paths, str):
+        paths = [paths]
+
+    files: list[Path] = []
+    for p in map(Path, paths):
+        if p.is_dir():
+            files.extend(fp for fp in p.glob("*.safetensors"))
+        elif p.suffix == ".safetensors":
+            files.append(p)
+        else:
+            raise ValueError(f"Unsupported path (expect dir or .safetensors): {p}")
+
+    if not files:
+        raise FileNotFoundError("No .safetensors files found in the provided paths.")
+
+    return sorted(files, key=shard_sort_key)
+
+
+def shard_sort_key(path: Path) -> tuple[str, Union[int, float]]:
+    """Sort shards by prefix and numeric suffix."""
+    import re
+
+    m = re.match(r"^(.*?)(\d+)$", path.stem.lower())
+    if m:
+        prefix, num = m.groups()
+        return (prefix, int(num))
+    return (path.stem.lower(), float("inf"))
+
+
+def safetensor_first_dim(path: Path, tensor_name: str = "spectra") -> int:
+    """Read the first dimension of a safetensors tensor without materializing all shards."""
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        if tensor_name not in f.keys():
+            raise KeyError(f"{path} must contain {tensor_name!r} tensor.")
+        return int(f.get_slice(tensor_name).get_shape()[0])
 
 
 def load_train_sample_by_global_id(
@@ -46,34 +86,7 @@ def load_train_sample_by_global_id(
     IndexError
         If ``global_id`` exceeds the total dataset size.
     """
-    # --- normalize to list ---
-    if isinstance(train_paths, str):
-        train_paths = [train_paths]
-
-    # --- collect safetensors files ---
-    files = []
-    for p in map(Path, train_paths):
-        if p.is_dir():
-            files.extend(sorted(fp for fp in p.glob("*.safetensors")))
-        elif p.suffix == ".safetensors":
-            files.append(p)
-        else:
-            raise ValueError(f"Invalid train path: {p}")
-
-    if not files:
-        raise FileNotFoundError("No .safetensors files found")
-
-    # --- same sort logic as dataset ---
-    def shard_sort_key(path: Path) -> tuple[str, Union[int, float]]:
-        import re
-
-        m = re.match(r"^(.*?)(\d+)$", path.stem.lower())
-        if m:
-            prefix, num = m.groups()
-            return (prefix, int(num))
-        return (path.stem.lower(), float("inf"))
-
-    files = sorted(files, key=shard_sort_key)
+    files = collect_safetensor_files(train_paths)
 
     # --- iterate until we find the correct shard ---
     offset = 0
@@ -159,33 +172,7 @@ def find_best_train_for_target(
     target_3w = t_3w.to(torch.float32).to(device_t)  # [3,W]
     w = target_3w.size(-1)
 
-    # --- collect all safetensors files, but don't load them yet ---
-    if isinstance(train_paths, str):
-        train_paths = [train_paths]
-
-    files = []
-    for p in map(Path, train_paths):
-        if p.is_dir():
-            files.extend(sorted(fp for fp in p.glob("*.safetensors")))
-        elif p.suffix == ".safetensors":
-            files.append(p)
-        else:
-            raise ValueError(f"Unsupported train path (expect dir or .safetensors): {p}")
-
-    if not files:
-        raise FileNotFoundError("No .safetensors files found in the provided train paths.")
-
-    # mimic the same sort logic as SpectraDataset for consistent indices
-    def shard_sort_key(path: Path) -> tuple[str, Union[int, float]]:
-        import re
-
-        m = re.match(r"^(.*?)(\d+)$", path.stem.lower())
-        if m:
-            prefix, num = m.groups()
-            return (prefix, int(num))
-        return (path.stem.lower(), float("inf"))
-
-    files = sorted(files, key=shard_sort_key)
+    files = collect_safetensor_files(train_paths)
 
     best_mae_val = float("inf")
     best_global_idx = -1
@@ -326,6 +313,165 @@ def find_nearest_neighbors(
     return results
 
 
+def pairwise_masked_mae(
+    test_spectra: torch.Tensor,
+    train_spectra: torch.Tensor,
+    wl_range: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute pairwise MAE between test and train spectra as [n_test, n_train]."""
+    if test_spectra.dim() != 3 or train_spectra.dim() != 3:
+        raise ValueError(
+            f"Expected test/train spectra with shape [N,3,W], got {tuple(test_spectra.shape)} and {tuple(train_spectra.shape)}"
+        )
+    if test_spectra.size(1) != 3 or train_spectra.size(1) != 3:
+        raise ValueError(
+            f"Expected channel dimension 3, got {test_spectra.size(1)} and {train_spectra.size(1)}"
+        )
+    if test_spectra.size(2) != train_spectra.size(2):
+        raise ValueError(
+            f"Wavelength dimension mismatch: test W={test_spectra.size(2)}, train W={train_spectra.size(2)}"
+        )
+
+    finite = torch.isfinite(train_spectra).all(dim=-1, keepdim=True).unsqueeze(0)
+    valid = finite.expand(test_spectra.size(0), -1, -1, train_spectra.size(-1))
+    if wl_range is not None:
+        valid = valid & wl_range.to(device=train_spectra.device, dtype=torch.bool).view(1, 1, 1, -1)
+
+    abs_err = torch.abs(test_spectra.unsqueeze(1) - torch.nan_to_num(train_spectra).unsqueeze(0))
+    masked_err = abs_err.where(valid, torch.zeros_like(abs_err))
+    num = masked_err.sum(dim=(2, 3))
+    den = valid.sum(dim=(2, 3)).clamp_min(1)
+    return num / den
+
+
+@torch.no_grad()
+def find_nearest_neighbors_streaming(
+    train_paths: Union[list[str], str],
+    test_paths: Union[list[str], str],
+    train_chunk_size: int = 1024,
+    test_chunk_size: int = 16,
+    max_test_samples: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    inner_progress: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Find nearest training spectra for test spectra without loading full datasets.
+
+    This scans training shards once per test chunk instead of once per test
+    sample, which is much more practical for multi-million-sample datasets.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_t = torch.device(device)
+
+    train_files = collect_safetensor_files(train_paths)
+    test_files = collect_safetensor_files(test_paths)
+    total_train = sum(safetensor_first_dim(path) for path in train_files)
+    total_test_all = sum(safetensor_first_dim(path) for path in test_files)
+    total_test = min(total_test_all, max_test_samples) if max_test_samples is not None else total_test_all
+    print(
+        f"Exact NN search: {total_test} test spectra x {total_train} train spectra "
+        f"({len(test_files)} test shards, {len(train_files)} train shards)"
+    )
+
+    results: list[dict[str, Any]] = []
+    test_global_offset = 0
+    outer = tqdm.tqdm(total=total_test, desc="Matching test -> train", unit="sample")
+
+    try:
+        for test_path in test_files:
+            test_data = load_file(str(test_path))
+            if "spectra" not in test_data:
+                raise KeyError(f"{test_path} must contain 'spectra' tensor.")
+            test_spectra_all = test_data["spectra"].to(torch.float32)
+            if test_spectra_all.dim() != 3 or test_spectra_all.size(1) != 3:
+                raise ValueError(f"'spectra' in {test_path} must be [N,3,W], got {tuple(test_spectra_all.shape)}")
+
+            n_test_in_shard = test_spectra_all.size(0)
+            if max_test_samples is not None:
+                remaining = max_test_samples - len(results)
+                if remaining <= 0:
+                    break
+                n_test_in_shard = min(n_test_in_shard, remaining)
+
+            for test_start in range(0, n_test_in_shard, test_chunk_size):
+                test_end = min(test_start + test_chunk_size, n_test_in_shard)
+                test_batch = test_spectra_all[test_start:test_end].to(device_t, non_blocking=True)
+                n_test_batch = test_batch.size(0)
+                w = test_batch.size(-1)
+
+                best_mae = torch.full((n_test_batch,), float("inf"), device=device_t)
+                best_global = torch.full((n_test_batch,), -1, dtype=torch.long, device=device_t)
+                best_local = [-1 for _ in range(n_test_batch)]
+                best_file = ["" for _ in range(n_test_batch)]
+
+                train_global_offset = 0
+                train_iter = train_files
+                if inner_progress:
+                    train_iter = tqdm.tqdm(
+                        train_files,
+                        desc=f"scan train for test {test_global_offset + test_start}-{test_global_offset + test_end - 1}",
+                        leave=False,
+                        unit="shard",
+                    )
+
+                for train_path in train_iter:
+                    train_data = load_file(str(train_path))
+                    if "spectra" not in train_data:
+                        raise KeyError(f"{train_path} must contain 'spectra' tensor.")
+                    train_spectra = train_data["spectra"].to(torch.float32)
+                    if train_spectra.dim() != 3 or train_spectra.size(1) != 3:
+                        raise ValueError(f"'spectra' in {train_path} must be [N,3,W], got {tuple(train_spectra.shape)}")
+                    if train_spectra.size(2) != w:
+                        raise ValueError(
+                            f"Wavelength dimension mismatch in {train_path}: train W={train_spectra.size(2)}, test W={w}"
+                        )
+
+                    n_train = train_spectra.size(0)
+                    for train_start in range(0, n_train, train_chunk_size):
+                        train_end = min(train_start + train_chunk_size, n_train)
+                        train_chunk = train_spectra[train_start:train_end].to(device_t, non_blocking=True)
+                        mae = pairwise_masked_mae(test_batch, train_chunk)
+                        chunk_best, chunk_idx = mae.min(dim=1)
+                        improved = chunk_best < best_mae
+                        if improved.any():
+                            best_mae[improved] = chunk_best[improved]
+                            best_global[improved] = train_global_offset + train_start + chunk_idx[improved]
+                            improved_indices = torch.nonzero(improved, as_tuple=False).flatten().detach().cpu().tolist()
+                            chunk_idx_cpu = chunk_idx.detach().cpu().tolist()
+                            for i in improved_indices:
+                                best_local[i] = train_start + int(chunk_idx_cpu[i])
+                                best_file[i] = str(train_path)
+
+                    train_global_offset += n_train
+
+                best_mae_cpu = best_mae.detach().cpu().tolist()
+                best_global_cpu = best_global.detach().cpu().tolist()
+                for i in range(n_test_batch):
+                    results.append(
+                        {
+                            "test_index": int(test_global_offset + test_start + i),
+                            "test_file": str(test_path),
+                            "test_index_in_file": int(test_start + i),
+                            "best_train_index": int(best_global_cpu[i]),
+                            "best_global_index": int(best_global_cpu[i]),
+                            "best_file": best_file[i],
+                            "best_index_in_file": int(best_local[i]),
+                            "mae": float(best_mae_cpu[i]),
+                        }
+                    )
+
+                outer.update(n_test_batch)
+
+            test_global_offset += test_spectra_all.size(0)
+            if max_test_samples is not None and len(results) >= max_test_samples:
+                break
+    finally:
+        outer.close()
+
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     """
     Parse CLI arguments for the match-test-to-train script.
@@ -341,6 +487,8 @@ def parse_args() -> argparse.Namespace:
         - ``out_dir`` — directory where the JSON result will be written.
         - ``name`` — base filename (default: ``"nearest_neighbors"``).
         - ``chunk_size`` — training chunk size for distance computation.
+        - ``test_chunk_size`` — number of test spectra matched together.
+        - ``max_test_samples`` — optional cap for exact matching.
         - ``device`` — e.g. ``"cuda"``, ``"cuda:0"``, or ``"cpu"``.
     """
     p = argparse.ArgumentParser(description="Match test spectra to nearest training spectra (by MAE).")
@@ -375,6 +523,23 @@ def parse_args() -> argparse.Namespace:
         help="Chunk size for iterating over training samples (default: 1024).",
     )
     p.add_argument(
+        "--test_chunk_size",
+        type=int,
+        default=16,
+        help="Number of test spectra matched against each training chunk (default: 16).",
+    )
+    p.add_argument(
+        "--max_test_samples",
+        type=int,
+        default=None,
+        help="Optional cap on the number of test spectra to match, taken from the start of the sorted test shards.",
+    )
+    p.add_argument(
+        "--no_inner_progress",
+        action="store_true",
+        help="Disable the per-test-chunk train-shard progress bar.",
+    )
+    p.add_argument(
         "--device",
         type=str,
         default=None,
@@ -407,14 +572,14 @@ def main() -> None:
     else:
         test_paths = args.test
 
-    train_ds = SpectraDataset(train_paths)
-    test_ds = SpectraDataset(test_paths)
-
-    results = find_nearest_neighbors(
-        train_ds,
-        test_ds,
+    results = find_nearest_neighbors_streaming(
+        train_paths,
+        test_paths,
         train_chunk_size=args.chunk_size,
+        test_chunk_size=args.test_chunk_size,
+        max_test_samples=args.max_test_samples,
         device=args.device,
+        inner_progress=not args.no_inner_progress,
     )
 
     # Save mapping as JSON using the project helper

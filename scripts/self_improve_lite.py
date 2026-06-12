@@ -15,6 +15,8 @@ import optollama.evaluation
 import optollama.model
 import optollama.utils
 
+from optollama.evaluation.prediction import split_model_sample_output
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -298,6 +300,10 @@ def build_model_from_config(
         temperature=cfg["TEMPERATURE"],
         top_k=cfg["TOP_K"],
         top_p=cfg["TOP_P"],
+        spectrum_latent=cfg.get("SPECTRUM_LATENT"),
+        depth_position=cfg.get("DEPTH_POSITION"),
+        depth_rope=cfg.get("DEPTH_ROPE"),
+        factored_output=cfg.get("FACTORED_OUTPUT"),
     ).to(device)
 
     checkpoint = cfg["BEST_CHECKPOINT_PATH"]
@@ -356,8 +362,7 @@ def sample_model_candidates(
     keep = min(max(1, int(keep_candidates)), m)
 
     targets_mc = targets.unsqueeze(1).expand(b, m, *targets.shape[1:]).reshape(b * m, *targets.shape[1:])
-    logits_or_ids, _ = model(targets_mc)
-    ids_flat = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
+    ids_flat, _, _ = split_model_sample_output(model(targets_mc))
     pred_flat = optollama.evaluation.simulation.simulate_token_sequence(ids_flat, tmm_ctx, eos=eos, pad=pad, msk=msk)
     mae = optollama.evaluation.masked_mae_roi(targets_mc, pred_flat, wl_mask=roi_mask).view(b, m)
     ids = ids_flat.view(b, m, -1)

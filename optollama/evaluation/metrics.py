@@ -141,6 +141,7 @@ def masked_mae_roi(
     x: torch.Tensor,
     y: torch.Tensor,
     wl_mask: torch.Tensor = None,
+    channel_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Compute Mean Absolute Error over finite predictions and a wavelength ROI.
@@ -170,6 +171,10 @@ def masked_mae_roi(
     if wl_mask is not None:
         wl_mask = wl_mask.view(1, 1, -1)  # [1,1,W]
         valid = valid & wl_mask  # [B,3,W]
+
+    if channel_mask is not None:
+        channel_mask = channel_mask.to(device=valid.device, dtype=torch.bool).view(1, -1, 1)
+        valid = valid & channel_mask
 
     abs_err = torch.abs(x - torch.nan_to_num(y))
     masked_err = abs_err.where(valid, torch.zeros_like(abs_err))
@@ -249,6 +254,7 @@ def resampled_mae(
     y: torch.Tensor,
     source_wavelengths: torch.Tensor,
     target_wavelengths: torch.Tensor,
+    channel_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Compute MAE after resampling both spectra to a common wavelength grid.
@@ -258,4 +264,4 @@ def resampled_mae(
     """
     x_resampled = interpolate_spectra_to_wavelengths(x, source_wavelengths, target_wavelengths)
     y_resampled = interpolate_spectra_to_wavelengths(y, source_wavelengths, target_wavelengths)
-    return masked_mae(x_resampled, y_resampled)
+    return masked_mae_roi(x_resampled, y_resampled, channel_mask=channel_mask)

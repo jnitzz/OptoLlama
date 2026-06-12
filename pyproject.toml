@@ -43,7 +43,8 @@ dependencies = [
   "tmm_fast",
   "tqdm",
   "omegaconf",
-  "huggingface_hub"
+  "huggingface_hub",
+  "pyarrow"
 ]
 
 [project.optional-dependencies]

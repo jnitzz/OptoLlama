@@ -13,6 +13,7 @@ import optollama.evaluation
 import optollama.evaluation.simulation
 import optollama.utils
 
+from optollama.evaluation.prediction import split_model_sample_output
 from scripts import self_improve_lite as lite
 
 
@@ -221,8 +222,7 @@ def _sample_rank_candidates(
     keep = min(max(1, int(rank_candidates)), m)
 
     targets_mc = targets.unsqueeze(1).expand(b, m, *targets.shape[1:]).reshape(b * m, *targets.shape[1:])
-    logits_or_ids, _ = model(targets_mc)
-    ids_flat = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
+    ids_flat, _, _ = split_model_sample_output(model(targets_mc))
     mae_flat = lite.simulate_mae_in_chunks(
         ids_flat,
         targets_mc,

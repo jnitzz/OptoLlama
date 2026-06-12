@@ -46,6 +46,20 @@ def _example_spectrum(dataset: torch.utils.data.Dataset) -> torch.Tensor:
     return sample[0]
 
 
+def _tmm_device(cfg: dict, default_device: torch.device) -> torch.device:
+    """Resolve the device used for validation TMM simulation."""
+    requested = cfg.get("TMM_DEVICE", "auto")
+    if requested is None or str(requested).lower() in {"auto", "same"}:
+        return default_device
+
+    requested_device = torch.device(str(requested))
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("TMM_DEVICE is set to CUDA, but CUDA is not available.")
+    if requested_device.type == "cuda" and requested_device.index is None and default_device.type == "cuda":
+        return default_device
+    return requested_device
+
+
 def train(cfg: dict) -> None:
     """
     Train and optionally validate OptoLlama (or OptoGPT).
@@ -79,10 +93,11 @@ def train(cfg: dict) -> None:
     )
 
     # --- TMM simulation ---
+    tmm_device = _tmm_device(cfg, device)
     tmm_ctx = optollama.evaluation.simulation.TMMContext.make(
         cfg=cfg,
         idx_to_token=idx_to_token,
-        device=device
+        device=tmm_device
     ) if tmm else None
 
     # --- model ---
@@ -108,6 +123,9 @@ def train(cfg: dict) -> None:
         top_k=cfg["TOP_K"],
         top_p=cfg["TOP_P"],
         spectrum_latent=cfg.get("SPECTRUM_LATENT"),
+        depth_position=cfg.get("DEPTH_POSITION"),
+        depth_rope=cfg.get("DEPTH_ROPE"),
+        factored_output=cfg.get("FACTORED_OUTPUT"),
     ).to(device)
 
     # --- DDP wrapper ---
@@ -155,7 +173,7 @@ def train(cfg: dict) -> None:
     checkpoint = cfg["LAST_CHECKPOINT_PATH"]
 
     best_test_acc = 0.0
-    best_test_mae = torch.inf
+    best_test_mae = float("inf")
     start_epoch = 0
 
     if resume_enabled and checkpoint and os.path.exists(checkpoint):
@@ -173,16 +191,153 @@ def train(cfg: dict) -> None:
         train_acc = blob.get("train_acc", train_acc)
         test_acc = blob.get("test_acc", test_acc)
         test_mae = blob.get("test_mae", test_mae)
+        if torch.is_tensor(test_acc) and test_acc.numel() > 0:
+            best_test_acc = float(torch.nan_to_num(test_acc, nan=0.0).max().item())
+        if torch.is_tensor(test_mae):
+            finite_mae = test_mae[torch.isfinite(test_mae)]
+            if finite_mae.numel() > 0:
+                best_test_mae = float(finite_mae.min().item())
 
     if rank == 0:
         os.makedirs(cfg["OUTPUT_PATH"], exist_ok=True)
 
+    def run_validation(
+        epoch: int,
+        trigger: str,
+        *,
+        save_last: bool,
+        samples_seen_epoch: int,
+        samples_seen_total: int,
+    ) -> None:
+        """Run validation and update best/last checkpoints."""
+        nonlocal best_test_acc, best_test_mae
+
+        model.eval()
+        test_output = optollama.evaluation.model_prediction(
+            model,
+            test_loader,
+            device=device,
+            mode=cfg["VALID_SIM"],
+            eos=eos_idx,
+            pad=pad_idx,
+            msk=msk_idx,
+            idx_to_token=idx_to_token,
+            tmm_ctx=tmm_ctx,
+            mc_samples=cfg["MC_SAMPLES"],
+            rank=rank,
+            world_size=world_size,
+            gather=True,
+            track_step_mae=False,
+        )
+
+        test_acc[epoch] = test_output["mean_acc"]
+        if tmm:
+            test_mae[epoch] = test_output["mean_mae"]
+
+        if rank != 0:
+            model.train()
+            return
+
+        samples = len(test_output["results"])
+        optollama.utils.save_as_json(cfg["SAMPLES_PATH"], test_output["results"])
+        print(
+            f"[rank 0] Saved {samples} samples -> {cfg['SAMPLES_PATH']} "
+            f"({trigger}, epoch={epoch + 1}, epoch_samples={samples_seen_epoch}, total_samples={samples_seen_total})"
+        )
+
+        checkpoint_paths = [cfg["LAST_CHECKPOINT_PATH"]] if save_last else []
+        if tmm:
+            new_mae = float(test_mae[epoch].item())
+            print(f"\tmin test MAE: {min(best_test_mae, new_mae):.6f}")
+            print(f"\tlast test MAE: {new_mae:.6f}")
+            if new_mae < best_test_mae:
+                print(
+                    f"Saving best checkpoint (MAE): new={new_mae:.6f} < best={best_test_mae:.6f} "
+                    f"[epoch {epoch + 1}, {trigger}]"
+                )
+                best_test_mae = new_mae
+                checkpoint_paths.append(cfg["BEST_CHECKPOINT_PATH"])
+        else:
+            print(f"\ttest accuracy: {test_acc[epoch]:.2f}%")
+            new_acc = test_acc[epoch].item()
+            if new_acc > best_test_acc:
+                print(
+                    f"Saving best checkpoint (ACC): new={new_acc:.2f} > best={best_test_acc:.2f} "
+                    f"[epoch {epoch + 1}, {trigger}]"
+                )
+                best_test_acc = new_acc
+                checkpoint_paths.append(cfg["BEST_CHECKPOINT_PATH"])
+
+        for path in checkpoint_paths:
+            optollama.utils.save_checkpoint(
+                path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                train_losses=train_losses,
+                train_acc=train_acc,
+                test_acc=test_acc,
+                test_mae=test_mae,
+                extra={
+                    "sampling": {
+                        "temperature": cfg["TEMPERATURE"],
+                        "top_k": cfg["TOP_K"],
+                        "top_p": cfg["TOP_P"],
+                    },
+                    "init_checkpoint": init_report,
+                    "validation_trigger": trigger,
+                    "samples_seen_epoch": int(samples_seen_epoch),
+                    "samples_seen_total": int(samples_seen_total),
+                },
+            )
+
+        model.train()
+
+    def save_last_checkpoint_only(
+        epoch: int,
+        trigger: str,
+        *,
+        samples_seen_epoch: int,
+        samples_seen_total: int,
+    ) -> None:
+        """Save the last checkpoint without re-running validation."""
+        if rank != 0:
+            return
+        optollama.utils.save_checkpoint(
+            cfg["LAST_CHECKPOINT_PATH"],
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            train_losses=train_losses,
+            train_acc=train_acc,
+            test_acc=test_acc,
+            test_mae=test_mae,
+            extra={
+                "sampling": {
+                    "temperature": cfg["TEMPERATURE"],
+                    "top_k": cfg["TOP_K"],
+                    "top_p": cfg["TOP_P"],
+                },
+                "init_checkpoint": init_report,
+                "validation_trigger": trigger,
+                "samples_seen_epoch": int(samples_seen_epoch),
+                "samples_seen_total": int(samples_seen_total),
+            },
+        )
+        print(f"[rank 0] Saved last checkpoint -> {cfg['LAST_CHECKPOINT_PATH']} ({trigger})")
+
     # ------------------------------ epochs ------------------------------
     epochs = cfg["EPOCHS"]
+    validate_every_samples = int(cfg.get("VALIDATE_EVERY_N_TRAIN_SAMPLES") or 0)
+    validate_at_epoch_end = bool(cfg.get("VALIDATE_AT_EPOCH_END", True))
+    samples_seen_total = 0
     for epoch in range(start_epoch, epochs):
         epoch_loss_sum = 0.0
         epoch_correct = 0.0
         epoch_tokens = 0.0
+        samples_seen_epoch = 0
+        last_validation_epoch_sample = -1
+        next_validation_sample = validate_every_samples if validate_every_samples > 0 else None
 
         # DDP epoch seeds
         _set_loader_epoch(train_loader, epoch)
@@ -197,16 +352,24 @@ def train(cfg: dict) -> None:
             optimizer.zero_grad(set_to_none=True)
 
             spectra, stacks = batch[0].to(device), batch[1].to(device)
-            logits = model(spectra, stacks)
-
-            log_probs = torch.nn.functional.log_softmax(torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0), dim=-1)
-            loss = torch.nn.NLLLoss(ignore_index=pad_idx)(
-                log_probs.view(-1, vocab_size), 
-                stacks.view(-1)
-            )
+            train_out = None
+            if bool((cfg.get("FACTORED_OUTPUT") or {}).get("ENABLED", False)):
+                train_out = model(spectra, stacks, return_loss=True)
+                loss = train_out["loss"]
+                logits = train_out["logits"]
+            else:
+                logits = model(spectra, stacks)
+                log_probs = torch.nn.functional.log_softmax(torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0), dim=-1)
+                loss = torch.nn.NLLLoss(ignore_index=pad_idx)(
+                    log_probs.view(-1, vocab_size), 
+                    stacks.view(-1)
+                )
 
             loss.backward()
             optimizer.step()
+            batch_global_samples = int(stacks.size(0)) * int(world_size)
+            samples_seen_epoch += batch_global_samples
+            samples_seen_total += batch_global_samples
 
             # --- logging (DDP-avg for losses) ---
             with torch.no_grad():
@@ -239,88 +402,49 @@ def train(cfg: dict) -> None:
                 train_acc[epoch] = epoch_correct / max(epoch_tokens, 1.0)
 
             if rank == 0:
-                pbar.set_postfix(
-                    loss_CE=f"{train_losses[epoch]:.4f}",
-                    acc=f"{train_acc[epoch] * 100:.4f}%",
-                )
+                postfix = {
+                    "loss": f"{train_losses[epoch]:.4f}",
+                    "acc": f"{train_acc[epoch] * 100:.4f}%",
+                }
+                if isinstance(locals().get("train_out"), dict):
+                    if "material_loss" in train_out:
+                        postfix["mat"] = f"{float(train_out['material_loss'].detach().cpu()):.3f}"
+                    if "thickness_loss" in train_out:
+                        postfix["th"] = f"{float(train_out['thickness_loss'].detach().cpu()):.3f}"
+                pbar.set_postfix(**postfix)
                 pbar.update()
+
+            if next_validation_sample is not None and samples_seen_epoch >= next_validation_sample:
+                if rank == 0:
+                    pbar.write(f"Validation after {samples_seen_epoch} train samples in epoch {epoch + 1}.")
+                run_validation(
+                    epoch,
+                    "mid_epoch",
+                    save_last=False,
+                    samples_seen_epoch=samples_seen_epoch,
+                    samples_seen_total=samples_seen_total,
+                )
+                last_validation_epoch_sample = samples_seen_epoch
+                next_validation_sample += validate_every_samples
 
         if rank == 0:
             pbar.close()
 
-        # ------------------------------ validation ------------------------------
-        model.eval()
-        test_output = optollama.evaluation.model_prediction(
-            model,
-            test_loader,
-            device=device,
-            mode=cfg["VALID_SIM"],
-            eos=eos_idx,
-            pad=pad_idx,
-            msk=msk_idx,
-            idx_to_token=idx_to_token,
-            tmm_ctx=tmm_ctx,
-            mc_samples=cfg["MC_SAMPLES"],
-            rank=rank,
-            world_size=world_size,
-            gather=True,
-            track_step_mae=False,
-        )
-
-        # update trackers
-        test_acc[epoch] = test_output["mean_acc"]
-        if tmm:
-            test_mae[epoch] = test_output["mean_mae"]
-
-        # save per-example results (rank 0 only)
-        if rank == 0:
-            samples = len(test_output["results"])
-            optollama.utils.save_as_json(cfg["SAMPLES_PATH"], test_output["results"])
-            print(f"[rank 0] Saved {samples} samples -> {cfg['SAMPLES_PATH']}")
-
-            if tmm:
-                print(f"\tmin test MAE: {torch.min(test_mae).item():.6f}")
-                print(f"\tlast test MAE: {test_mae[epoch]:.6f}")
+        if validate_at_epoch_end:
+            if last_validation_epoch_sample == samples_seen_epoch:
+                save_last_checkpoint_only(
+                    epoch,
+                    "epoch_end_no_revalidation",
+                    samples_seen_epoch=samples_seen_epoch,
+                    samples_seen_total=samples_seen_total,
+                )
             else:
-                print(f"\ttest accuracy: {test_acc[epoch]:.2f}%")
-        
-        # ------------------------------ checkpointing ------------------------------
-        if rank == 0:
-            checkpoint_paths = [cfg["LAST_CHECKPOINT_PATH"],]
-
-            if tmm:
-                # MAE-based checkpointing
-                new_mae = test_mae[epoch].item()
-                if new_mae < best_test_mae:
-                    print(f"Saving best checkpoint (MAE): new={new_mae:.6f} < best={best_test_mae:.6f} [epoch {epoch + 1}]")
-                    best_test_mae = new_mae
-                    checkpoint_paths.append(cfg["BEST_CHECKPOINT_PATH"])
-            else:
-                # accuracy-based checkpointing
-                new_acc = test_acc[epoch].item()
-                if new_acc > best_test_acc:
-                    print(f"Saving best checkpoint (ACC): new={new_acc:.2f} > best={best_test_acc:.2f} [epoch {epoch + 1}]")
-                    best_test_acc = new_acc
-                    checkpoint_paths.append(cfg["BEST_CHECKPOINT_PATH"])
-        
-            for path in checkpoint_paths:
-                optollama.utils.save_checkpoint(
-                    path,
-                    model=model,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    train_losses=train_losses,
-                    train_acc=train_acc,
-                    test_acc=test_acc,
-                    test_mae=test_mae,
-                    extra={
-                        "sampling": {
-                            "temperature": cfg["TEMPERATURE"],
-                            "top_k": cfg["TOP_K"],
-                            "top_p": cfg["TOP_P"],
-                        },
-                        "init_checkpoint": init_report,
-                    },
+                run_validation(
+                    epoch,
+                    "epoch_end",
+                    save_last=True,
+                    samples_seen_epoch=samples_seen_epoch,
+                    samples_seen_total=samples_seen_total,
                 )
 
 

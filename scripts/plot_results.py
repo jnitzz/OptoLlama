@@ -33,6 +33,19 @@ def decode_ids(ids: torch.Tensor, idx_to_token: dict[int, str], eos_idx: int, pa
     return tokens
 
 
+def continuous_layers_to_plot_tokens(sample: dict) -> list[str]:
+    """Return token-like strings with continuous thicknesses for stack plots."""
+    layers = sample.get("stack_pred_continuous") or []
+    tokens: list[str] = []
+    for layer in layers:
+        material = layer.get("material")
+        thickness = layer.get("thickness_nm")
+        if material is None or thickness is None:
+            continue
+        tokens.append(f"{material}_{float(thickness):.3g}")
+    return tokens
+
+
 def parse_arguments() -> argparse.Namespace:
     """Parse plotting CLI arguments."""
     parser = argparse.ArgumentParser(description="Plot OptoLlama inference outputs.")
@@ -193,7 +206,7 @@ def _sample_one(
         wavelengths=wavelengths,
         target_spectrum=np.asarray(sample["rat_target"], dtype=np.float32),
         predicted_spectrum=np.asarray(sample["rat_pred"], dtype=np.float32),
-        predicted_tokens=sample.get("stack_pred_tokens", []),
+        predicted_tokens=continuous_layers_to_plot_tokens(sample) or sample.get("stack_pred_tokens", []),
         target_tokens=sample.get("stack_target_tokens", []),
         sample_acc=sample.get("acc"),
         sample_mae=sample.get("mae"),

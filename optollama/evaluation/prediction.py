@@ -6,6 +6,7 @@ import torch
 import tqdm
 # ruff: noqa: F401
 
+import optollama.data
 import optollama.evaluation
 import optollama.utils
 
@@ -18,6 +19,45 @@ def sync_for_timing(device: torch.device, enabled: bool) -> None:
     """
     if enabled and torch.device(device).type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def split_model_sample_output(
+    output: Any,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Normalize model sampling output across legacy and factored formats.
+
+    Legacy models return ``(ids_or_logits, mae_traj)``. The continuous
+    thickness path returns a dict with hard token ``ids`` plus
+    ``thickness_nm``.
+    """
+    thickness_nm = None
+    mae_traj = None
+
+    if isinstance(output, dict):
+        if "ids" in output:
+            logits_or_ids = output["ids"]
+        elif "logits" in output:
+            logits_or_ids = output["logits"]
+        else:
+            raise ValueError("Model sample output dict must contain 'ids' or 'logits'.")
+        if "mae_traj" in output:
+            mae_traj = output["mae_traj"]
+        elif "step_mae_traj" in output:
+            mae_traj = output["step_mae_traj"]
+        thickness_nm = output.get("thickness_nm")
+    elif isinstance(output, tuple):
+        if len(output) == 2:
+            logits_or_ids, mae_traj = output
+        elif len(output) == 3:
+            logits_or_ids, mae_traj, thickness_nm = output
+        else:
+            raise ValueError(f"Unsupported model sample tuple length: {len(output)}")
+    else:
+        logits_or_ids = output
+
+    ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
+    return ids, mae_traj, thickness_nm
 
 
 def validate_and_setup(
@@ -147,6 +187,7 @@ def run_mc_batch(
     record_pred_spectra: bool,
     device: torch.device,
     score_spectra: Optional[torch.Tensor] = None,
+    mae_channel_mask: Optional[torch.Tensor] = None,
     deduplicate_stacks: bool = False,
     profile_timing: bool = False,
 ) -> tuple[dict, dict, dict[str, float]]:
@@ -229,17 +270,35 @@ def run_mc_batch(
     )
     sync_for_timing(device, profile_timing)
     t0 = time.perf_counter()
-    logits_or_ids, mae_traj_s = model(spectra_mc)
-    ids_flat = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
+    model_output = model(spectra_mc)
+    ids_flat, mae_traj_s, thickness_flat = split_model_sample_output(model_output)
     ids = ids_flat.view(b, m, -1)
+    thickness = thickness_flat.view(b, m, -1) if thickness_flat is not None else None
     sync_for_timing(device, profile_timing)
     timing["model_s"] = time.perf_counter() - t0
+
+    inner_model = model.module if hasattr(model, "module") else model
+    use_continuous_thickness_for_tmm = bool(
+        thickness_flat is not None and getattr(inner_model, "continuous_thickness_use_for_tmm", True)
+    )
+    save_continuous_thickness = bool(
+        thickness is not None and getattr(inner_model, "continuous_thickness_save_in_results", True)
+    )
 
     if do_sim:
         sync_for_timing(device, profile_timing)
         t0 = time.perf_counter()
-        if deduplicate_stacks:
-            unique_ids, inverse = torch.unique(ids_flat, dim=0, return_inverse=True)
+        sim_device = tmm_ctx.wl.device if tmm_ctx is not None else device
+        ids_for_sim = ids_flat.to(sim_device, non_blocking=True) if ids_flat.device != sim_device else ids_flat
+        thickness_for_sim = None
+        if use_continuous_thickness_for_tmm:
+            thickness_for_sim = (
+                thickness_flat.to(sim_device, non_blocking=True)
+                if thickness_flat.device != sim_device
+                else thickness_flat
+            )
+        if deduplicate_stacks and thickness_for_sim is None:
+            unique_ids, inverse = torch.unique(ids_for_sim, dim=0, return_inverse=True)
             pred_unique = optollama.evaluation.simulation.simulate_token_sequence(
                 unique_ids,
                 tmm_ctx,
@@ -247,22 +306,28 @@ def run_mc_batch(
                 pad=pad,
                 msk=msk,
             )
-            pred_flat = pred_unique[inverse]
+            pred_flat = pred_unique[inverse].to(device, non_blocking=True)
             timing["dedup_input"] = float(ids_flat.size(0))
             timing["dedup_unique"] = float(unique_ids.size(0))
         else:
             pred_flat = optollama.evaluation.simulation.simulate_token_sequence(
-                ids_flat,
+                ids_for_sim,
                 tmm_ctx,
                 eos=eos,
                 pad=pad,
                 msk=msk,
-            )
+                thickness_override=thickness_for_sim,
+            ).to(device, non_blocking=True)
             timing["dedup_input"] = float(ids_flat.size(0))
             timing["dedup_unique"] = float(ids_flat.size(0))
         sync_for_timing(device, profile_timing)
         timing["tmm_s"] = time.perf_counter() - t0
-        mae_flat = optollama.evaluation.metrics.masked_mae_roi(score_spectra_mc, pred_flat, wl_mask=roi_mask)
+        mae_flat = optollama.evaluation.metrics.masked_mae_roi(
+            score_spectra_mc,
+            pred_flat,
+            wl_mask=roi_mask,
+            channel_mask=mae_channel_mask,
+        )
         mae_common_flat = None
         if source_wavelengths is not None and common_mae_wavelengths is not None:
             mae_common_flat = optollama.evaluation.metrics.resampled_mae(
@@ -270,6 +335,7 @@ def run_mc_batch(
                 pred_flat,
                 source_wavelengths=source_wavelengths,
                 target_wavelengths=common_mae_wavelengths,
+                channel_mask=mae_channel_mask,
             )
         pred = pred_flat.view(b, m, *pred_flat.shape[1:])
         mae = mae_flat.view(b, m)
@@ -283,7 +349,7 @@ def run_mc_batch(
     if mae_traj_s is not None:
         traj = mae_traj_s.view(b, m, -1)
 
-    draws = {"mae": [], "mae_common": [], "ids": [], "pred_spectra": [], "traj": []}
+    draws = {"mae": [], "mae_common": [], "ids": [], "thickness_nm": [], "pred_spectra": [], "traj": []}
     if record_all_mc:
         sync_for_timing(device, profile_timing)
         t0 = time.perf_counter()
@@ -292,6 +358,8 @@ def run_mc_batch(
             if mae_common is not None:
                 draws["mae_common"].append(mae_common[:, sample_idx].detach().cpu())
             draws["ids"].append(ids[:, sample_idx].detach().cpu())
+            if save_continuous_thickness:
+                draws["thickness_nm"].append(thickness[:, sample_idx].detach().cpu())
             if do_sim and record_pred_spectra and pred is not None:
                 draws["pred_spectra"].append(pred[:, sample_idx].detach().cpu())
             if traj is not None:
@@ -309,6 +377,7 @@ def run_mc_batch(
     best_mae = mae[batch_indices, best_indices]
     best_mae_common = mae_common[batch_indices, best_indices] if mae_common is not None else None
     best_pred_ids = ids[batch_indices, best_indices]
+    best_thickness_nm = thickness[batch_indices, best_indices] if save_continuous_thickness else None
     best_pred_spectra = pred[batch_indices, best_indices] if pred is not None else None
     best_step_mae_traj = traj[batch_indices, best_indices] if traj is not None else None
 
@@ -316,6 +385,7 @@ def run_mc_batch(
         "mae": best_mae,
         "mae_common": best_mae_common,
         "ids": best_pred_ids,
+        "thickness_nm": best_thickness_nm,
         "pred_spectra": best_pred_spectra,
         "step_mae_traj": best_step_mae_traj,
     }
@@ -334,6 +404,7 @@ def accumulate_mc_draws(
     all_mc_ids: list,
     all_mc_pred: list,
     all_mc_traj: list,
+    all_mc_thickness: Optional[list] = None,
 ) -> None:
     """
     Validate and accumulate per-batch MC draw lists into the global accumulators.
@@ -360,6 +431,8 @@ def accumulate_mc_draws(
         Global accumulator for predicted spectra draws (mutated in-place).
     all_mc_traj : list
         Global accumulator for MAE trajectory draws (mutated in-place).
+    all_mc_thickness : list, optional
+        Global accumulator for continuous thickness draws (mutated in-place).
 
     Raises
     ------
@@ -381,6 +454,13 @@ def accumulate_mc_draws(
             )
         all_mc_mae_common.append(draws["mae_common"])
     all_mc_ids.append(draws["ids"])
+    if all_mc_thickness is not None and draws.get("thickness_nm"):
+        if len(draws["thickness_nm"]) != m:
+            raise RuntimeError(
+                f"MC thickness recording mismatch: expected m={m}, "
+                f"got thickness_nm={len(draws['thickness_nm'])}"
+            )
+        all_mc_thickness.append(draws["thickness_nm"])
 
     if do_sim and record_pred_spectra:
         if len(draws["pred_spectra"]) != m:
@@ -394,6 +474,39 @@ def accumulate_mc_draws(
         all_mc_traj.append(draws["traj"])
 
 
+def continuous_stack_records(
+    pred_ids: list[int],
+    thickness_nm: torch.Tensor,
+    idx_to_token: dict[int, str],
+    eos: int,
+    special: set[int],
+) -> list[dict[str, Any]]:
+    """
+    Convert sampled hard materials plus continuous thicknesses to JSON records.
+    """
+    pred_len = pred_ids.index(eos) if eos in pred_ids else len(pred_ids)
+    records: list[dict[str, Any]] = []
+    thickness_values = thickness_nm.detach().cpu().tolist()
+
+    for pos, token_id_raw in enumerate(pred_ids[:pred_len]):
+        token_id = int(token_id_raw)
+        if token_id in special:
+            continue
+        token = idx_to_token[int(token_id)]
+        parts = optollama.data.layer_token_parts(token)
+        if parts is None:
+            continue
+        material, token_thickness_nm = parts
+        records.append({
+            "material": material,
+            "thickness_nm": float(thickness_values[pos]),
+            "token": token,
+            "token_thickness_nm": float(token_thickness_nm),
+        })
+
+    return records
+
+
 def build_example_record(
     i: int,
     idxs: torch.Tensor,
@@ -404,6 +517,7 @@ def build_example_record(
     best_mae_common: Optional[torch.Tensor],
     best_pred_spectra: Optional[torch.Tensor],
     best_step_mae_traj: Optional[torch.Tensor],
+    best_thickness_nm: Optional[torch.Tensor],
     score_spectra: torch.Tensor,
     idx_to_token: dict[int, str],
     eos: int,
@@ -435,6 +549,9 @@ def build_example_record(
         Best predicted spectra, shape ``[B, 3, W]``, or ``None``.
     best_step_mae_traj : torch.Tensor or None
         Per-step MAE trajectory, shape ``[B, steps]``, or ``None``.
+    best_thickness_nm : torch.Tensor or None
+        Continuous thicknesses for the best predicted hard-token sequence,
+        shape ``[B, S]``, or ``None``.
     score_spectra : torch.Tensor
         Spectra used for MC ranking and MAE reporting, shape ``[B, 3, W]``.
     idx_to_token : dict[int, str]
@@ -475,6 +592,14 @@ def build_example_record(
         "stack_target_tokens": tgt_tokens,
         "stack_pred_tokens": pred_tokens,
     }
+    if best_thickness_nm is not None:
+        rec["stack_pred_continuous"] = continuous_stack_records(
+            pred_ids_i,
+            best_thickness_nm[i],
+            idx_to_token,
+            eos=eos,
+            special=special,
+        )
 
     if do_sim and best_pred_spectra is not None:
         rec.update({
@@ -589,6 +714,7 @@ def assemble_mc_grids(
     do_sim: bool,
     record_pred_spectra: bool,
     track_step_mae: bool,
+    all_mc_thickness: Optional[list] = None,
 ) -> dict:
     """
     Assemble per-batch MC draw lists into ``[N, m, ...]`` grid tensors.
@@ -606,6 +732,8 @@ def assemble_mc_grids(
         List over batches; each element is a list of ``m`` tensors ``[B, 3, W]``.
     all_mc_traj : list
         List over batches; each element is a list of ``m`` tensors ``[B, steps]``.
+    all_mc_thickness : list, optional
+        List over batches; each element is a list of ``m`` tensors ``[B, S]``.
     m : int
         Number of MC samples.
     do_sim : bool
@@ -640,6 +768,9 @@ def assemble_mc_grids(
     if track_step_mae and all_mc_traj:
         grids["mae_traj_grid"] = _concat_and_stack(all_mc_traj).to(torch.float32)
 
+    if all_mc_thickness:
+        grids["thickness_nm_grid"] = _concat_and_stack(all_mc_thickness).to(torch.float32)
+
     return grids
 
 
@@ -659,6 +790,7 @@ def model_prediction(
     roi_mask: Optional[torch.Tensor] = None,
     source_wavelengths: Optional[torch.Tensor] = None,
     common_mae_wavelengths: Optional[torch.Tensor] = None,
+    mae_channel_mask: Optional[torch.Tensor] = None,
     score_spectrum: Optional[torch.Tensor] = None,
     record_all_mc: bool = False,
     record_pred_spectra: bool = True,
@@ -760,7 +892,15 @@ def model_prediction(
         mode, tmm_ctx, track_step_mae, model, ddp, rank, gather, record_all_mc
     )
 
-    all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj, results = [], [], [], [], [], []
+    all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj, all_mc_thickness, results = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     total_correct, total_tokens = 0.0, 0.0
     total_mae, total_mae_examples, running_idx = 0.0, 0.0, 0
     total_mae_common, total_mae_common_examples = 0.0, 0.0
@@ -805,6 +945,7 @@ def model_prediction(
             eos, pad, msk, roi_mask, source_wavelengths, common_mae_wavelengths,
             record_all_mc, record_pred_spectra, device,
             score_spectra=score_spectra,
+            mae_channel_mask=mae_channel_mask,
             deduplicate_stacks=deduplicate_stacks,
             profile_timing=profile_timing,
         )
@@ -818,6 +959,7 @@ def model_prediction(
             accumulate_mc_draws(
                 draws, mc_samples, do_sim, record_pred_spectra, track_step_mae,
                 all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj,
+                all_mc_thickness,
             )
 
         len_seq = min(stacks.size(1), best["ids"].size(1))
@@ -831,7 +973,12 @@ def model_prediction(
         total_correct += float(correct_count.item())
         total_tokens += float(total_count.item())
         if do_sim and best["pred_spectra"] is not None:
-            mae_vec = optollama.evaluation.metrics.masked_mae_roi(score_spectra, best["pred_spectra"], wl_mask=roi_mask)
+            mae_vec = optollama.evaluation.metrics.masked_mae_roi(
+                score_spectra,
+                best["pred_spectra"],
+                wl_mask=roi_mask,
+                channel_mask=mae_channel_mask,
+            )
             total_mae += float(mae_vec.sum().item())
             total_mae_examples += float(mae_vec.numel())
             if best["mae_common"] is not None:
@@ -842,7 +989,7 @@ def model_prediction(
             results.append(build_example_record(
                 i, idxs, stacks_aligned, ids_aligned, acc_vec,
                 best["mae"], best["mae_common"], best["pred_spectra"], best["step_mae_traj"],
-                score_spectra, idx_to_token, eos, pad, msk, do_sim,
+                best["thickness_nm"], score_spectra, idx_to_token, eos, pad, msk, do_sim,
                 conditioning_spectra=conditioning_spectra,
             ))
 
@@ -901,6 +1048,7 @@ def model_prediction(
             out.update(assemble_mc_grids(
                 all_mc_mae, all_mc_mae_common, all_mc_ids, all_mc_pred, all_mc_traj,
                 max(1, mc_samples), do_sim, record_pred_spectra, track_step_mae,
+                all_mc_thickness=all_mc_thickness,
             ))
 
     return out

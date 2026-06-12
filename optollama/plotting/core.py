@@ -20,6 +20,7 @@ class PlotBundle:
     mae_grid: Optional[np.ndarray] = None
     mae_common_grid: Optional[np.ndarray] = None
     ids_grid: Optional[np.ndarray] = None
+    thickness_nm_grid: Optional[np.ndarray] = None
     pred_spectra_grid: Optional[np.ndarray] = None
     mae_traj_grid: Optional[np.ndarray] = None
 
@@ -78,7 +79,14 @@ def save_plot_bundle(
     if roi_max is not None:
         arrays["roi_max"] = np.asarray([roi_max], dtype=np.float32)
 
-    for key in ("mae_grid", "mae_common_grid", "ids_grid", "pred_spectra_grid", "mae_traj_grid"):
+    for key in (
+        "mae_grid",
+        "mae_common_grid",
+        "ids_grid",
+        "thickness_nm_grid",
+        "pred_spectra_grid",
+        "mae_traj_grid",
+    ):
         value = output.get(key)
         if _has_value(value):
             arrays[key] = _to_numpy(value)
@@ -113,6 +121,7 @@ def load_plot_bundle(path: str) -> PlotBundle:
             mae_grid=payload["mae_grid"] if "mae_grid" in payload else None,
             mae_common_grid=payload["mae_common_grid"] if "mae_common_grid" in payload else None,
             ids_grid=payload["ids_grid"] if "ids_grid" in payload else None,
+            thickness_nm_grid=payload["thickness_nm_grid"] if "thickness_nm_grid" in payload else None,
             pred_spectra_grid=payload["pred_spectra_grid"] if "pred_spectra_grid" in payload else None,
             mae_traj_grid=payload["mae_traj_grid"] if "mae_traj_grid" in payload else None,
         )

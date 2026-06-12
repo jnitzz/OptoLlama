@@ -5,11 +5,10 @@ import tempfile
 
 from typing import Any, Optional
 
-import pandas as pd
+import numpy as np
 import torch
 
 from safetensors.torch import load_file, save_file
-from scipy.interpolate import interp1d
 from torch.nn.parallel import DistributedDataParallel
 
 import optollama.data.spectra
@@ -422,36 +421,30 @@ def load_materials(path_materials: str, wavelengths: torch.Tensor) -> dict:
         ``[W]``.
     """
     material_files = [item[:-4] for item in sorted(os.listdir(path_materials)) if item.lower().endswith(".csv")]
+    wavelength_grid = wavelengths.detach().cpu().numpy().astype(np.float64, copy=False)
 
     nk_dict = {}
 
     for mat in material_files:
         try:
-            data_temp = pd.read_csv(os.path.join(path_materials, f"{mat}.csv"))
-            wavelength_nm = data_temp["nm"].to_numpy()
-            n_vals = data_temp["n"].to_numpy()
-            k_vals = data_temp["k"].to_numpy()
+            data_temp = np.genfromtxt(
+                os.path.join(path_materials, f"{mat}.csv"),
+                delimiter=",",
+                names=True,
+                dtype=np.float64,
+            )
+            wavelength_nm = np.asarray(data_temp["nm"], dtype=np.float64)
+            n_vals = np.asarray(data_temp["n"], dtype=np.float64)
+            k_vals = np.asarray(data_temp["k"], dtype=np.float64)
         except Exception:
             print("Error: NK file does not have the right format: .csv with columns 'nm', 'n', 'k', comma (,) separated.")
             continue
 
-        n_fn = interp1d(
-            wavelength_nm,
-            n_vals,
-            axis=0,
-            bounds_error=False,
-            kind="linear",
-            fill_value=(n_vals[0], n_vals[-1]),
-        )
-        k_fn = interp1d(
-            wavelength_nm,
-            k_vals,
-            axis=0,
-            bounds_error=False,
-            kind="linear",
-            fill_value=(k_vals[0], k_vals[-1]),
-        )
-
-        nk_dict[mat] = n_fn(wavelengths.cpu().numpy()) + 1j * k_fn(wavelengths.cpu().numpy())
+        # 1D material tables only need linear interpolation with edge hold.
+        # np.genfromtxt/np.interp avoid native crashes seen from the Pandas/SciPy
+        # path on Windows after importing the broader evaluation stack.
+        n_interp = np.interp(wavelength_grid, wavelength_nm, n_vals, left=n_vals[0], right=n_vals[-1])
+        k_interp = np.interp(wavelength_grid, wavelength_nm, k_vals, left=k_vals[0], right=k_vals[-1])
+        nk_dict[mat] = n_interp + 1j * k_interp
 
     return nk_dict

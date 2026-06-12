@@ -3,9 +3,14 @@ from typing import Any, NamedTuple, Self, Sequence, Union
 import torch
 import torch.nn as nn
 
-from tmm_fast import coh_tmm
-
 import optollama.utils
+
+
+def _coh_tmm(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+    """Import tmm_fast lazily to avoid a Windows import-order crash."""
+    from tmm_fast import coh_tmm
+
+    return coh_tmm(*args, **kwargs)
 
 
 class TMMSpectrum(nn.Module):
@@ -200,7 +205,7 @@ class TMMSpectrum(nn.Module):
         t_tensor = torch.cat([front_t, t_base, back_t], dim=1)  # [B, S+2]
 
         # ---- 3. Coherent TMM solver ----
-        res = coh_tmm(
+        res = _coh_tmm(
             pol,
             n_tensor,
             t_tensor,
@@ -267,7 +272,14 @@ def build_tmm(
 
 
 @torch.no_grad()
-def simulate_token_sequence(ids: torch.Tensor, tmm_ctx: "TMMContext", eos: int, pad: int, msk: int) -> torch.Tensor:
+def simulate_token_sequence(
+    ids: torch.Tensor,
+    tmm_ctx: "TMMContext",
+    eos: int,
+    pad: int,
+    msk: int,
+    thickness_override: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
     Simulate RAT spectra from a batch of token id sequences.
 
@@ -283,6 +295,9 @@ def simulate_token_sequence(ids: torch.Tensor, tmm_ctx: "TMMContext", eos: int, 
         PAD token id (zero-thickness layers).
     msk : int
         MASK token id (zero-thickness layers).
+    thickness_override : torch.Tensor, optional
+        Continuous layer thicknesses in nm for hard-token stacks, shape
+        ``[B, S]``. Materials are still taken from ``ids``.
 
     Returns
     -------
@@ -303,9 +318,18 @@ def simulate_token_sequence(ids: torch.Tensor, tmm_ctx: "TMMContext", eos: int, 
             eos=eos,
             pad=pad,
             msk=msk,
+            thickness_override=thickness_override,
         )
     else:
-        out = tmm_ctx.tmm(ids, tmm_ctx.wl, tmm_ctx.theta, eos=eos, pad=pad, msk=msk)  # [B, 3, W]
+        out = tmm_ctx.tmm(
+            ids,
+            tmm_ctx.wl,
+            tmm_ctx.theta,
+            eos=eos,
+            pad=pad,
+            msk=msk,
+            thickness_override=thickness_override,
+        )  # [B, 3, W]
 
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
 
@@ -333,6 +357,7 @@ def simulate_token_sequence_averaged(
     eos: int,
     pad: int,
     msk: int,
+    thickness_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Simulate token stacks with angle, polarization, and thickness-jitter averaging.
@@ -346,7 +371,15 @@ def simulate_token_sequence_averaged(
 
     token_ids = ids.to(torch.long)
     valid = active_layer_mask(token_ids, eos=eos, pad=pad, msk=msk)
-    nominal = tmm.thickness[token_ids].real.float() * valid.float()
+    if thickness_override is None:
+        nominal = tmm.thickness[token_ids].real.float() * valid.float()
+    else:
+        if thickness_override.shape != token_ids.shape:
+            raise ValueError(
+                "thickness_override must have the same shape as token ids "
+                f"({tuple(token_ids.shape)}), got {tuple(thickness_override.shape)}."
+            )
+        nominal = thickness_override.to(device=token_ids.device, dtype=torch.float32) * valid.float()
     out = torch.zeros((token_ids.size(0), 3, wavelengths.numel()), device=token_ids.device, dtype=torch.float32)
 
     normalizer = float(sum(float(v) for v in angle_weights) * len(polarizations))

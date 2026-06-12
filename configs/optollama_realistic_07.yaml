@@ -1,6 +1,6 @@
 EXPERIMENT:
   MODEL: optollama
-  RUN: REALISTIC_07_20M
+  RUN: REALISTIC_07_DEPTH_FACTORED
   SEED: 3
 
 PATHS:
@@ -28,10 +28,10 @@ CHECKPOINT:
 DATA_LOADING:
   NUM_WORKERS: 0
   SHARDED_LOADING: true
-  NUM_SAMPLES_TRAIN: 20000000
-  NUM_SAMPLES_TEST: 512
-  TRAIN_BATCH_SIZE: 320
-  TEST_BATCH_SIZE: 128
+  NUM_SAMPLES_TRAIN: 1000000
+  NUM_SAMPLES_TEST: 32
+  TRAIN_BATCH_SIZE: 64
+  TEST_BATCH_SIZE: 16
 
 SPECTRAL_GRID:
   WAVELENGTH_MIN: 300
@@ -43,13 +43,40 @@ SEQUENCE:
   MAX_EMIT_LEN: ${SEQUENCE.MAX_SEQ_LEN}
 
 MODEL_ARCH:
-  D_MODEL: 1536
-  N_BLOCKS: 10
-  N_HEADS: 12
+  D_MODEL: 1024
+  N_BLOCKS: 6
+  N_HEADS: 8
   DROPOUT: 0.0
-  DIFFUSION_STEPS: 500
+  DIFFUSION_STEPS: 50
+  DEPTH_POSITION:
+    ENABLED: false
+    SCALE_NM: 1000
+    MASK_THICKNESS_NM: null
+    LAYER_CENTERS: true
+  DEPTH_ROPE:
+    ENABLED: true
+    SCALE_NM: 1000
+    BASE: 10000
+    LAYER_CENTERS: true
+  FACTORED_OUTPUT:
+    ENABLED: true
+    MATERIAL_VOCAB_MODE: true
+    THICKNESS_LOSS_WEIGHT: 0.25
+    JOINT_CE_WEIGHT: 0.10
+    MATERIAL_LABEL_SMOOTHING: 0.01
+    THICKNESS_LOG_SIGMA: 0.20
+    CONTINUOUS_THICKNESS:
+      ENABLED: true
+      USE_FOR_TMM: true
+      SAVE_IN_RESULTS: true
+      ROUND_STEP_NM: null
+      MIN_NM: 10
+      MAX_NM: 500
+      STATE_ENABLED: true
+      STATE_NOISE_LOG_STD: 0.30
+      STATE_INIT_NM: null
 SPECTRUM_LATENT:
-  ENABLED: true
+  ENABLED: false
   CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
   MODE: token
   FREEZE_ENCODER: true
@@ -62,7 +89,7 @@ SAMPLING:
   TEMPERATURE: 0.65
   TOP_K: 0
   TOP_P: 0.9
-  MC_SAMPLES: 10
+  MC_SAMPLES: 2
 
 INFERENCE:
   TRACK_DIFFUSION_STEPS_MAE: false
@@ -71,6 +98,13 @@ INFERENCE:
   SHOW_PROGRESS: true
   PROFILE_TIMING: true
   DEDUP_STACKS: true
+
+VALIDATION:
+  # 0 disables mid-epoch validation. Set e.g. 1000000 to validate after
+  # each million globally processed training samples while still finishing
+  # the full configured epoch.
+  EVERY_N_TRAIN_SAMPLES: 50000
+  AT_EPOCH_END: true
 
 EVALUATION:
   VALID_SIM: TMM_FAST
@@ -84,11 +118,11 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  # TARGET: null
+  TARGET: null
   # TARGET_GLOB: ${PATHS.DATA_PATH}/targets/multicolor_realistic/*.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_blue_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_yellow_realistic.csv
-  TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_B_realistic.csv
   N_TARGETS: 1
 

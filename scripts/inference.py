@@ -31,6 +31,38 @@ def _common_mae_wavelengths(cfg: dict[str, Any], device: torch.device) -> torch.
     return torch.arange(wl_min, wl_max + 1, wl_step, dtype=torch.float32, device=device)
 
 
+def _tmm_device(cfg: dict[str, Any], default_device: torch.device) -> torch.device:
+    """Resolve the device used for TMM simulation."""
+    requested = cfg.get("TMM_DEVICE", "auto")
+    if requested is None or str(requested).lower() in {"auto", "same"}:
+        return default_device
+
+    requested_device = torch.device(str(requested))
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("TMM_DEVICE is set to CUDA, but CUDA is not available.")
+    if requested_device.type == "cuda" and requested_device.index is None and default_device.type == "cuda":
+        return default_device
+    return requested_device
+
+
+def _mae_channel_mask(cfg: dict[str, Any], device: torch.device) -> torch.Tensor | None:
+    """Return optional channel mask for MAE over R/A/T spectra."""
+    channels = cfg.get("MAE_CHANNELS")
+    if not channels:
+        return None
+    if isinstance(channels, str):
+        channels = [channels]
+
+    index = {"R": 0, "A": 1, "T": 2}
+    mask = torch.zeros(3, dtype=torch.bool, device=device)
+    for channel in channels:
+        key = str(channel).strip().upper()
+        if key not in index:
+            raise ValueError(f"Unknown MAE channel {channel!r}; expected one of R, A, T.")
+        mask[index[key]] = True
+    return mask if mask.any() else None
+
+
 def _selection_target_mode(cfg: dict[str, Any]) -> str:
     """Return whether MC ranking uses the original or conditioned target."""
     mode = str((cfg.get("TARGET_PHYSICALIZE") or {}).get("SELECTION_TARGET", "conditioned")).lower()
@@ -95,6 +127,8 @@ def _example_spectrum(test_ds: torch.utils.data.Dataset) -> torch.Tensor:
     """Extract one spectrum to initialize the model input layers."""
     if isinstance(test_ds, torch.utils.data.Subset):
         return test_ds.dataset.spectra[0]
+    if hasattr(test_ds, "example_spectrum"):
+        return test_ds.example_spectrum()
     if hasattr(test_ds, "spectra"):
         return test_ds.spectra[0]
     return test_ds.spectrum
@@ -270,13 +304,32 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         top_k=cfg["TOP_K"],
         top_p=cfg["TOP_P"],
         spectrum_latent=cfg.get("SPECTRUM_LATENT"),
+        depth_position=cfg.get("DEPTH_POSITION"),
+        depth_rope=cfg.get("DEPTH_ROPE"),
+        factored_output=cfg.get("FACTORED_OUTPUT"),
     ).to(device)
 
     # --- checkpointing ---
     checkpoint = cfg["BEST_CHECKPOINT_PATH"]
     if checkpoint and os.path.exists(checkpoint):
         print(f"Resuming from checkpoint {checkpoint}")
-        optollama.utils.load_checkpoint(checkpoint, model, map_location="cpu", strict=True)
+        strict = bool(cfg.get("INIT_CHECKPOINT_STRICT", True))
+        fallback_filter = bool(cfg.get("INIT_CHECKPOINT_FALLBACK_FILTER", True))
+        if strict:
+            optollama.utils.load_checkpoint(checkpoint, model, map_location="cpu", strict=True)
+        else:
+            report = optollama.utils.load_checkpoint_weights_for_init(
+                checkpoint,
+                model,
+                map_location="cpu",
+                strict=False,
+                fallback_filter=fallback_filter,
+            )
+            print(
+                "Checkpoint load: "
+                f"mode={report['mode']}, fallback={report['fallback_used']}, "
+                f"loaded={report['loaded_keys']}, skipped={len(report['skipped_keys'])}"
+            )
     else:
         print(f"Checkpoint path set to {checkpoint} does not exist.")
 
@@ -291,17 +344,23 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         pass
 
     # --- TMM simulation ---
+    tmm_device = _tmm_device(cfg, device)
     tmm_ctx = (
-        optollama.evaluation.simulation.TMMContext.make(cfg=cfg, idx_to_token=idx_to_token, device=device)
+        optollama.evaluation.simulation.TMMContext.make(cfg=cfg, idx_to_token=idx_to_token, device=tmm_device)
         if cfg["VALID_SIM"] == "TMM_FAST"
         else None
     )
-    if tmm_ctx is not None and tmm_ctx.realistic_enabled:
-        print(
-            "REALISTIC_TMM enabled: "
-            f"{len(tmm_ctx.average_thetas)} angles x {len(tmm_ctx.polarizations)} polarizations x "
-            f"{tmm_ctx.jitter_realizations} jitter realizations, +/-{tmm_ctx.thickness_jitter_nm:g} nm"
-        )
+    if tmm_ctx is not None and rank == 0:
+        device_note = f" on {tmm_device}" if tmm_device != device else ""
+        if tmm_ctx.realistic_enabled:
+            print(
+                "REALISTIC_TMM enabled"
+                f"{device_note}: "
+                f"{len(tmm_ctx.average_thetas)} angles x {len(tmm_ctx.polarizations)} polarizations x "
+                f"{tmm_ctx.jitter_realizations} jitter realizations, +/-{tmm_ctx.thickness_jitter_nm:g} nm"
+            )
+        elif device_note:
+            print(f"TMM_FAST enabled{device_note}.")
 
     # ---- validation options ----
     model.eval()
@@ -311,6 +370,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
     profile_timing = bool(cfg.get("INFERENCE_PROFILE_TIMING", False))
     deduplicate_stacks = bool(cfg.get("INFERENCE_DEDUP_STACKS", False))
     common_mae_wavelengths = _common_mae_wavelengths(cfg, device)
+    mae_channel_mask = _mae_channel_mask(cfg, device)
     if rank == 0:
         print(
             "Inference options: "
@@ -322,6 +382,10 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
             wl_max = int(cfg.get("COMMON_MAE_WAVELENGTH_MAX", 1700))
             wl_step = int(cfg.get("COMMON_MAE_WAVELENGTH_STEPS", 10))
             print(f"Common-grid MAE enabled: {wl_min}-{wl_max} nm, {wl_step} nm")
+        if mae_channel_mask is not None:
+            labels = ["R", "A", "T"]
+            selected = [labels[i] for i, flag in enumerate(mae_channel_mask.detach().cpu().tolist()) if flag]
+            print(f"MAE channels: {','.join(selected)}")
 
     def run_prediction(
         run_cfg: dict[str, Any],
@@ -351,6 +415,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
             ),
             source_wavelengths=run_cfg["WAVELENGTHS"],
             common_mae_wavelengths=common_mae_wavelengths,
+            mae_channel_mask=mae_channel_mask,
             score_spectrum=score_spectrum,
             record_all_mc=record_all_mc,
             record_pred_spectra=record_pred_spectra,
