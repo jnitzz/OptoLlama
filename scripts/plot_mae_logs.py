@@ -132,6 +132,7 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
     margin = {"left": 82, "right": 250, "top": 72, "bottom": 78}
     plot_width = width - margin["left"] - margin["right"]
     plot_height = height - margin["top"] - margin["bottom"]
+    min_epoch = 0.0
     max_epoch = max(max(run["x_values"]) for run in runs)
     values = [value for run in runs for value in run["min_values"] + run["last_values"]]
     y_min_raw = min(values)
@@ -141,8 +142,8 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
     y_max = y_max_raw + y_pad
 
     def x_scale(epoch: float) -> float:
-        denom = max(1.0, max_epoch - 1.0)
-        return margin["left"] + ((epoch - 1.0) / denom) * plot_width
+        denom = max(1.0, max_epoch - min_epoch)
+        return margin["left"] + ((epoch - min_epoch) / denom) * plot_width
 
     def y_scale(value: float) -> float:
         return margin["top"] + (1 - (value - y_min) / (y_max - y_min)) * plot_height
@@ -176,7 +177,7 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
 
     max_tick = int(max_epoch) if max_epoch == int(max_epoch) else int(max_epoch) + 1
     x_step = 1 if max_tick <= 20 else max(1, (max_tick + 9) // 10)
-    for epoch in range(1, max_tick + 1, x_step):
+    for epoch in range(0, max_tick + 1, x_step):
         x_pos = x_scale(epoch)
         parts.append(
             f'<line x1="{x_pos:.2f}" x2="{x_pos:.2f}" y1="{margin["top"]}" '
