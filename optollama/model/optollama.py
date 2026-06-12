@@ -909,6 +909,13 @@ class OptoLlama(torch.nn.Module):
                 self.pad_material_id = int(self.factored_head.pad_material_id)
                 self.eos_material_id = int(self.factored_head.eos_material_id)
                 self.mask_material_id = int(self.factored_head.mask_material_id)
+                # Keep the legacy joint-token embedding in the module for
+                # checkpoint compatibility, but do not train it in
+                # material-vocab mode. The active state embedding is
+                # material_state_embedding, so DDP would otherwise see this
+                # parameter as unused.
+                for param in self.stack_embedding.parameters():
+                    param.requires_grad_(False)
             self.projection = None
         else:
             self.projection = torch.nn.Linear(d_model, vocab_size)
