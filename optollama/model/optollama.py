@@ -348,6 +348,7 @@ class FactoredOutputHead(torch.nn.Module):
         stacks: torch.Tensor,
         thickness_weight: float,
         joint_ce_weight: float,
+        total_thickness_weight: float,
         label_smoothing: float,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         token_ids = stacks.to(torch.long).clamp(0, self.token_material_ids.numel() - 1)
@@ -369,6 +370,25 @@ class FactoredOutputHead(torch.nn.Module):
         else:
             thickness_loss = outputs["log_thickness"].sum() * 0.0
 
+        if float(total_thickness_weight) > 0.0:
+            material_probs = F.softmax(outputs["material_logits"], dim=-1)
+            material_layer_mask = self.material_layer_mask.to(device=token_ids.device, dtype=material_probs.dtype)
+            max_thickness = float(self.token_thickness_nm.max().item())
+            predicted_thickness = torch.exp(outputs["log_thickness"]).to(torch.float32).clamp(0.0, max_thickness)
+            expected_layer_thickness = (material_probs.to(torch.float32) * material_layer_mask.view(1, 1, -1) * predicted_thickness).sum(
+                dim=-1
+            )
+            predicted_total_thickness = expected_layer_thickness.sum(dim=1)
+
+            target_thickness = self.token_thickness_nm.to(device=token_ids.device, dtype=torch.float32)[token_ids]
+            target_total_thickness = (target_thickness * layer_mask.to(torch.float32)).sum(dim=1)
+            total_thickness_loss = F.mse_loss(
+                torch.log1p(predicted_total_thickness),
+                torch.log1p(target_total_thickness),
+            )
+        else:
+            total_thickness_loss = outputs["log_thickness"].sum() * 0.0
+
         joint_targets = token_ids.masked_fill(token_ids == self.pad_idx, -100)
         joint_loss = F.cross_entropy(
             outputs["joint_logits"].reshape(-1, self.token_material_ids.numel()),
@@ -376,10 +396,16 @@ class FactoredOutputHead(torch.nn.Module):
             ignore_index=-100,
         )
 
-        loss = material_loss + float(thickness_weight) * thickness_loss + float(joint_ce_weight) * joint_loss
+        loss = (
+            material_loss
+            + float(thickness_weight) * thickness_loss
+            + float(total_thickness_weight) * total_thickness_loss
+            + float(joint_ce_weight) * joint_loss
+        )
         parts = {
             "material_loss": material_loss.detach(),
             "thickness_loss": thickness_loss.detach(),
+            "total_thickness_loss": total_thickness_loss.detach(),
             "joint_loss": joint_loss.detach(),
         }
         return loss, parts
@@ -858,6 +884,7 @@ class OptoLlama(torch.nn.Module):
         self.factored_output_enabled = bool(factored_cfg.get("ENABLED", False))
         self.material_vocab_mode = bool(self.factored_output_enabled and factored_cfg.get("MATERIAL_VOCAB_MODE", False))
         self.factored_thickness_weight = float(factored_cfg.get("THICKNESS_LOSS_WEIGHT", 0.25))
+        self.factored_total_thickness_weight = float(factored_cfg.get("TOTAL_THICKNESS_LOSS_WEIGHT", 0.0))
         self.factored_joint_ce_weight = float(factored_cfg.get("JOINT_CE_WEIGHT", 0.10))
         self.factored_label_smoothing = float(factored_cfg.get("MATERIAL_LABEL_SMOOTHING", 0.05))
         continuous_cfg = factored_cfg.get("CONTINUOUS_THICKNESS") or {}
@@ -1433,6 +1460,7 @@ class OptoLlama(torch.nn.Module):
             stacks,
             thickness_weight=self.factored_thickness_weight,
             joint_ce_weight=0.0 if self.material_vocab_mode else self.factored_joint_ce_weight,
+            total_thickness_weight=self.factored_total_thickness_weight,
             label_smoothing=self.factored_label_smoothing,
         )
         if self.material_vocab_mode:

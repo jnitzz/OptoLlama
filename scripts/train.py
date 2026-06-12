@@ -411,6 +411,8 @@ def train(cfg: dict) -> None:
                         postfix["mat"] = f"{float(train_out['material_loss'].detach().cpu()):.3f}"
                     if "thickness_loss" in train_out:
                         postfix["th"] = f"{float(train_out['thickness_loss'].detach().cpu()):.3f}"
+                    if "total_thickness_loss" in train_out:
+                        postfix["totth"] = f"{float(train_out['total_thickness_loss'].detach().cpu()):.3f}"
                 pbar.set_postfix(**postfix)
                 pbar.update()
 
