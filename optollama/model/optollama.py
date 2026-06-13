@@ -902,6 +902,9 @@ class OptoLlama(torch.nn.Module):
             self.continuous_thickness_enabled and continuous_cfg.get("STATE_ENABLED", False)
         )
         self.continuous_thickness_state_noise_log_std = float(continuous_cfg.get("STATE_NOISE_LOG_STD", 0.30))
+        self.continuous_thickness_unknown_log_std = float(
+            continuous_cfg.get("UNKNOWN_THICKNESS_LOG_STD", self.continuous_thickness_state_noise_log_std)
+        )
         self.continuous_thickness_state_init_nm = float(continuous_cfg.get("STATE_INIT_NM") or default_state_init)
         self.thickness_state_embedding: Optional[ThicknessStateEmbedding] = None
         self.material_state_embedding: Optional[StackEmbedding] = None
@@ -1352,37 +1355,73 @@ class OptoLlama(torch.nn.Module):
         layer_mask = self._layer_mask_from_ids(token_ids)
         return thickness * layer_mask.to(thickness.dtype)
 
-    def _noise_thickness_state(self, stacks: torch.Tensor, timesteps: torch.Tensor) -> Optional[torch.Tensor]:
+    def _unknown_thickness_state(
+        self,
+        shape: torch.Size | tuple[int, ...],
+        device: torch.device,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sample a generic log-normal thickness prior for unknown material states."""
+        init_nm = min(
+            max(float(self.continuous_thickness_state_init_nm), float(self.continuous_thickness_min_nm)),
+            float(self.continuous_thickness_max_nm),
+        )
+        log_init = math.log(max(init_nm, 1e-6))
+        log_thickness = torch.full(shape, log_init, dtype=torch.float32, device=device)
+        log_std = float(self.continuous_thickness_unknown_log_std)
+        if log_std > 0.0:
+            if timesteps is None:
+                scale = 1.0
+            else:
+                scale = timesteps.to(device=device, dtype=torch.float32).reshape(-1, 1).clamp(0.0, 1.0)
+            log_thickness = log_thickness + torch.randn(shape, dtype=torch.float32, device=device) * (log_std * scale)
+        return torch.exp(log_thickness).clamp(
+            float(self.continuous_thickness_min_nm),
+            float(self.continuous_thickness_max_nm),
+        )
+
+    def _noise_thickness_state(
+        self,
+        stacks: torch.Tensor,
+        timesteps: torch.Tensor,
+        masked_positions: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """
         Build the noised continuous thickness state used during training.
 
         Noise is applied in log-thickness space and only on true material
-        layers. Positions after EOS and special tokens remain zero.
+        layers. Positions after EOS and special tokens remain zero unless the
+        material state is masked, in which case they receive the same unknown
+        thickness prior used by all-mask sampling.
         """
         if not self.continuous_thickness_state_enabled:
             return None
 
         target = self._target_thickness_from_ids(stacks)
         valid = target > 0
-        if not valid.any():
-            return torch.zeros_like(target)
+        state = torch.zeros_like(target)
+        if valid.any():
+            std = float(self.continuous_thickness_state_noise_log_std) * timesteps.reshape(-1, 1).clamp(
+                0.0,
+                1.0,
+            )
+            log_target = torch.log(target.clamp_min(float(self.continuous_thickness_min_nm)))
+            noisy = torch.exp(log_target + torch.randn_like(target) * std)
+            noisy = noisy.clamp(float(self.continuous_thickness_min_nm), float(self.continuous_thickness_max_nm))
+            state = torch.where(valid, noisy, state)
 
-        std = float(self.continuous_thickness_state_noise_log_std) * timesteps.reshape(-1, 1).clamp(0.0, 1.0)
-        log_target = torch.log(target.clamp_min(float(self.continuous_thickness_min_nm)))
-        noisy = torch.exp(log_target + torch.randn_like(target) * std)
-        noisy = noisy.clamp(float(self.continuous_thickness_min_nm), float(self.continuous_thickness_max_nm))
-        return torch.where(valid, noisy, torch.zeros_like(noisy))
+        if masked_positions is not None:
+            unknown = self._unknown_thickness_state(state.shape, state.device, timesteps=timesteps)
+            state = torch.where(masked_positions.to(device=state.device, dtype=torch.bool), unknown, state)
+
+        return state
 
     def _initial_thickness_state(self, stacks: torch.Tensor) -> Optional[torch.Tensor]:
         """Initial continuous thickness state for sampling from all-mask tokens."""
         if not self.continuous_thickness_state_enabled:
             return None
-        return torch.full(
-            stacks.shape,
-            float(self.continuous_thickness_state_init_nm),
-            dtype=torch.float32,
-            device=stacks.device,
-        )
+        timesteps = torch.ones((stacks.size(0),), dtype=torch.float32, device=stacks.device)
+        return self._unknown_thickness_state(stacks.shape, stacks.device, timesteps=timesteps)
 
     def _train(self, spectra: torch.Tensor, stacks: torch.Tensor) -> torch.Tensor:
         """
@@ -1418,7 +1457,7 @@ class OptoLlama(torch.nn.Module):
             noised_stacks = torch.where(flipped, self.mask, stacks)
 
         # query model
-        state_thickness_nm = self._noise_thickness_state(stacks, timesteps)
+        state_thickness_nm = self._noise_thickness_state(stacks, timesteps, masked_positions=flipped)
         predicted_stacks = self._model(
             spectra,
             noised_stacks,
@@ -1444,7 +1483,7 @@ class OptoLlama(torch.nn.Module):
             noised_stacks = torch.where(flipped, int(self.mask_material_id), target_state)
         else:
             noised_stacks = torch.where(flipped, self.mask, stacks)
-        state_thickness_nm = self._noise_thickness_state(stacks, timesteps)
+        state_thickness_nm = self._noise_thickness_state(stacks, timesteps, masked_positions=flipped)
         return timesteps, noised_stacks, state_thickness_nm
 
     def _factored_training_loss(self, spectra: torch.Tensor, stacks: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -1646,7 +1685,16 @@ class OptoLlama(torch.nn.Module):
 
                 mask_id = int(self.mask_material_id) if self.material_vocab_mode else int(self.mask)
                 stacks = torch.where(remask, mask_id, sampled_stacks)
-                thickness_state = next_thickness_state
+                if self.continuous_thickness_state_enabled and next_thickness_state is not None:
+                    next_timestep = timesteps[min(i + 1, self.steps - 1)].expand(stacks.size(0))
+                    unknown = self._unknown_thickness_state(
+                        next_thickness_state.shape,
+                        next_thickness_state.device,
+                        timesteps=next_timestep,
+                    )
+                    thickness_state = torch.where(remask, unknown, next_thickness_state)
+                else:
+                    thickness_state = next_thickness_state
             else:
                 stacks = sampled_stacks
                 thickness_state = next_thickness_state
