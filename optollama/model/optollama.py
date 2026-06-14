@@ -207,6 +207,7 @@ class FactoredOutputHead(torch.nn.Module):
         eos_idx: int,
         mask_idx: int,
         thickness_log_sigma: float = 0.20,
+        active_gate_enabled: bool = False,
     ) -> None:
         super().__init__()
         material_names, token_material_ids, token_thickness_nm, layer_token_mask = _token_metadata(
@@ -219,6 +220,7 @@ class FactoredOutputHead(torch.nn.Module):
         self.material_names = material_names
         self.num_materials = len(material_names)
         self.thickness_log_sigma = max(float(thickness_log_sigma), 1e-4)
+        self.active_gate_enabled = bool(active_gate_enabled)
 
         self.register_buffer("token_material_ids", token_material_ids)
         self.register_buffer("token_thickness_nm", token_thickness_nm)
@@ -241,10 +243,20 @@ class FactoredOutputHead(torch.nn.Module):
             torch.nn.SiLU(),
             torch.nn.Linear(d_model, self.num_materials),
         )
+        self.active_head = (
+            torch.nn.Sequential(
+                torch.nn.Linear(d_model, d_model),
+                torch.nn.SiLU(),
+                torch.nn.Linear(d_model, 1),
+            )
+            if self.active_gate_enabled
+            else None
+        )
 
     def forward(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
         material_logits = self.material_head(hidden)  # [B,S,M]
         log_thickness = self.log_thickness_head(hidden)  # [B,S,M]
+        active_logits = self.active_head(hidden).squeeze(-1) if self.active_head is not None else None
 
         token_material_ids = self.token_material_ids.to(device=hidden.device)
         token_log_thickness = self.token_log_thickness.to(device=hidden.device, dtype=hidden.dtype)
@@ -256,11 +268,14 @@ class FactoredOutputHead(torch.nn.Module):
         thickness_score = -(thickness_delta * thickness_delta)
         thickness_score = torch.where(layer_token_mask.view(1, 1, -1), thickness_score, torch.zeros_like(thickness_score))
 
-        return {
+        outputs = {
             "joint_logits": material_joint + thickness_score,
             "material_logits": material_logits,
             "log_thickness": log_thickness,
         }
+        if active_logits is not None:
+            outputs["active_logits"] = active_logits
+        return outputs
 
     def thickness_for_ids(
         self,
@@ -349,6 +364,8 @@ class FactoredOutputHead(torch.nn.Module):
         thickness_weight: float,
         joint_ce_weight: float,
         total_thickness_weight: float,
+        active_loss_weight: float,
+        active_sparsity_weight: float,
         label_smoothing: float,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         token_ids = stacks.to(torch.long).clamp(0, self.token_material_ids.numel() - 1)
@@ -370,6 +387,18 @@ class FactoredOutputHead(torch.nn.Module):
         else:
             thickness_loss = outputs["log_thickness"].sum() * 0.0
 
+        active_logits = outputs.get("active_logits")
+        zero = outputs["log_thickness"].sum() * 0.0
+        if active_logits is not None:
+            active_targets = layer_mask.to(device=active_logits.device, dtype=active_logits.dtype)
+            active_loss = F.binary_cross_entropy_with_logits(active_logits, active_targets)
+            active_prob = torch.sigmoid(active_logits).to(torch.float32)
+            active_sparsity_loss = active_prob.mean()
+        else:
+            active_loss = zero
+            active_sparsity_loss = zero
+            active_prob = None
+
         if float(total_thickness_weight) > 0.0:
             material_probs = F.softmax(outputs["material_logits"], dim=-1)
             material_layer_mask = self.material_layer_mask.to(device=token_ids.device, dtype=material_probs.dtype)
@@ -378,6 +407,8 @@ class FactoredOutputHead(torch.nn.Module):
             expected_layer_thickness = (material_probs.to(torch.float32) * material_layer_mask.view(1, 1, -1) * predicted_thickness).sum(
                 dim=-1
             )
+            if active_prob is not None:
+                expected_layer_thickness = expected_layer_thickness * active_prob
             predicted_total_thickness = expected_layer_thickness.sum(dim=1)
 
             target_thickness = self.token_thickness_nm.to(device=token_ids.device, dtype=torch.float32)[token_ids]
@@ -387,7 +418,7 @@ class FactoredOutputHead(torch.nn.Module):
                 torch.log1p(target_total_thickness),
             )
         else:
-            total_thickness_loss = outputs["log_thickness"].sum() * 0.0
+            total_thickness_loss = zero
 
         joint_targets = token_ids.masked_fill(token_ids == self.pad_idx, -100)
         joint_loss = F.cross_entropy(
@@ -400,6 +431,8 @@ class FactoredOutputHead(torch.nn.Module):
             material_loss
             + float(thickness_weight) * thickness_loss
             + float(total_thickness_weight) * total_thickness_loss
+            + float(active_loss_weight) * active_loss
+            + float(active_sparsity_weight) * active_sparsity_loss
             + float(joint_ce_weight) * joint_loss
         )
         parts = {
@@ -408,6 +441,9 @@ class FactoredOutputHead(torch.nn.Module):
             "total_thickness_loss": total_thickness_loss.detach(),
             "joint_loss": joint_loss.detach(),
         }
+        if active_logits is not None:
+            parts["active_loss"] = active_loss.detach()
+            parts["active_sparsity_loss"] = active_sparsity_loss.detach()
         return loss, parts
 
 
@@ -886,6 +922,13 @@ class OptoLlama(torch.nn.Module):
         self.factored_thickness_weight = float(factored_cfg.get("THICKNESS_LOSS_WEIGHT", 0.25))
         self.factored_total_thickness_weight = float(factored_cfg.get("TOTAL_THICKNESS_LOSS_WEIGHT", 0.0))
         self.factored_joint_ce_weight = float(factored_cfg.get("JOINT_CE_WEIGHT", 0.10))
+        self.factored_active_loss_weight = float(factored_cfg.get("ACTIVE_LOSS_WEIGHT", 0.0))
+        self.factored_active_sparsity_weight = float(factored_cfg.get("ACTIVE_SPARSITY_WEIGHT", 0.0))
+        self.factored_active_gate_enabled = bool(
+            factored_cfg.get("ACTIVE_GATE_ENABLED", False)
+            or self.factored_active_loss_weight > 0.0
+            or self.factored_active_sparsity_weight > 0.0
+        )
         self.factored_label_smoothing = float(factored_cfg.get("MATERIAL_LABEL_SMOOTHING", 0.05))
         continuous_cfg = factored_cfg.get("CONTINUOUS_THICKNESS") or {}
         self.continuous_thickness_enabled = bool(
@@ -927,6 +970,7 @@ class OptoLlama(torch.nn.Module):
                 eos_idx=eos_idx,
                 mask_idx=mask_idx,
                 thickness_log_sigma=float(factored_cfg.get("THICKNESS_LOG_SIGMA", 0.20)),
+                active_gate_enabled=self.factored_active_gate_enabled,
             )
             if self.material_vocab_mode:
                 if not self.continuous_thickness_state_enabled:
@@ -1271,6 +1315,35 @@ class OptoLlama(torch.nn.Module):
 
         return predicted_stacks
 
+    def _sample_valid_mask(self, sampled_stacks: torch.Tensor) -> torch.Tensor:
+        """Return valid sampled layer positions before EOS."""
+        if self.material_vocab_mode:
+            material_ids = sampled_stacks.to(torch.long)
+            eos_id = int(self.eos_material_id)
+            pad_id = int(self.pad_material_id)
+            mask_id = int(self.mask_material_id)
+            is_eos = material_ids == eos_id
+            before_eos = is_eos.cumsum(dim=1) == 0
+            return before_eos & (material_ids != pad_id) & (material_ids != mask_id)
+
+        token_ids = sampled_stacks.to(torch.long)
+        is_eos = token_ids == self.eos
+        before_eos = is_eos.cumsum(dim=1) == 0
+        return before_eos & (token_ids != self.pad) & (token_ids != self.mask)
+
+    def _active_probability_for_sample(
+        self,
+        outputs: Optional[dict[str, torch.Tensor]],
+        valid: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Return per-slot active probability for valid sampled layers."""
+        if not self.factored_active_gate_enabled:
+            return None
+        if outputs is None or "active_logits" not in outputs:
+            return None
+        active = torch.sigmoid(outputs["active_logits"]).to(torch.float32)
+        return active * valid.to(device=active.device, dtype=active.dtype)
+
     def _continuous_thickness_for_sample(
         self,
         outputs: Optional[dict[str, torch.Tensor]],
@@ -1291,14 +1364,12 @@ class OptoLlama(torch.nn.Module):
                 max_nm=self.continuous_thickness_max_nm,
                 round_step_nm=self.continuous_thickness_round_step_nm,
             )
-            material_ids = sampled_stacks.to(torch.long)
-            eos_id = int(self.eos_material_id)
-            pad_id = int(self.pad_material_id)
-            mask_id = int(self.mask_material_id)
-            is_eos = material_ids == eos_id
-            before_eos = is_eos.cumsum(dim=1) == 0
-            valid = before_eos & (material_ids != pad_id) & (material_ids != mask_id)
-            return thickness * valid.to(thickness.dtype)
+            valid = self._sample_valid_mask(sampled_stacks)
+            thickness = thickness * valid.to(thickness.dtype)
+            active = self._active_probability_for_sample(outputs, valid)
+            if active is not None:
+                thickness = thickness * active
+            return thickness
 
         thickness = self.factored_head.thickness_for_ids(
             outputs,
@@ -1307,11 +1378,12 @@ class OptoLlama(torch.nn.Module):
             max_nm=self.continuous_thickness_max_nm,
             round_step_nm=self.continuous_thickness_round_step_nm,
         )
-        token_ids = sampled_stacks.to(torch.long)
-        is_eos = token_ids == self.eos
-        before_eos = is_eos.cumsum(dim=1) == 0
-        valid = before_eos & (token_ids != self.pad) & (token_ids != self.mask)
-        return thickness * valid.to(thickness.dtype)
+        valid = self._sample_valid_mask(sampled_stacks)
+        thickness = thickness * valid.to(thickness.dtype)
+        active = self._active_probability_for_sample(outputs, valid)
+        if active is not None:
+            thickness = thickness * active
+        return thickness
 
     def _material_ids_from_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Convert old joint material-thickness token IDs to material IDs."""
@@ -1500,6 +1572,8 @@ class OptoLlama(torch.nn.Module):
             thickness_weight=self.factored_thickness_weight,
             joint_ce_weight=0.0 if self.material_vocab_mode else self.factored_joint_ce_weight,
             total_thickness_weight=self.factored_total_thickness_weight,
+            active_loss_weight=self.factored_active_loss_weight,
+            active_sparsity_weight=self.factored_active_sparsity_weight,
             label_smoothing=self.factored_label_smoothing,
         )
         if self.material_vocab_mode:
@@ -1725,6 +1799,12 @@ class OptoLlama(torch.nn.Module):
             step_mae_traj = None
 
         if self.continuous_thickness_enabled:
+            active_prob = None
+            if self.factored_active_gate_enabled:
+                active_prob = self._active_probability_for_sample(
+                    factored_outputs,
+                    self._sample_valid_mask(stacks),
+                )
             output_stacks = (
                 self._tokens_from_material_state(stacks, thickness_state)
                 if self.material_vocab_mode
@@ -1734,6 +1814,7 @@ class OptoLlama(torch.nn.Module):
                 "ids": output_stacks,
                 "material_ids": stacks if self.material_vocab_mode else None,
                 "thickness_nm": thickness_state if thickness_state is not None else sampled_thickness,
+                "active_prob": active_prob,
                 "mae_traj": step_mae_traj,
             }
 

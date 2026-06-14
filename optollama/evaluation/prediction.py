@@ -23,7 +23,7 @@ def sync_for_timing(device: torch.device, enabled: bool) -> None:
 
 def split_model_sample_output(
     output: Any,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Normalize model sampling output across legacy and factored formats.
 
@@ -32,6 +32,7 @@ def split_model_sample_output(
     ``thickness_nm``.
     """
     thickness_nm = None
+    active_prob = None
     mae_traj = None
 
     if isinstance(output, dict):
@@ -46,18 +47,21 @@ def split_model_sample_output(
         elif "step_mae_traj" in output:
             mae_traj = output["step_mae_traj"]
         thickness_nm = output.get("thickness_nm")
+        active_prob = output.get("active_prob")
     elif isinstance(output, tuple):
         if len(output) == 2:
             logits_or_ids, mae_traj = output
         elif len(output) == 3:
             logits_or_ids, mae_traj, thickness_nm = output
+        elif len(output) == 4:
+            logits_or_ids, mae_traj, thickness_nm, active_prob = output
         else:
             raise ValueError(f"Unsupported model sample tuple length: {len(output)}")
     else:
         logits_or_ids = output
 
     ids = logits_or_ids.argmax(dim=-1) if logits_or_ids.dim() == 3 else logits_or_ids
-    return ids, mae_traj, thickness_nm
+    return ids, mae_traj, thickness_nm, active_prob
 
 
 def validate_and_setup(
@@ -271,9 +275,10 @@ def run_mc_batch(
     sync_for_timing(device, profile_timing)
     t0 = time.perf_counter()
     model_output = model(spectra_mc)
-    ids_flat, mae_traj_s, thickness_flat = split_model_sample_output(model_output)
+    ids_flat, mae_traj_s, thickness_flat, active_flat = split_model_sample_output(model_output)
     ids = ids_flat.view(b, m, -1)
     thickness = thickness_flat.view(b, m, -1) if thickness_flat is not None else None
+    active = active_flat.view(b, m, -1) if active_flat is not None else None
     sync_for_timing(device, profile_timing)
     timing["model_s"] = time.perf_counter() - t0
 
@@ -284,6 +289,7 @@ def run_mc_batch(
     save_continuous_thickness = bool(
         thickness is not None and getattr(inner_model, "continuous_thickness_save_in_results", True)
     )
+    save_active_prob = bool(active is not None and save_continuous_thickness)
 
     if do_sim:
         sync_for_timing(device, profile_timing)
@@ -349,7 +355,15 @@ def run_mc_batch(
     if mae_traj_s is not None:
         traj = mae_traj_s.view(b, m, -1)
 
-    draws = {"mae": [], "mae_common": [], "ids": [], "thickness_nm": [], "pred_spectra": [], "traj": []}
+    draws = {
+        "mae": [],
+        "mae_common": [],
+        "ids": [],
+        "thickness_nm": [],
+        "active_prob": [],
+        "pred_spectra": [],
+        "traj": [],
+    }
     if record_all_mc:
         sync_for_timing(device, profile_timing)
         t0 = time.perf_counter()
@@ -360,6 +374,8 @@ def run_mc_batch(
             draws["ids"].append(ids[:, sample_idx].detach().cpu())
             if save_continuous_thickness:
                 draws["thickness_nm"].append(thickness[:, sample_idx].detach().cpu())
+            if save_active_prob:
+                draws["active_prob"].append(active[:, sample_idx].detach().cpu())
             if do_sim and record_pred_spectra and pred is not None:
                 draws["pred_spectra"].append(pred[:, sample_idx].detach().cpu())
             if traj is not None:
@@ -378,6 +394,7 @@ def run_mc_batch(
     best_mae_common = mae_common[batch_indices, best_indices] if mae_common is not None else None
     best_pred_ids = ids[batch_indices, best_indices]
     best_thickness_nm = thickness[batch_indices, best_indices] if save_continuous_thickness else None
+    best_active_prob = active[batch_indices, best_indices] if save_active_prob else None
     best_pred_spectra = pred[batch_indices, best_indices] if pred is not None else None
     best_step_mae_traj = traj[batch_indices, best_indices] if traj is not None else None
 
@@ -386,6 +403,7 @@ def run_mc_batch(
         "mae_common": best_mae_common,
         "ids": best_pred_ids,
         "thickness_nm": best_thickness_nm,
+        "active_prob": best_active_prob,
         "pred_spectra": best_pred_spectra,
         "step_mae_traj": best_step_mae_traj,
     }
@@ -480,6 +498,7 @@ def continuous_stack_records(
     idx_to_token: dict[int, str],
     eos: int,
     special: set[int],
+    active_prob: Optional[torch.Tensor] = None,
 ) -> list[dict[str, Any]]:
     """
     Convert sampled hard materials plus continuous thicknesses to JSON records.
@@ -487,6 +506,7 @@ def continuous_stack_records(
     pred_len = pred_ids.index(eos) if eos in pred_ids else len(pred_ids)
     records: list[dict[str, Any]] = []
     thickness_values = thickness_nm.detach().cpu().tolist()
+    active_values = active_prob.detach().cpu().tolist() if active_prob is not None else None
 
     for pos, token_id_raw in enumerate(pred_ids[:pred_len]):
         token_id = int(token_id_raw)
@@ -497,12 +517,15 @@ def continuous_stack_records(
         if parts is None:
             continue
         material, token_thickness_nm = parts
-        records.append({
+        layer = {
             "material": material,
             "thickness_nm": float(thickness_values[pos]),
             "token": token,
             "token_thickness_nm": float(token_thickness_nm),
-        })
+        }
+        if active_values is not None:
+            layer["active_prob"] = float(active_values[pos])
+        records.append(layer)
 
     return records
 
@@ -518,6 +541,7 @@ def build_example_record(
     best_pred_spectra: Optional[torch.Tensor],
     best_step_mae_traj: Optional[torch.Tensor],
     best_thickness_nm: Optional[torch.Tensor],
+    best_active_prob: Optional[torch.Tensor],
     score_spectra: torch.Tensor,
     idx_to_token: dict[int, str],
     eos: int,
@@ -551,6 +575,9 @@ def build_example_record(
         Per-step MAE trajectory, shape ``[B, steps]``, or ``None``.
     best_thickness_nm : torch.Tensor or None
         Continuous thicknesses for the best predicted hard-token sequence,
+        shape ``[B, S]``, or ``None``.
+    best_active_prob : torch.Tensor or None
+        Active probabilities for the best predicted hard-token sequence,
         shape ``[B, S]``, or ``None``.
     score_spectra : torch.Tensor
         Spectra used for MC ranking and MAE reporting, shape ``[B, 3, W]``.
@@ -599,6 +626,7 @@ def build_example_record(
             idx_to_token,
             eos=eos,
             special=special,
+            active_prob=best_active_prob[i] if best_active_prob is not None else None,
         )
 
     if do_sim and best_pred_spectra is not None:
@@ -989,7 +1017,7 @@ def model_prediction(
             results.append(build_example_record(
                 i, idxs, stacks_aligned, ids_aligned, acc_vec,
                 best["mae"], best["mae_common"], best["pred_spectra"], best["step_mae_traj"],
-                best["thickness_nm"], score_spectra, idx_to_token, eos, pad, msk, do_sim,
+                best["thickness_nm"], best["active_prob"], score_spectra, idx_to_token, eos, pad, msk, do_sim,
                 conditioning_spectra=conditioning_spectra,
             ))
 

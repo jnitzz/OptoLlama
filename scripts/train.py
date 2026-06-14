@@ -413,6 +413,10 @@ def train(cfg: dict) -> None:
                         postfix["th"] = f"{float(train_out['thickness_loss'].detach().cpu()):.3f}"
                     if "total_thickness_loss" in train_out:
                         postfix["totth"] = f"{float(train_out['total_thickness_loss'].detach().cpu()):.3f}"
+                    if "active_loss" in train_out:
+                        postfix["act"] = f"{float(train_out['active_loss'].detach().cpu()):.3f}"
+                    if "active_sparsity_loss" in train_out:
+                        postfix["asp"] = f"{float(train_out['active_sparsity_loss'].detach().cpu()):.3f}"
                 pbar.set_postfix(**postfix)
                 pbar.update()
 
