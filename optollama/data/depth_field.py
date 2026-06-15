@@ -167,6 +167,41 @@ def depth_field_active_bins(fields: torch.Tensor, void_id: int) -> torch.Tensor:
     return (fields != int(void_id)).sum(dim=-1)
 
 
+def token_stack_total_thickness_nm(
+    stacks: torch.Tensor,
+    idx_to_token: dict[int, str],
+    *,
+    eos_idx: int,
+    pad_idx: int,
+    msk_idx: int,
+) -> torch.Tensor:
+    """Return total tokenized layer thickness per stack before EOS."""
+    if stacks.dim() == 1:
+        stacks = stacks.unsqueeze(0)
+    if stacks.dim() != 2:
+        raise ValueError(f"stacks must have shape [B,S] or [S], got {tuple(stacks.shape)}")
+
+    totals: list[float] = []
+    stacks_cpu = stacks.detach().cpu()
+    for batch_idx in range(stacks_cpu.size(0)):
+        total = 0.0
+        for token_id in stacks_cpu[batch_idx].tolist():
+            token_id = int(token_id)
+            if token_id == eos_idx:
+                break
+            if token_id in (pad_idx, msk_idx):
+                continue
+            token = idx_to_token.get(token_id)
+            if token is None:
+                continue
+            parts = layer_token_parts(token)
+            if parts is not None:
+                total += float(parts[1])
+        totals.append(total)
+
+    return torch.tensor(totals, dtype=torch.float32, device=stacks.device)
+
+
 def depth_field_runs(field: torch.Tensor, vocab: DepthFieldVocab, *, dz_nm: float = 10.0) -> list[dict[str, float | str]]:
     """
     Convert one depth field to material runs, merging equal neighbors.

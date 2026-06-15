@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-val", action="store_true", help="Skip validation.")
     parser.add_argument("--sharded-loading", action="store_true", help="Force sharded streaming dataset loading.")
     parser.add_argument("--eager-loading", action="store_true", help="Force eager in-memory dataset loading.")
+    parser.add_argument(
+        "--keep-overlimit-stacks",
+        action="store_true",
+        help="Keep stacks thicker than --max-thickness-nm by clipping them. Default skips them.",
+    )
 
     parser.add_argument("--d-model", type=int, default=192, help="Depth-field model channel width.")
     parser.add_argument("--n-blocks", type=int, default=12, help="Number of dilated Conv1d residual blocks.")
@@ -146,14 +151,31 @@ def accuracy_counts(logits: torch.Tensor, fields: torch.Tensor, void_id: int) ->
     )
 
 
-def counts_to_metrics(counts: torch.Tensor, *, loss_sum: float, batches: int, active_nm_sum: float, full_count: int, samples: int, dz_nm: float) -> dict:
+def counts_to_metrics(
+    counts: torch.Tensor,
+    *,
+    loss_sum: float,
+    batches: int,
+    active_nm_sum: float,
+    full_count: int,
+    samples: int,
+    seen_samples: int,
+    overlimit_seen: int,
+    skipped_overlimit: int,
+    dz_nm: float,
+) -> dict:
     return {
         "loss": loss_sum / max(int(batches), 1),
         "acc": float(counts[0].item() / max(counts[1].item(), 1.0)),
         "mat_acc": float(counts[2].item() / max(counts[3].item(), 1.0)),
         "void_acc": float(counts[4].item() / max(counts[5].item(), 1.0)),
         "mean_active_thickness_nm": active_nm_sum / max(int(samples), 1),
-        "clipped_fraction": float(full_count / max(int(samples), 1)),
+        "full_depth_fraction": float(full_count / max(int(samples), 1)),
+        "overlimit_fraction": float(overlimit_seen / max(int(seen_samples), 1)),
+        "overlimit_skipped": int(skipped_overlimit),
+        "overlimit_skip_fraction": float(skipped_overlimit / max(int(seen_samples), 1)),
+        "samples_kept": int(samples),
+        "samples_seen": int(seen_samples),
         "dz_nm": float(dz_nm),
     }
 
@@ -181,6 +203,9 @@ def run_epoch(
     loss_sum = 0.0
     batches = 0
     samples = 0
+    seen_samples = 0
+    overlimit_seen = 0
+    skipped_overlimit = 0
     full_count = 0
     active_nm_sum = 0.0
     counts = torch.zeros(6, dtype=torch.float64, device=device)
@@ -189,6 +214,26 @@ def run_epoch(
 
     for batch in pbar:
         spectra_cpu, stacks_cpu = batch[0], batch[1]
+        true_thickness_nm = optollama.data.token_stack_total_thickness_nm(
+            stacks_cpu,
+            idx_to_token,
+            eos_idx=eos_idx,
+            pad_idx=pad_idx,
+            msk_idx=msk_idx,
+        )
+        seen_samples += int(stacks_cpu.size(0))
+        overlimit = true_thickness_nm > (float(args.max_thickness_nm) + 1.0e-6)
+        overlimit_count = int(overlimit.sum().item())
+        overlimit_seen += overlimit_count
+        if not args.keep_overlimit_stacks:
+            skipped_overlimit += overlimit_count
+            keep = ~overlimit
+            if not bool(keep.any()):
+                pbar.set_postfix(skip=f"{skipped_overlimit / max(seen_samples, 1) * 100.0:.1f}%")
+                continue
+            spectra_cpu = spectra_cpu[keep]
+            stacks_cpu = stacks_cpu[keep]
+
         fields_cpu = optollama.data.rasterize_stack_to_depth_field(
             stacks_cpu,
             idx_to_token,
@@ -249,6 +294,9 @@ def run_epoch(
             active_nm_sum=active_nm_sum,
             full_count=full_count,
             samples=samples,
+            seen_samples=seen_samples,
+            overlimit_seen=overlimit_seen,
+            skipped_overlimit=skipped_overlimit,
             dz_nm=args.dz_nm,
         )
         pbar.set_postfix(
@@ -257,7 +305,13 @@ def run_epoch(
             mat=f"{metrics['mat_acc'] * 100.0:.2f}%",
             void=f"{metrics['void_acc'] * 100.0:.2f}%",
             th=f"{metrics['mean_active_thickness_nm']:.0f}nm",
-            clip=f"{metrics['clipped_fraction'] * 100.0:.1f}%",
+            skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%",
+            full=f"{metrics['full_depth_fraction'] * 100.0:.1f}%",
+        )
+
+    if batches == 0:
+        raise RuntimeError(
+            "No samples remained after over-limit filtering. Increase --max-thickness-nm or use --keep-overlimit-stacks."
         )
 
     return counts_to_metrics(
@@ -267,6 +321,9 @@ def run_epoch(
         active_nm_sum=active_nm_sum,
         full_count=full_count,
         samples=samples,
+        seen_samples=seen_samples,
+        overlimit_seen=overlimit_seen,
+        skipped_overlimit=skipped_overlimit,
         dz_nm=args.dz_nm,
     )
 
@@ -287,6 +344,7 @@ def make_checkpoint_extra(
             "output_seq_len": int(args.output_seq_len or cfg["MAX_SEQ_LEN"]),
             "vocab": vocab.to_dict(),
             "representation": "material_depth_field_with_void",
+            "filter_overlimit_stacks": not bool(args.keep_overlimit_stacks),
         },
         "model_config": model_config.to_dict(),
         "config_path": str(args.config),
