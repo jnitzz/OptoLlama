@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional supervised CE mixing weight from the configured train split.",
     )
     parser.add_argument(
+        "--supervised-batch-size",
+        type=int,
+        default=None,
+        help="Supervised anchor sub-batch size. Defaults to --batch-size instead of config TRAIN_BATCH_SIZE.",
+    )
+    parser.add_argument(
         "--sampling-steps",
         "--diffusion-steps",
         dest="sampling_steps",
@@ -684,14 +690,23 @@ def main() -> None:
 
     supervised_iter = None
     train_loader = None
+    supervised_batch_size = 0
     if float(args.supervised_weight) > 0.0:
+        supervised_batch_size = max(
+            1,
+            int(args.supervised_batch_size if args.supervised_batch_size is not None else args.batch_size),
+        )
+        supervised_loader_cfg = dict(cfg)
+        supervised_loader_cfg["TRAIN_BATCH_SIZE"] = supervised_batch_size
         _, train_loader, _ = optollama.data.SpectraDataset.make_loader(
-            cfg,
+            supervised_loader_cfg,
             split="train",
             subset_n=cfg.get("NUM_SAMPLES_TRAIN"),
             ddp=ddp,
         )
         supervised_iter = cycle_loader(train_loader)
+        if rank == 0:
+            print(f"Supervised anchor enabled with batch_size={supervised_batch_size}.")
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(cfg["OUTPUT_PATH"]) / "ram_reward"
     if rank == 0:
@@ -806,8 +821,8 @@ def main() -> None:
             supervised_ce = torch.zeros((), device=device)
             if supervised_iter is not None and float(args.supervised_weight) > 0.0:
                 sup_batch = next(supervised_iter)
-                sup_spectra = sup_batch[0].to(device, non_blocking=True)
-                sup_stacks = sup_batch[1].to(device, non_blocking=True)
+                sup_spectra = sup_batch[0][:supervised_batch_size].to(device, non_blocking=True)
+                sup_stacks = sup_batch[1][:supervised_batch_size].to(device, non_blocking=True)
                 if bool(getattr(core, "factored_output_enabled", False)):
                     sup_out = model(sup_spectra, sup_stacks, return_loss=True)
                     supervised_ce = sup_out["loss"]
@@ -918,6 +933,7 @@ def main() -> None:
                             "total_thickness_penalty": float(args.total_thickness_penalty),
                             "kl_weight": float(args.kl_weight),
                             "supervised_weight": float(args.supervised_weight),
+                            "supervised_batch_size": int(supervised_batch_size),
                             "reward_thickness_weight": (
                                 None if args.reward_thickness_weight is None else float(args.reward_thickness_weight)
                             ),
