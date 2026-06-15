@@ -1,4 +1,5 @@
 from .dataset import *
+from .depth_field import *
 from .spectra import *
 from .token import *
 from .augmentation import *
