@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None, help="Optional train subset size.")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Optional validation subset size.")
     parser.add_argument("--no-val", action="store_true", help="Skip validation.")
+    parser.add_argument(
+        "--validate-every-n-train-samples",
+        type=int,
+        default=None,
+        help="Override VALIDATE_EVERY_N_TRAIN_SAMPLES. 0 disables mid-epoch validation.",
+    )
     parser.add_argument("--sharded-loading", action="store_true", help="Force sharded streaming dataset loading.")
     parser.add_argument("--eager-loading", action="store_true", help="Force eager in-memory dataset loading.")
     parser.add_argument(
@@ -196,6 +203,8 @@ def run_epoch(
     epoch: int,
     epochs: int,
     train: bool,
+    validation_callback: Callable[[int, int, dict], None] | None = None,
+    validate_every_samples: int = 0,
 ) -> dict:
     model.train(train)
     set_loader_epoch(loader, epoch)
@@ -211,6 +220,8 @@ def run_epoch(
     counts = torch.zeros(6, dtype=torch.float64, device=device)
     desc = f"Epoch {epoch + 1}/{epochs} {'train' if train else 'val'}"
     pbar = tqdm.tqdm(loader, desc=desc, leave=True)
+    validation_interval = int(validate_every_samples or 0)
+    next_validation_sample = validation_interval if train and validation_callback is not None and validation_interval > 0 else None
 
     for batch in pbar:
         spectra_cpu, stacks_cpu = batch[0], batch[1]
@@ -308,6 +319,12 @@ def run_epoch(
             skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%",
             full=f"{metrics['full_depth_fraction'] * 100.0:.1f}%",
         )
+
+        if next_validation_sample is not None and seen_samples >= next_validation_sample:
+            validation_callback(epoch, seen_samples, dict(metrics))
+            model.train(True)
+            while next_validation_sample <= seen_samples:
+                next_validation_sample += validation_interval
 
     if batches == 0:
         raise RuntimeError(
@@ -434,14 +451,67 @@ def main() -> None:
     last_path = out_dir / "depth-field-last.pt"
     history_path = out_dir / "depth-field-history.json"
     best_score = min([item.get("val", item["train"])["loss"] for item in history], default=float("inf"))
+    validate_every_samples = (
+        int(args.validate_every_n_train_samples)
+        if args.validate_every_n_train_samples is not None
+        else int(cfg.get("VALIDATE_EVERY_N_TRAIN_SAMPLES") or 0)
+    )
+    if val_loader is None:
+        validate_every_samples = 0
+
+    def run_validation_trigger(epoch: int, trigger: str, train_metrics: dict, samples_seen_epoch: int) -> None:
+        nonlocal best_score
+        if val_loader is None:
+            return
+
+        val_metrics = run_epoch(
+            model=model,
+            loader=val_loader,
+            optimizer=None,
+            scaler=scaler,
+            device=device,
+            idx_to_token=idx_to_token,
+            vocab=vocab,
+            args=args,
+            eos_idx=eos_idx,
+            pad_idx=pad_idx,
+            msk_idx=msk_idx,
+            epoch=epoch,
+            epochs=epochs,
+            train=False,
+        )
+        record = {
+            "epoch": int(epoch),
+            "trigger": str(trigger),
+            "samples_seen_epoch": int(samples_seen_epoch),
+            "train": train_metrics,
+            "val": val_metrics,
+        }
+        history.append(record)
+
+        extra = make_checkpoint_extra(args=args, cfg=cfg, vocab=vocab, model_config=model_config, history=history)
+        score = float(val_metrics["loss"])
+        if score < best_score:
+            best_score = score
+            save_depth_checkpoint(path=best_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
+            print(f"Saved best checkpoint -> {best_path} (score={best_score:.6f}, trigger={trigger})")
+
+        optollama.utils.save_as_json(str(history_path), history)
 
     print(
         "Depth-field diffusion: "
         f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
         f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}"
     )
+    if validate_every_samples > 0:
+        print(f"Mid-epoch validation enabled every {validate_every_samples} seen train samples.")
 
     for epoch in range(start_epoch, epochs):
+        mid_validation_callback = None
+        if validate_every_samples > 0 and val_loader is not None:
+            def mid_validation_callback(e: int, seen: int, metrics: dict) -> None:
+                run_validation_trigger(e, f"sample_{seen}", metrics, seen)
+
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -457,6 +527,8 @@ def main() -> None:
             epoch=epoch,
             epochs=epochs,
             train=True,
+            validation_callback=mid_validation_callback,
+            validate_every_samples=validate_every_samples,
         )
 
         val_metrics = None
@@ -478,7 +550,12 @@ def main() -> None:
                 train=False,
             )
 
-        record = {"epoch": int(epoch), "train": train_metrics}
+        record = {
+            "epoch": int(epoch),
+            "trigger": "epoch_end",
+            "samples_seen_epoch": int(train_metrics["samples_seen"]),
+            "train": train_metrics,
+        }
         if val_metrics is not None:
             record["val"] = val_metrics
         history.append(record)
