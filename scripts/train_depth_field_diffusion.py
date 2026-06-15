@@ -214,6 +214,129 @@ def autocast_context(enabled: bool):
     return nullcontext()
 
 
+def ddp_active() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+
+
+def ddp_rank() -> int:
+    return torch.distributed.get_rank() if ddp_active() else 0
+
+
+def ddp_world_size() -> int:
+    return torch.distributed.get_world_size() if ddp_active() else 1
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def all_reduce_sum(values: torch.Tensor) -> torch.Tensor:
+    if ddp_active():
+        torch.distributed.all_reduce(values)
+    return values
+
+
+def gather_1d_tensor(values: torch.Tensor) -> torch.Tensor:
+    values = values.detach().cpu().reshape(-1)
+    if not ddp_active():
+        return values
+    gathered = [torch.empty(0, dtype=values.dtype) for _ in range(ddp_world_size())]
+    torch.distributed.all_gather_object(gathered, values)
+    if not gathered:
+        return values
+    return torch.cat(gathered, dim=0)
+
+
+def depth_field_training_loss(
+    model: torch.nn.Module,
+    spectra: torch.Tensor,
+    clean_fields: torch.Tensor,
+    *,
+    void_id: int,
+    void_loss_weight: float = 0.25,
+    random_replace_prob: float = 0.10,
+    loss_on_corrupted_only: bool = False,
+) -> dict[str, torch.Tensor]:
+    core = unwrap_model(model)
+    batch_size = int(clean_fields.size(0))
+    timesteps = torch.randint(0, int(core.timesteps), (batch_size,), device=clean_fields.device)
+    noised_fields, corrupted = core.corrupt(
+        clean_fields,
+        timesteps,
+        random_replace_prob=random_replace_prob,
+    )
+    logits = model(spectra, noised_fields, timesteps)
+
+    weights = torch.ones(int(core.num_materials), device=clean_fields.device, dtype=logits.dtype)
+    if 0 <= int(void_id) < int(core.num_materials):
+        weights[int(void_id)] = float(void_loss_weight)
+    loss_per_bin = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, int(core.num_materials)),
+        clean_fields.long().reshape(-1),
+        weight=weights,
+        reduction="none",
+    ).view_as(clean_fields)
+
+    if loss_on_corrupted_only:
+        denom = corrupted.float().sum().clamp_min(1.0)
+        loss = (loss_per_bin * corrupted.float()).sum() / denom
+    else:
+        loss = loss_per_bin.mean()
+
+    return {
+        "loss": loss,
+        "logits": logits,
+        "timesteps": timesteps,
+        "noised_fields": noised_fields,
+        "corrupted": corrupted,
+    }
+
+
+def reduced_epoch_metrics(
+    *,
+    counts: torch.Tensor,
+    loss_sum: float,
+    batches: int,
+    active_nm_sum: float,
+    full_count: int,
+    samples: int,
+    seen_samples: int,
+    overlimit_seen: int,
+    skipped_overlimit: int,
+    dz_nm: float,
+    device: torch.device,
+) -> dict:
+    reduced_counts = counts.detach().clone()
+    totals = torch.tensor(
+        [
+            float(loss_sum),
+            float(batches),
+            float(active_nm_sum),
+            float(full_count),
+            float(samples),
+            float(seen_samples),
+            float(overlimit_seen),
+            float(skipped_overlimit),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    all_reduce_sum(reduced_counts)
+    all_reduce_sum(totals)
+    return counts_to_metrics(
+        reduced_counts,
+        loss_sum=float(totals[0].item()),
+        batches=int(totals[1].item()),
+        active_nm_sum=float(totals[2].item()),
+        full_count=int(totals[3].item()),
+        samples=int(totals[4].item()),
+        seen_samples=int(totals[5].item()),
+        overlimit_seen=int(totals[6].item()),
+        skipped_overlimit=int(totals[7].item()),
+        dz_nm=dz_nm,
+    )
+
+
 @torch.no_grad()
 def accuracy_counts(logits: torch.Tensor, fields: torch.Tensor, void_id: int) -> torch.Tensor:
     pred = logits.argmax(dim=-1)
@@ -343,7 +466,7 @@ def simulate_decoded(
 @torch.no_grad()
 def run_tmm_evaluation(
     *,
-    model: optollama.model.DepthFieldDiffusion,
+    model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     tmm_ctx: optollama.evaluation.simulation.TMMContext,
@@ -359,6 +482,7 @@ def run_tmm_evaluation(
 ) -> dict:
     """Run proper all-mask depth-field sampling and score decoded stacks by TMM MAE."""
     model.eval()
+    sample_model = unwrap_model(model)
     set_loader_epoch(loader, epoch)
 
     mc_samples = int(args.eval_mc_samples)
@@ -371,7 +495,8 @@ def run_tmm_evaluation(
     best_thickness: list[torch.Tensor] = []
     target_overlimit = 0
     samples_seen = 0
-    pbar = tqdm.tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs} tmm", leave=True)
+    show_progress = ddp_rank() == 0
+    pbar = tqdm.tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs} tmm", leave=True, disable=not show_progress)
 
     for batch in pbar:
         spectra_cpu, stacks_cpu = batch[0], batch[1]
@@ -388,7 +513,7 @@ def run_tmm_evaluation(
 
         spectra = spectra_cpu.to(device, non_blocking=True)
         spectra_rep = spectra.repeat_interleave(mc_samples, dim=0)
-        fields = model.sample(
+        fields = sample_model.sample(
             spectra_rep,
             steps=args.eval_sampling_steps,
             temperature=float(args.eval_temperature),
@@ -429,20 +554,33 @@ def run_tmm_evaluation(
         mae_values.append(best_mae)
         best_layers.append(non_special.sum(dim=1).float())
         best_thickness.append(decoded_thickness.float())
-        all_mae = torch.cat(mae_values)
-        pbar.set_postfix(
-            mae=f"{all_mae.mean().item():.5f}",
-            best=f"{all_mae.min().item():.5f}",
-            layers=f"{torch.cat(best_layers).mean().item():.1f}",
-            th=f"{torch.cat(best_thickness).mean().item():.0f}nm",
-        )
+        if show_progress:
+            all_mae = torch.cat(mae_values)
+            pbar.set_postfix(
+                mae=f"{all_mae.mean().item():.5f}",
+                best=f"{all_mae.min().item():.5f}",
+                layers=f"{torch.cat(best_layers).mean().item():.1f}",
+                th=f"{torch.cat(best_thickness).mean().item():.0f}nm",
+            )
 
-    if not mae_values:
+    if mae_values:
+        local_mae = torch.cat(mae_values)
+        local_layers = torch.cat(best_layers)
+        local_thickness = torch.cat(best_thickness)
+    else:
+        local_mae = torch.empty(0, dtype=torch.float32)
+        local_layers = torch.empty(0, dtype=torch.float32)
+        local_thickness = torch.empty(0, dtype=torch.float32)
+
+    all_mae = gather_1d_tensor(local_mae)
+    all_layers = gather_1d_tensor(local_layers)
+    all_thickness = gather_1d_tensor(local_thickness)
+    target_totals = torch.tensor([float(target_overlimit), float(samples_seen)], dtype=torch.float64, device=device)
+    all_reduce_sum(target_totals)
+
+    if all_mae.numel() == 0:
         raise RuntimeError("TMM validation produced no samples.")
 
-    all_mae = torch.cat(mae_values)
-    all_layers = torch.cat(best_layers)
-    all_thickness = torch.cat(best_thickness)
     return {
         "score": float(all_mae.mean().item()),
         "score_name": "tmm_mae_mean",
@@ -452,17 +590,17 @@ def run_tmm_evaluation(
         "mae_max": float(all_mae.max().item()),
         "material_layers_mean": float(all_layers.mean().item()),
         "decoded_total_thickness_nm_mean": float(all_thickness.mean().item()),
-        "target_overlimit_fraction": float(target_overlimit / max(samples_seen, 1)),
-        "samples_seen": int(samples_seen),
+        "target_overlimit_fraction": float(target_totals[0].item() / max(int(target_totals[1].item()), 1)),
+        "samples_seen": int(target_totals[1].item()),
         "mc_samples": int(mc_samples),
-        "sampling_steps": int(args.eval_sampling_steps or model.timesteps),
+        "sampling_steps": int(args.eval_sampling_steps or sample_model.timesteps),
         "tmm_batch_size": int(args.eval_tmm_batch_size),
     }
 
 
 def run_epoch(
     *,
-    model: optollama.model.DepthFieldDiffusion,
+    model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.amp.GradScaler,
@@ -492,12 +630,14 @@ def run_epoch(
     active_nm_sum = 0.0
     counts = torch.zeros(6, dtype=torch.float64, device=device)
     desc = f"Epoch {epoch + 1}/{epochs} {'train' if train else 'val'}"
-    pbar = tqdm.tqdm(loader, desc=desc, leave=True)
+    show_progress = ddp_rank() == 0
+    pbar = tqdm.tqdm(loader, desc=desc, leave=True, disable=not show_progress)
     validation_interval = int(validate_every_samples or 0)
     next_validation_sample = validation_interval if train and validation_callback is not None and validation_interval > 0 else None
 
     for batch in pbar:
-        spectra_cpu, stacks_cpu = batch[0], batch[1]
+        raw_spectra_cpu, raw_stacks_cpu = batch[0], batch[1]
+        spectra_cpu, stacks_cpu = raw_spectra_cpu, raw_stacks_cpu
         true_thickness_nm = optollama.data.token_stack_total_thickness_nm(
             stacks_cpu,
             idx_to_token,
@@ -509,12 +649,37 @@ def run_epoch(
         overlimit = true_thickness_nm > (float(args.max_thickness_nm) + 1.0e-6)
         overlimit_count = int(overlimit.sum().item())
         overlimit_seen += overlimit_count
+        count_batch_metrics = True
         if not args.keep_overlimit_stacks:
             skipped_overlimit += overlimit_count
             keep = ~overlimit
             if not bool(keep.any()):
-                pbar.set_postfix(skip=f"{skipped_overlimit / max(seen_samples, 1) * 100.0:.1f}%")
-                continue
+                if ddp_active():
+                    count_batch_metrics = False
+                    spectra_cpu = raw_spectra_cpu[:1]
+                    stacks_cpu = raw_stacks_cpu[:1]
+                else:
+                    metrics = reduced_epoch_metrics(
+                        counts=counts,
+                        loss_sum=loss_sum,
+                        batches=batches,
+                        active_nm_sum=active_nm_sum,
+                        full_count=full_count,
+                        samples=samples,
+                        seen_samples=seen_samples,
+                        overlimit_seen=overlimit_seen,
+                        skipped_overlimit=skipped_overlimit,
+                        dz_nm=args.dz_nm,
+                        device=device,
+                    )
+                    if show_progress:
+                        pbar.set_postfix(skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%")
+                    if next_validation_sample is not None and int(metrics["samples_seen"]) >= next_validation_sample:
+                        validation_callback(epoch, int(metrics["samples_seen"]), dict(metrics))
+                        model.train(True)
+                        while next_validation_sample <= int(metrics["samples_seen"]):
+                            next_validation_sample += validation_interval
+                    continue
             spectra_cpu = spectra_cpu[keep]
             stacks_cpu = stacks_cpu[keep]
 
@@ -528,10 +693,11 @@ def run_epoch(
             pad_idx=pad_idx,
             msk_idx=msk_idx,
         )
-        active_bins = optollama.data.depth_field_active_bins(fields_cpu, vocab.void_id)
-        full_count += int((active_bins >= fields_cpu.size(1)).sum().item())
-        active_nm_sum += float(active_bins.float().sum().item() * float(args.dz_nm))
-        samples += int(fields_cpu.size(0))
+        if count_batch_metrics:
+            active_bins = optollama.data.depth_field_active_bins(fields_cpu, vocab.void_id)
+            full_count += int((active_bins >= fields_cpu.size(1)).sum().item())
+            active_nm_sum += float(active_bins.float().sum().item() * float(args.dz_nm))
+            samples += int(fields_cpu.size(0))
 
         spectra = spectra_cpu.to(device, non_blocking=True)
         fields = fields_cpu.to(device, non_blocking=True)
@@ -541,7 +707,8 @@ def run_epoch(
                 raise RuntimeError("optimizer is required for training")
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(bool(scaler.is_enabled())):
-                out = model.training_loss(
+                out = depth_field_training_loss(
+                    model,
                     spectra,
                     fields,
                     void_id=vocab.void_id,
@@ -550,6 +717,8 @@ def run_epoch(
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
                 )
             loss = out["loss"]
+            if not count_batch_metrics:
+                loss = loss * 0.0
             scaler.scale(loss).backward()
             if args.grad_clip and args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -558,7 +727,8 @@ def run_epoch(
             scaler.update()
         else:
             with torch.no_grad(), autocast_context(bool(scaler.is_enabled())):
-                out = model.training_loss(
+                out = depth_field_training_loss(
+                    model,
                     spectra,
                     fields,
                     void_id=vocab.void_id,
@@ -567,12 +737,15 @@ def run_epoch(
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
                 )
             loss = out["loss"]
+            if not count_batch_metrics:
+                loss = loss * 0.0
 
-        loss_sum += float(loss.detach().item())
-        batches += 1
-        counts += accuracy_counts(out["logits"].detach(), fields, vocab.void_id)
-        metrics = counts_to_metrics(
-            counts,
+        if count_batch_metrics:
+            loss_sum += float(loss.detach().item())
+            batches += 1
+            counts += accuracy_counts(out["logits"].detach(), fields, vocab.void_id)
+        metrics = reduced_epoch_metrics(
+            counts=counts,
             loss_sum=loss_sum,
             batches=batches,
             active_nm_sum=active_nm_sum,
@@ -582,30 +755,27 @@ def run_epoch(
             overlimit_seen=overlimit_seen,
             skipped_overlimit=skipped_overlimit,
             dz_nm=args.dz_nm,
+            device=device,
         )
-        pbar.set_postfix(
-            loss=f"{metrics['loss']:.4f}",
-            acc=f"{metrics['acc'] * 100.0:.2f}%",
-            mat=f"{metrics['mat_acc'] * 100.0:.2f}%",
-            void=f"{metrics['void_acc'] * 100.0:.2f}%",
-            th=f"{metrics['mean_active_thickness_nm']:.0f}nm",
-            skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%",
-            full=f"{metrics['full_depth_fraction'] * 100.0:.1f}%",
-        )
+        if show_progress:
+            pbar.set_postfix(
+                loss=f"{metrics['loss']:.4f}",
+                acc=f"{metrics['acc'] * 100.0:.2f}%",
+                mat=f"{metrics['mat_acc'] * 100.0:.2f}%",
+                void=f"{metrics['void_acc'] * 100.0:.2f}%",
+                th=f"{metrics['mean_active_thickness_nm']:.0f}nm",
+                skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%",
+                full=f"{metrics['full_depth_fraction'] * 100.0:.1f}%",
+            )
 
-        if next_validation_sample is not None and seen_samples >= next_validation_sample:
-            validation_callback(epoch, seen_samples, dict(metrics))
+        if next_validation_sample is not None and int(metrics["samples_seen"]) >= next_validation_sample:
+            validation_callback(epoch, int(metrics["samples_seen"]), dict(metrics))
             model.train(True)
-            while next_validation_sample <= seen_samples:
+            while next_validation_sample <= int(metrics["samples_seen"]):
                 next_validation_sample += validation_interval
 
-    if batches == 0:
-        raise RuntimeError(
-            "No samples remained after over-limit filtering. Increase --max-thickness-nm or use --keep-overlimit-stacks."
-        )
-
-    return counts_to_metrics(
-        counts,
+    metrics = reduced_epoch_metrics(
+        counts=counts,
         loss_sum=loss_sum,
         batches=batches,
         active_nm_sum=active_nm_sum,
@@ -615,7 +785,14 @@ def run_epoch(
         overlimit_seen=overlimit_seen,
         skipped_overlimit=skipped_overlimit,
         dz_nm=args.dz_nm,
+        device=device,
     )
+    if int(metrics["samples_kept"]) == 0:
+        raise RuntimeError(
+            "No samples remained after over-limit filtering. Increase --max-thickness-nm or use --keep-overlimit-stacks."
+        )
+
+    return metrics
 
 
 def make_checkpoint_extra(
@@ -652,7 +829,7 @@ def make_checkpoint_extra(
 def save_depth_checkpoint(
     *,
     path: Path,
-    model: optollama.model.DepthFieldDiffusion,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     history: list[dict],
@@ -677,12 +854,14 @@ def main() -> None:
     apply_depth_field_defaults(cfg, args)
     apply_loader_overrides(cfg, args)
 
-    seed = int(args.seed if args.seed is not None else cfg.get("SEED", 0))
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    device = resolve_device(args.device)
+    if args.seed is not None:
+        cfg["SEED"] = int(args.seed)
+    device, local_rank, rank, world_size = optollama.utils.setup_run(cfg, make_dirs=False)
+    if args.device is not None and world_size == 1:
+        device = resolve_device(args.device)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+    ddp = optollama.utils.is_ddp()
     amp_enabled = bool(args.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -692,10 +871,10 @@ def main() -> None:
 
     train_subset = args.max_train_samples if args.max_train_samples is not None else cfg.get("NUM_SAMPLES_TRAIN")
     val_subset = args.max_val_samples if args.max_val_samples is not None else cfg.get("NUM_SAMPLES_TEST")
-    train_ds, train_loader, _ = optollama.data.SpectraDataset.make_loader(cfg, split="train", subset_n=train_subset, ddp=False)
+    train_ds, train_loader, _ = optollama.data.SpectraDataset.make_loader(cfg, split="train", subset_n=train_subset, ddp=ddp)
     val_loader = None
     if not args.no_val:
-        _, val_loader, _ = optollama.data.SpectraDataset.make_loader(cfg, split="test", subset_n=val_subset, ddp=False)
+        _, val_loader, _ = optollama.data.SpectraDataset.make_loader(cfg, split="test", subset_n=val_subset, ddp=ddp)
     eval_mode = str(args.eval_mode).lower()
     tmm_ctx = None
     if val_loader is not None and eval_mode in {"tmm", "both"}:
@@ -713,6 +892,12 @@ def main() -> None:
         dropout=float(args.dropout),
     )
     model = optollama.model.DepthFieldDiffusion(model_config).to(device)
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(args.learning_rate if args.learning_rate is not None else cfg["LEARNING_RATE"]),
@@ -725,11 +910,15 @@ def main() -> None:
         start_epoch_loaded, blob = optollama.utils.load_checkpoint(args.resume, model, optimizer=optimizer, map_location="cpu")
         start_epoch = int(start_epoch_loaded or 0)
         history = list(((blob.get("extra") or {}).get("history") or []))
-        print(f"Resumed depth-field checkpoint {args.resume} at epoch {start_epoch}.")
+        if rank == 0:
+            print(f"Resumed depth-field checkpoint {args.resume} at epoch {start_epoch}.")
 
     epochs = int(args.epochs if args.epochs is not None else cfg.get("EPOCHS", 20))
     out_dir = Path(args.out_dir)
-    os.makedirs(out_dir, exist_ok=True)
+    if rank == 0:
+        os.makedirs(out_dir, exist_ok=True)
+    if ddp:
+        torch.distributed.barrier()
     best_path = out_dir / "depth-field-best.pt"
     last_path = out_dir / "depth-field-last.pt"
     history_path = out_dir / "depth-field-history.json"
@@ -799,6 +988,9 @@ def main() -> None:
             for key, value in denoise_metrics.items():
                 val_metrics[f"denoise_{key}"] = value
 
+        if rank != 0:
+            return
+
         record = {
             "epoch": int(epoch),
             "trigger": str(trigger),
@@ -817,15 +1009,17 @@ def main() -> None:
 
         optollama.utils.save_as_json(str(history_path), history)
 
-    print(
-        "Depth-field diffusion: "
-        f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
-        f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}"
-    )
-    if validate_every_samples > 0:
-        print(f"Mid-epoch validation enabled every {validate_every_samples} seen train samples.")
-    if val_loader is not None:
-        print(f"Validation mode: {eval_mode}.")
+    if rank == 0:
+        print(
+            "Depth-field diffusion: "
+            f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
+            f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
+            f"ddp={ddp}, world={world_size}"
+        )
+        if validate_every_samples > 0:
+            print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")
+        if val_loader is not None:
+            print(f"Validation mode: {eval_mode}.")
 
     for epoch in range(start_epoch, epochs):
         mid_validation_callback = None
@@ -859,7 +1053,7 @@ def main() -> None:
                 train_metrics=train_metrics,
                 samples_seen_epoch=int(train_metrics["samples_seen"]),
             )
-        else:
+        elif rank == 0:
             history.append(
                 {
                     "epoch": int(epoch),
@@ -869,20 +1063,25 @@ def main() -> None:
                 }
             )
 
-        extra = make_checkpoint_extra(args=args, cfg=cfg, vocab=vocab, model_config=model_config, history=history)
-        if args.save_every > 0 and ((epoch + 1) % int(args.save_every) == 0 or epoch == epochs - 1):
-            save_depth_checkpoint(path=last_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
-            print(f"Saved last checkpoint -> {last_path}")
+        if rank == 0:
+            extra = make_checkpoint_extra(args=args, cfg=cfg, vocab=vocab, model_config=model_config, history=history)
+            if args.save_every > 0 and ((epoch + 1) % int(args.save_every) == 0 or epoch == epochs - 1):
+                save_depth_checkpoint(path=last_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
+                print(f"Saved last checkpoint -> {last_path}")
 
-        if val_loader is None:
-            score = metric_score(train_metrics)
-            if score < best_score:
-                best_score = score
-                save_depth_checkpoint(path=best_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
-                print(f"Saved best checkpoint -> {best_path} (train_loss={best_score:.6f})")
+            if val_loader is None:
+                score = metric_score(train_metrics)
+                if score < best_score:
+                    best_score = score
+                    save_depth_checkpoint(path=best_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
+                    print(f"Saved best checkpoint -> {best_path} (train_loss={best_score:.6f})")
 
-        optollama.utils.save_as_json(str(history_path), history)
+            optollama.utils.save_as_json(str(history_path), history)
 
 
 if __name__ == "__main__":
-    main()
+    optollama.utils.stop_ddp()
+    try:
+        main()
+    finally:
+        optollama.utils.stop_ddp()
