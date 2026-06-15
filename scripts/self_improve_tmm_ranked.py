@@ -222,7 +222,7 @@ def _sample_rank_candidates(
     keep = min(max(1, int(rank_candidates)), m)
 
     targets_mc = targets.unsqueeze(1).expand(b, m, *targets.shape[1:]).reshape(b * m, *targets.shape[1:])
-    ids_flat, _, _ = split_model_sample_output(model(targets_mc))
+    ids_flat, _, thickness_flat, _ = split_model_sample_output(model(targets_mc))
     mae_flat = lite.simulate_mae_in_chunks(
         ids_flat,
         targets_mc,
@@ -232,6 +232,7 @@ def _sample_rank_candidates(
         msk=msk,
         roi_mask=roi_mask,
         eval_batch_size=max(1, int(eval_batch_size)),
+        thickness_override=thickness_flat,
     )
 
     ids = ids_flat.view(b, m, -1)

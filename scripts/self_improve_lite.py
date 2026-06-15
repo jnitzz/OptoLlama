@@ -329,16 +329,19 @@ def simulate_mae_in_chunks(
     msk: int,
     roi_mask: Optional[torch.Tensor],
     eval_batch_size: int,
+    thickness_override: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     maes: list[torch.Tensor] = []
     for start in range(0, stacks.size(0), eval_batch_size):
         end = min(start + eval_batch_size, stacks.size(0))
+        thickness_chunk = thickness_override[start:end] if thickness_override is not None else None
         pred = optollama.evaluation.simulation.simulate_token_sequence(
             stacks[start:end],
             tmm_ctx,
             eos=eos,
             pad=pad,
             msk=msk,
+            thickness_override=thickness_chunk,
         )
         maes.append(optollama.evaluation.masked_mae_roi(targets[start:end], pred, wl_mask=roi_mask))
     return torch.cat(maes, dim=0)
@@ -362,8 +365,15 @@ def sample_model_candidates(
     keep = min(max(1, int(keep_candidates)), m)
 
     targets_mc = targets.unsqueeze(1).expand(b, m, *targets.shape[1:]).reshape(b * m, *targets.shape[1:])
-    ids_flat, _, _ = split_model_sample_output(model(targets_mc))
-    pred_flat = optollama.evaluation.simulation.simulate_token_sequence(ids_flat, tmm_ctx, eos=eos, pad=pad, msk=msk)
+    ids_flat, _, thickness_flat, _ = split_model_sample_output(model(targets_mc))
+    pred_flat = optollama.evaluation.simulation.simulate_token_sequence(
+        ids_flat,
+        tmm_ctx,
+        eos=eos,
+        pad=pad,
+        msk=msk,
+        thickness_override=thickness_flat,
+    )
     mae = optollama.evaluation.masked_mae_roi(targets_mc, pred_flat, wl_mask=roi_mask).view(b, m)
     ids = ids_flat.view(b, m, -1)
 

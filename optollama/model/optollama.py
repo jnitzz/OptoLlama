@@ -1826,6 +1826,8 @@ class OptoLlama(torch.nn.Module):
         stacks: torch.Tensor = None,
         timesteps: torch.Tensor = None,
         return_loss: bool = False,
+        state_thickness_nm: Optional[torch.Tensor] = None,
+        return_factored_outputs: bool = False,
     ) -> torch.Tensor:
         """
         Unified forward interface.
@@ -1863,5 +1865,16 @@ class OptoLlama(torch.nn.Module):
             loss = torch.nn.NLLLoss(ignore_index=self.pad)(log_probs.view(-1, self.vocab_size), stacks.view(-1))
             return {"loss": loss, "logits": logits}
         if timesteps is not None:
-            return self._model(spectra, stacks, timesteps)
+            if return_factored_outputs:
+                logits, factored_outputs = self._sample_outputs(
+                    spectra,
+                    stacks,
+                    timesteps,
+                    state_thickness_nm=state_thickness_nm,
+                )
+                return {
+                    "logits": logits,
+                    "factored_outputs": factored_outputs,
+                }
+            return self._model(spectra, stacks, timesteps, state_thickness_nm=state_thickness_nm)
         return self._train(spectra, stacks)
