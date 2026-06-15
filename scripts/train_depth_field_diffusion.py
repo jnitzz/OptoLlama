@@ -22,12 +22,12 @@ import optollama.utils
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an experimental 10 nm depth-field diffusion model.")
     parser.add_argument("--config", type=str, default="configs/optollama.yaml", help="Project config YAML.")
-    parser.add_argument("--out-dir", type=str, default="data/checkpoints/depth_field_10um", help="Checkpoint output dir.")
+    parser.add_argument("--out-dir", type=str, default=None, help="Checkpoint output dir.")
     parser.add_argument("--device", type=str, default=None, help='Device, e.g. "cuda", "cuda:0", or "cpu".')
     parser.add_argument("--seed", type=int, default=None, help="Random seed. Defaults to config SEED.")
 
-    parser.add_argument("--dz-nm", type=float, default=10.0, help="Depth resolution in nm.")
-    parser.add_argument("--max-thickness-nm", type=float, default=10_000.0, help="Maximum represented total thickness in nm.")
+    parser.add_argument("--dz-nm", type=float, default=None, help="Depth resolution in nm.")
+    parser.add_argument("--max-thickness-nm", type=float, default=None, help="Maximum represented total thickness in nm.")
     parser.add_argument("--output-seq-len", type=int, default=None, help="Decoded token sequence length metadata.")
 
     parser.add_argument("--epochs", type=int, default=None, help="Epoch count. Defaults to config EPOCHS.")
@@ -47,31 +47,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eager-loading", action="store_true", help="Force eager in-memory dataset loading.")
     parser.add_argument(
         "--keep-overlimit-stacks",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Keep stacks thicker than --max-thickness-nm by clipping them. Default skips them.",
     )
 
-    parser.add_argument("--d-model", type=int, default=192, help="Depth-field model channel width.")
-    parser.add_argument("--n-blocks", type=int, default=12, help="Number of dilated Conv1d residual blocks.")
-    parser.add_argument("--kernel-size", type=int, default=7, help="Conv1d kernel size.")
-    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout inside residual blocks.")
-    parser.add_argument("--diffusion-steps", type=int, default=100, help="Discrete depth-field diffusion timesteps.")
+    parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
+    parser.add_argument("--n-blocks", type=int, default=None, help="Number of dilated Conv1d residual blocks.")
+    parser.add_argument("--kernel-size", type=int, default=None, help="Conv1d kernel size.")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout inside residual blocks.")
+    parser.add_argument("--diffusion-steps", type=int, default=None, help="Discrete depth-field diffusion timesteps.")
 
     parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer LR. Defaults to config LEARNING_RATE.")
-    parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clip. <=0 disables clipping.")
-    parser.add_argument("--amp", action="store_true", help="Use CUDA autocast/GradScaler.")
+    parser.add_argument("--weight-decay", type=float, default=None, help="AdamW weight decay.")
+    parser.add_argument("--grad-clip", type=float, default=None, help="Gradient norm clip. <=0 disables clipping.")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None, help="Use CUDA autocast/GradScaler.")
 
-    parser.add_argument("--void-loss-weight", type=float, default=0.25, help="CE class weight for the void depth class.")
+    parser.add_argument("--void-loss-weight", type=float, default=None, help="CE class weight for the void depth class.")
     parser.add_argument(
         "--random-replace-prob",
         type=float,
-        default=0.10,
+        default=None,
         help="Fraction of corrupted bins that are random material replacements rather than masks.",
     )
     parser.add_argument(
         "--loss-on-corrupted-only",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Compute CE only on bins that were masked/replaced. Default supervises every bin.",
     )
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint to resume.")
@@ -79,17 +81,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-mode",
         type=str,
-        default="tmm",
+        default=None,
         choices=["tmm", "denoise", "both"],
         help="Validation mode. 'tmm' samples all-mask fields and scores TMM MAE; 'denoise' uses CE on corrupted targets.",
     )
-    parser.add_argument("--eval-mc-samples", type=int, default=4, help="TMM validation candidates per target.")
+    parser.add_argument("--eval-mc-samples", type=int, default=None, help="TMM validation candidates per target.")
     parser.add_argument("--eval-sampling-steps", type=int, default=None, help="TMM validation denoising steps.")
-    parser.add_argument("--eval-temperature", type=float, default=1.0, help="TMM validation sampling temperature.")
-    parser.add_argument("--eval-top-k", type=int, default=0, help="TMM validation top-k material sampling filter.")
-    parser.add_argument("--eval-deterministic", action="store_true", help="Use argmax sampling for TMM validation.")
-    parser.add_argument("--eval-tmm-device", type=str, default="auto", help='TMM validation device. "auto" uses model device.')
-    parser.add_argument("--eval-tmm-batch-size", type=int, default=64, help="Decoded stacks per TMM validation chunk.")
+    parser.add_argument("--eval-temperature", type=float, default=None, help="TMM validation sampling temperature.")
+    parser.add_argument("--eval-top-k", type=int, default=None, help="TMM validation top-k material sampling filter.")
+    parser.add_argument("--eval-deterministic", action=argparse.BooleanOptionalAction, default=None, help="Use argmax sampling for TMM validation.")
+    parser.add_argument("--eval-tmm-device", type=str, default=None, help='TMM validation device. "auto" uses model device.')
+    parser.add_argument("--eval-tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM validation chunk.")
     return parser.parse_args()
 
 
@@ -154,6 +156,56 @@ def apply_loader_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> Non
         cfg["SHARDED_LOADING"] = True
     if args.eager_loading:
         cfg["SHARDED_LOADING"] = False
+
+
+def depth_field_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    block = cfg.get("DEPTH_FIELD") or {}
+    return block if isinstance(block, dict) else {}
+
+
+def nested_get(block: dict[str, Any], *path: str, default: Any = None) -> Any:
+    value: Any = block
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return default
+        value = value[key]
+    return value
+
+
+def set_arg_default(args: argparse.Namespace, name: str, value: Any) -> None:
+    if getattr(args, name) is None and value is not None:
+        setattr(args, name, value)
+
+
+def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    block = depth_field_block(cfg)
+    set_arg_default(args, "out_dir", block.get("OUT_DIR", "data/checkpoints/depth_field_10um"))
+    set_arg_default(args, "dz_nm", block.get("DZ_NM", 10.0))
+    set_arg_default(args, "max_thickness_nm", block.get("MAX_THICKNESS_NM", 10_000.0))
+    set_arg_default(args, "output_seq_len", block.get("OUTPUT_SEQ_LEN"))
+
+    set_arg_default(args, "d_model", nested_get(block, "MODEL", "D_MODEL", default=192))
+    set_arg_default(args, "n_blocks", nested_get(block, "MODEL", "N_BLOCKS", default=12))
+    set_arg_default(args, "kernel_size", nested_get(block, "MODEL", "KERNEL_SIZE", default=7))
+    set_arg_default(args, "dropout", nested_get(block, "MODEL", "DROPOUT", default=0.0))
+    set_arg_default(args, "diffusion_steps", nested_get(block, "MODEL", "DIFFUSION_STEPS", default=100))
+
+    set_arg_default(args, "weight_decay", nested_get(block, "TRAIN", "WEIGHT_DECAY", default=0.01))
+    set_arg_default(args, "grad_clip", nested_get(block, "TRAIN", "GRAD_CLIP", default=1.0))
+    set_arg_default(args, "amp", nested_get(block, "TRAIN", "AMP", default=False))
+    set_arg_default(args, "keep_overlimit_stacks", nested_get(block, "TRAIN", "KEEP_OVERLIMIT_STACKS", default=False))
+    set_arg_default(args, "void_loss_weight", nested_get(block, "TRAIN", "VOID_LOSS_WEIGHT", default=0.25))
+    set_arg_default(args, "random_replace_prob", nested_get(block, "TRAIN", "RANDOM_REPLACE_PROB", default=0.10))
+    set_arg_default(args, "loss_on_corrupted_only", nested_get(block, "TRAIN", "LOSS_ON_CORRUPTED_ONLY", default=False))
+
+    set_arg_default(args, "eval_mode", nested_get(block, "EVAL", "MODE", default="tmm"))
+    set_arg_default(args, "eval_mc_samples", nested_get(block, "EVAL", "MC_SAMPLES", default=4))
+    set_arg_default(args, "eval_sampling_steps", nested_get(block, "EVAL", "SAMPLING_STEPS"))
+    set_arg_default(args, "eval_temperature", nested_get(block, "EVAL", "TEMPERATURE", default=1.0))
+    set_arg_default(args, "eval_top_k", nested_get(block, "EVAL", "TOP_K", default=0))
+    set_arg_default(args, "eval_deterministic", nested_get(block, "EVAL", "DETERMINISTIC", default=False))
+    set_arg_default(args, "eval_tmm_device", nested_get(block, "EVAL", "TMM_DEVICE", default="auto"))
+    set_arg_default(args, "eval_tmm_batch_size", nested_get(block, "EVAL", "TMM_BATCH_SIZE", default=64))
 
 
 def autocast_context(enabled: bool):
@@ -622,6 +674,7 @@ def save_depth_checkpoint(
 def main() -> None:
     args = parse_args()
     cfg = optollama.utils.load_config(args)
+    apply_depth_field_defaults(cfg, args)
     apply_loader_overrides(cfg, args)
 
     seed = int(args.seed if args.seed is not None else cfg.get("SEED", 0))
