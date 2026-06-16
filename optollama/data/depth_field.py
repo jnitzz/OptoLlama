@@ -228,6 +228,20 @@ def depth_field_runs(field: torch.Tensor, vocab: DepthFieldVocab, *, dz_nm: floa
     ]
 
 
+def depth_field_material_token_ids(vocab: DepthFieldVocab) -> dict[str, int]:
+    """
+    Return one representative layer token id per material.
+
+    The representative token supplies only the material identity when TMM is
+    called with a continuous thickness override.
+    """
+    return {
+        material: int(options[0].token_id)
+        for material, options in vocab.token_options.items()
+        if options
+    }
+
+
 def _nearest_option(options: tuple[DepthTokenOption, ...], thickness_nm: float) -> DepthTokenOption:
     return min(options, key=lambda item: (abs(item.thickness_nm - float(thickness_nm)), item.thickness_nm))
 

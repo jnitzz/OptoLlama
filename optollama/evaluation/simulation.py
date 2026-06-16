@@ -334,10 +334,84 @@ def simulate_token_sequence(
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.0)
 
 
+def material_runs_to_token_tensors(
+    runs_batch: Sequence[Sequence[dict[str, Any]]],
+    *,
+    material_to_token_id: dict[str, int],
+    eos: int,
+    pad: int,
+    device: Union[str, torch.device],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert material runs into token IDs plus continuous thickness overrides.
+
+    Token IDs carry material identity only. The returned thickness tensor carries
+    the exact run thickness in nm, avoiding discretized token chunking.
+    """
+    batch_size = len(runs_batch)
+    max_runs = max((len(runs) for runs in runs_batch), default=0)
+    seq_len = max(max_runs + 1, 1)
+    token_ids = torch.full((batch_size, seq_len), int(pad), dtype=torch.long, device=device)
+    thickness = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
+
+    for batch_idx, runs in enumerate(runs_batch):
+        write_idx = 0
+        for run in runs:
+            material = str(run["material"])
+            thickness_nm = float(run["thickness_nm"])
+            if thickness_nm <= 0.0:
+                continue
+            token_id = material_to_token_id.get(material)
+            if token_id is None:
+                raise ValueError(f"No representative token id for material {material!r}.")
+            if write_idx >= seq_len - 1:
+                break
+            token_ids[batch_idx, write_idx] = int(token_id)
+            thickness[batch_idx, write_idx] = float(thickness_nm)
+            write_idx += 1
+        if write_idx < seq_len:
+            token_ids[batch_idx, write_idx] = int(eos)
+
+    return token_ids, thickness
+
+
+@torch.no_grad()
+def simulate_material_runs(
+    runs_batch: Sequence[Sequence[dict[str, Any]]],
+    tmm_ctx: "TMMContext",
+    *,
+    material_to_token_id: dict[str, int],
+    eos: int,
+    pad: int,
+    msk: int,
+) -> torch.Tensor:
+    """
+    Simulate RAT spectra from material runs with native run thicknesses.
+
+    This is the depth-field-native scoring path: each contiguous material run
+    becomes one optical layer with its run thickness, independent of the
+    tokenized layer-thickness vocabulary and independent of MAX_SEQ_LEN.
+    """
+    device = tmm_ctx.wl.device
+    token_ids, thickness = material_runs_to_token_tensors(
+        runs_batch,
+        material_to_token_id=material_to_token_id,
+        eos=eos,
+        pad=pad,
+        device=device,
+    )
+    return simulate_token_sequence(
+        token_ids,
+        tmm_ctx,
+        eos=eos,
+        pad=pad,
+        msk=msk,
+        thickness_override=thickness,
+    )
+
+
 def active_layer_mask(stacks: torch.Tensor, eos: int, pad: int, msk: int) -> torch.Tensor:
-    """
-    Return a boolean mask for material layers before EOS.
-    """
+    """Return a boolean mask for material layers before EOS."""
     token_ids = stacks.to(torch.long)
     is_eos = token_ids == eos
     before_eos = is_eos.cumsum(dim=1) == 0
@@ -359,9 +433,7 @@ def simulate_token_sequence_averaged(
     msk: int,
     thickness_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Simulate token stacks with angle, polarization, and thickness-jitter averaging.
-    """
+    """Simulate token stacks with angle, polarization, and thickness-jitter averaging."""
     if len(angle_thetas) != len(angle_weights):
         raise ValueError("angle_thetas and angle_weights must have the same length.")
     if len(polarizations) == 0:
@@ -458,6 +530,7 @@ class TMMContext(NamedTuple):
     thickness_jitter_nm : float
         Uniform per-layer thickness jitter range in nm.
     """
+
     tmm: torch.nn.Module
     wl: torch.Tensor
     theta: torch.Tensor
@@ -469,9 +542,7 @@ class TMMContext(NamedTuple):
 
     @property
     def realistic_enabled(self) -> bool:
-        """
-        Whether this context uses realistic averaged TMM simulation.
-        """
+        """Whether this context uses realistic averaged TMM simulation."""
         return self.average_thetas is not None
 
     @staticmethod

@@ -39,6 +39,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed. Defaults to config SEED.")
 
     parser.add_argument("--tmm-batch-size", type=int, default=64, help="Decoded stacks per TMM chunk.")
+    parser.add_argument(
+        "--score-mode",
+        type=str,
+        default="field",
+        choices=["field", "decoded", "both"],
+        help="Score native depth-field material runs, decoded token stacks, or both.",
+    )
+    parser.add_argument(
+        "--rank-by",
+        type=str,
+        default="auto",
+        choices=["auto", "field", "decoded"],
+        help="Candidate MAE used for MC ranking. Auto uses field for both/field mode and decoded for decoded mode.",
+    )
     parser.add_argument("--record-spectra", action="store_true", help="Store target and predicted spectra arrays.")
     parser.add_argument("--record-all-mc", action="store_true", help="Store every MC candidate, not only the best one.")
     return parser.parse_args()
@@ -176,6 +190,34 @@ def simulate_decoded(
     return torch.cat(outputs, dim=0)
 
 
+def simulate_field_runs(
+    fields_cpu: torch.Tensor,
+    *,
+    vocab: optollama.data.DepthFieldVocab,
+    tmm_ctx: optollama.evaluation.simulation.TMMContext,
+    material_to_token_id: dict[str, int],
+    dz_nm: float,
+    eos_idx: int,
+    pad_idx: int,
+    msk_idx: int,
+    tmm_batch_size: int,
+) -> torch.Tensor:
+    outputs = []
+    runs_batch = [optollama.data.depth_field_runs(field, vocab, dz_nm=dz_nm) for field in fields_cpu]
+    for start in range(0, len(runs_batch), int(tmm_batch_size)):
+        outputs.append(
+            optollama.evaluation.simulation.simulate_material_runs(
+                runs_batch[start : start + int(tmm_batch_size)],
+                tmm_ctx,
+                material_to_token_id=material_to_token_id,
+                eos=eos_idx,
+                pad=pad_idx,
+                msk=msk_idx,
+            ).detach()
+        )
+    return torch.cat(outputs, dim=0)
+
+
 def stack_total_thickness_nm(tokens: list[str]) -> float:
     total = 0.0
     for token in tokens:
@@ -193,6 +235,8 @@ def candidate_record(
     mae_values: torch.Tensor,
     pred_spectra_cpu: torch.Tensor,
     target_spectrum_cpu: torch.Tensor,
+    field_mae_values: torch.Tensor | None,
+    decoded_mae_values: torch.Tensor | None,
     vocab: optollama.data.DepthFieldVocab,
     idx_to_token: dict[int, str],
     eos_idx: int,
@@ -207,14 +251,21 @@ def candidate_record(
         pad_idx=pad_idx,
     )
     active_bins = int(optollama.data.depth_field_active_bins(fields_cpu[flat_idx], vocab.void_id).item())
+    field_runs = optollama.data.depth_field_runs(fields_cpu[flat_idx], vocab, dz_nm=dz_nm)
     record = {
         "mae": float(mae_values[flat_idx].item()),
         "tokens": tokens,
         "material_layers": int(len(tokens)),
         "decoded_total_thickness_nm": float(stack_total_thickness_nm(tokens)),
         "field_active_thickness_nm": float(active_bins * dz_nm),
-        "field_runs": optollama.data.depth_field_runs(fields_cpu[flat_idx], vocab, dz_nm=dz_nm),
+        "field_material_runs": int(len(field_runs)),
+        "field_total_thickness_nm": float(sum(float(run["thickness_nm"]) for run in field_runs)),
+        "field_runs": field_runs,
     }
+    if field_mae_values is not None:
+        record["field_mae"] = float(field_mae_values[flat_idx].item())
+    if decoded_mae_values is not None:
+        record["decoded_mae"] = float(decoded_mae_values[flat_idx].item())
     if record_spectra:
         record["target_spectra"] = target_spectrum_cpu.detach().cpu().tolist()
         record["pred_spectra"] = pred_spectra_cpu[flat_idx].detach().cpu().tolist()
@@ -235,6 +286,7 @@ def main() -> None:
 
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
     vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
+    material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     model, extra = load_depth_model(args.checkpoint, device)
     depth_info = extra.get("depth_field") or {}
     dz_nm = float(depth_info.get("dz_nm", 10.0))
@@ -249,12 +301,21 @@ def main() -> None:
     tmm_ctx = optollama.evaluation.simulation.TMMContext.make(cfg=cfg, idx_to_token=idx_to_token, device=tmm_device)
     results: list[dict] = []
     mae_all: list[float] = []
+    selected_field_mae: list[float] = []
+    selected_decoded_mae: list[float] = []
     mc_samples = int(args.mc_samples)
+    score_mode = str(args.score_mode).lower()
+    rank_by = str(args.rank_by).lower()
+    if rank_by == "auto":
+        rank_by = "field" if score_mode in {"field", "both"} else "decoded"
+    if score_mode != "both" and rank_by != score_mode:
+        raise ValueError(f"--rank-by={rank_by} requires --score-mode=both or --score-mode={rank_by}.")
 
     print(
         "Depth-field inference: "
         f"split={args.split}, mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
-        f"max={max_thickness_nm:g}nm, model_device={device}, tmm_device={tmm_device}"
+        f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
+        f"model_device={device}, tmm_device={tmm_device}"
     )
 
     for batch in tqdm.tqdm(loader, desc="depth-field inference", leave=True):
@@ -280,17 +341,50 @@ def main() -> None:
             pad_idx=pad_idx,
         )
 
-        pred_spectra = simulate_decoded(
-            token_ids_cpu,
-            tmm_ctx=tmm_ctx,
-            eos_idx=eos_idx,
-            pad_idx=pad_idx,
-            msk_idx=msk_idx,
-            tmm_batch_size=int(args.tmm_batch_size),
-        )
         target_rep = spectra_cpu.to(tmm_device).repeat_interleave(mc_samples, dim=0)
-        mae = mae_per_sample(pred_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
-        pred_spectra_cpu = pred_spectra.detach().cpu()
+        field_mae = None
+        decoded_mae = None
+        field_spectra_cpu = None
+        decoded_spectra_cpu = None
+
+        if score_mode in {"field", "both"}:
+            field_spectra = simulate_field_runs(
+                fields_cpu,
+                vocab=vocab,
+                tmm_ctx=tmm_ctx,
+                material_to_token_id=material_to_token_id,
+                dz_nm=dz_nm,
+                eos_idx=eos_idx,
+                pad_idx=pad_idx,
+                msk_idx=msk_idx,
+                tmm_batch_size=int(args.tmm_batch_size),
+            )
+            field_mae = mae_per_sample(field_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
+            field_spectra_cpu = field_spectra.detach().cpu()
+
+        if score_mode in {"decoded", "both"}:
+            decoded_spectra = simulate_decoded(
+                token_ids_cpu,
+                tmm_ctx=tmm_ctx,
+                eos_idx=eos_idx,
+                pad_idx=pad_idx,
+                msk_idx=msk_idx,
+                tmm_batch_size=int(args.tmm_batch_size),
+            )
+            decoded_mae = mae_per_sample(decoded_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
+            decoded_spectra_cpu = decoded_spectra.detach().cpu()
+
+        if rank_by == "field":
+            if field_mae is None or field_spectra_cpu is None:
+                raise RuntimeError("Field MAE requested for ranking but was not computed.")
+            mae = field_mae
+            pred_spectra_cpu = field_spectra_cpu
+        else:
+            if decoded_mae is None or decoded_spectra_cpu is None:
+                raise RuntimeError("Decoded MAE requested for ranking but was not computed.")
+            mae = decoded_mae
+            pred_spectra_cpu = decoded_spectra_cpu
+
         mae_matrix = mae.view(batch_size, mc_samples)
         best_mae, best_idx = mae_matrix.min(dim=1)
 
@@ -309,6 +403,8 @@ def main() -> None:
                     mae_values=mae,
                     pred_spectra_cpu=pred_spectra_cpu,
                     target_spectrum_cpu=spectra_cpu[row_idx],
+                    field_mae_values=field_mae,
+                    decoded_mae_values=decoded_mae,
                     vocab=vocab,
                     idx_to_token=idx_to_token,
                     eos_idx=eos_idx,
@@ -326,6 +422,8 @@ def main() -> None:
                         mae_values=mae,
                         pred_spectra_cpu=pred_spectra_cpu,
                         target_spectrum_cpu=spectra_cpu[row_idx],
+                        field_mae_values=field_mae,
+                        decoded_mae_values=decoded_mae,
                         vocab=vocab,
                         idx_to_token=idx_to_token,
                         eos_idx=eos_idx,
@@ -337,17 +435,29 @@ def main() -> None:
                 ]
             results.append(record)
             mae_all.append(float(best_mae[row_idx].item()))
+            if field_mae is not None:
+                selected_field_mae.append(float(field_mae[flat_idx].item()))
+            if decoded_mae is not None:
+                selected_decoded_mae.append(float(decoded_mae[flat_idx].item()))
 
+    field_mae_tensor = torch.tensor(selected_field_mae) if selected_field_mae else None
+    decoded_mae_tensor = torch.tensor(selected_decoded_mae) if selected_decoded_mae else None
     summary = {
         "checkpoint": str(args.checkpoint),
         "config": str(args.config),
         "split": str(args.split),
         "samples": int(len(results)),
         "mc_samples": mc_samples,
+        "score_mode": score_mode,
+        "rank_by": rank_by,
         "mae_mean": float(torch.tensor(mae_all).mean().item()) if mae_all else None,
         "mae_median": float(torch.tensor(mae_all).median().item()) if mae_all else None,
         "mae_min": float(min(mae_all)) if mae_all else None,
         "mae_max": float(max(mae_all)) if mae_all else None,
+        "field_mae_mean": float(field_mae_tensor.mean().item()) if field_mae_tensor is not None else None,
+        "field_mae_median": float(field_mae_tensor.median().item()) if field_mae_tensor is not None else None,
+        "decoded_mae_mean": float(decoded_mae_tensor.mean().item()) if decoded_mae_tensor is not None else None,
+        "decoded_mae_median": float(decoded_mae_tensor.median().item()) if decoded_mae_tensor is not None else None,
         "depth_field": {
             "dz_nm": dz_nm,
             "max_thickness_nm": max_thickness_nm,

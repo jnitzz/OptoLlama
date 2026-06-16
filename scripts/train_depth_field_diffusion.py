@@ -463,6 +463,35 @@ def simulate_decoded(
     return torch.cat(outputs, dim=0)
 
 
+def simulate_field_runs(
+    fields_cpu: torch.Tensor,
+    *,
+    vocab: optollama.data.DepthFieldVocab,
+    tmm_ctx: optollama.evaluation.simulation.TMMContext,
+    material_to_token_id: dict[str, int],
+    dz_nm: float,
+    eos_idx: int,
+    pad_idx: int,
+    msk_idx: int,
+    tmm_batch_size: int,
+) -> torch.Tensor:
+    """Simulate sampled depth fields as native material runs in chunks."""
+    runs_batch = [optollama.data.depth_field_runs(field, vocab, dz_nm=dz_nm) for field in fields_cpu]
+    outputs = []
+    for start in range(0, len(runs_batch), int(tmm_batch_size)):
+        outputs.append(
+            optollama.evaluation.simulation.simulate_material_runs(
+                runs_batch[start : start + int(tmm_batch_size)],
+                tmm_ctx,
+                material_to_token_id=material_to_token_id,
+                eos=eos_idx,
+                pad=pad_idx,
+                msk=msk_idx,
+            ).detach()
+        )
+    return torch.cat(outputs, dim=0)
+
+
 @torch.no_grad()
 def run_tmm_evaluation(
     *,
@@ -480,7 +509,7 @@ def run_tmm_evaluation(
     epoch: int,
     epochs: int,
 ) -> dict:
-    """Run proper all-mask depth-field sampling and score decoded stacks by TMM MAE."""
+    """Run all-mask depth-field sampling and score native material runs by TMM MAE."""
     model.eval()
     sample_model = unwrap_model(model)
     set_loader_epoch(loader, epoch)
@@ -489,12 +518,12 @@ def run_tmm_evaluation(
     if mc_samples <= 0:
         raise ValueError(f"--eval-mc-samples must be positive, got {mc_samples}")
 
-    output_seq_len = int(args.output_seq_len or cfg["MAX_SEQ_LEN"])
     mae_values: list[torch.Tensor] = []
     best_layers: list[torch.Tensor] = []
     best_thickness: list[torch.Tensor] = []
     target_overlimit = 0
     samples_seen = 0
+    material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     show_progress = ddp_rank() == 0
     pbar = tqdm.tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs} tmm", leave=True, disable=not show_progress)
 
@@ -520,17 +549,13 @@ def run_tmm_evaluation(
             top_k=int(args.eval_top_k),
             deterministic=bool(args.eval_deterministic or args.eval_temperature <= 0.0),
         )
-        token_ids_cpu = optollama.data.decode_depth_field_to_tokens(
-            fields.detach().cpu(),
-            vocab,
-            output_seq_len=output_seq_len,
-            dz_nm=args.dz_nm,
-            eos_idx=eos_idx,
-            pad_idx=pad_idx,
-        )
-        pred_spectra = simulate_decoded(
-            token_ids_cpu,
+        fields_cpu = fields.detach().cpu()
+        pred_spectra = simulate_field_runs(
+            fields_cpu,
+            vocab=vocab,
             tmm_ctx=tmm_ctx,
+            material_to_token_id=material_to_token_id,
+            dz_nm=float(args.dz_nm),
             eos_idx=eos_idx,
             pad_idx=pad_idx,
             msk_idx=msk_idx,
@@ -540,20 +565,16 @@ def run_tmm_evaluation(
         mae = mae_per_sample(pred_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu().view(batch_size, mc_samples)
         best_mae, best_idx = mae.min(dim=1)
         flat_idx = torch.arange(batch_size, dtype=torch.long) * mc_samples + best_idx
-        best_ids = token_ids_cpu[flat_idx]
-        non_pad = best_ids != int(pad_idx)
-        non_special = non_pad & (best_ids != int(eos_idx)) & (best_ids != int(msk_idx))
-        decoded_thickness = optollama.data.token_stack_total_thickness_nm(
-            best_ids,
-            idx_to_token,
-            eos_idx=eos_idx,
-            pad_idx=pad_idx,
-            msk_idx=msk_idx,
+        best_runs = [optollama.data.depth_field_runs(fields_cpu[int(idx.item())], vocab, dz_nm=float(args.dz_nm)) for idx in flat_idx]
+        run_layers = torch.tensor([len(runs) for runs in best_runs], dtype=torch.float32)
+        run_thickness = torch.tensor(
+            [sum(float(run["thickness_nm"]) for run in runs) for runs in best_runs],
+            dtype=torch.float32,
         )
 
         mae_values.append(best_mae)
-        best_layers.append(non_special.sum(dim=1).float())
-        best_thickness.append(decoded_thickness.float())
+        best_layers.append(run_layers)
+        best_thickness.append(run_thickness)
         if show_progress:
             all_mae = torch.cat(mae_values)
             pbar.set_postfix(
@@ -588,8 +609,9 @@ def run_tmm_evaluation(
         "mae_median": float(all_mae.median().item()),
         "mae_min": float(all_mae.min().item()),
         "mae_max": float(all_mae.max().item()),
-        "material_layers_mean": float(all_layers.mean().item()),
-        "decoded_total_thickness_nm_mean": float(all_thickness.mean().item()),
+        "score_basis": "field_material_runs",
+        "material_runs_mean": float(all_layers.mean().item()),
+        "field_total_thickness_nm_mean": float(all_thickness.mean().item()),
         "target_overlimit_fraction": float(target_totals[0].item() / max(int(target_totals[1].item()), 1)),
         "samples_seen": int(target_totals[1].item()),
         "mc_samples": int(mc_samples),
