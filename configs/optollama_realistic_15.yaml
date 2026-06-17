@@ -1,10 +1,10 @@
 EXPERIMENT:
   MODEL: optollama
-  RUN: REALISTIC_14_DEPTH_FIELD_10UM
+  RUN: REALISTIC_15_DEPTH_FIELD_10UM
   SEED: 3
 
 PATHS:
-  DATA_PATH: E:/repos/OptoLlama/data #/scratch/htc/jschaibl/repos/OptoLlama/data
+  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data
   MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
   TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
   OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
@@ -20,10 +20,10 @@ PATHS:
     - ${PATHS.DATA_PATH}/realistic_07_20M_test
 
 CHECKPOINT:
-  INIT_PATH: null
+  INIT_PATH: ${PATHS.DATA_PATH}/checkpoints/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-last.pt
   INIT_STRICT: true
   INIT_FALLBACK_FILTER: true
-  RESUME: true
+  RESUME: false
 
 DATA_LOADING:
   NUM_WORKERS: 2
@@ -96,13 +96,14 @@ DEPTH_FIELD:
     WEIGHT_DECAY: 0.01
     GRAD_CLIP: 1.0
     KEEP_OVERLIMIT_STACKS: false
-    VOID_LOSS_WEIGHT: 0.25
-    RANDOM_REPLACE_PROB: 0.10
+    VOID_LOSS_WEIGHT: 0.10
+    RANDOM_REPLACE_PROB: 0.15
     LOSS_ON_CORRUPTED_ONLY: false
   EVAL:
     MODE: tmm
     MC_SAMPLES: 10
     SAMPLING_STEPS: 200
+    REMASK_STRATEGY: random
     TEMPERATURE: 1.0
     TOP_K: 0
     DETERMINISTIC: false
@@ -152,12 +153,12 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  # TARGET: null
+  TARGET: null
   # TARGET_GLOB: ${PATHS.DATA_PATH}/targets/multicolor_realistic/*.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_blue_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/multicolor_realistic/target_R_peak_yellow_realistic.csv
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
-  TARGET: ${PATHS.DATA_PATH}/targets/target_R_B_realistic.csv
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_B_realistic.csv
   N_TARGETS: 1
 
 TARGET_PREPROCESS:

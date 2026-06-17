@@ -12,6 +12,7 @@ import tqdm
 import optollama.data
 import optollama.evaluation.simulation
 import optollama.model
+import optollama.plotting
 import optollama.utils
 
 # ruff: noqa: D103
@@ -23,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True, help="Depth-field .pt checkpoint.")
     parser.add_argument("--out-json", type=str, default="data/output_depth_field_10um/samples.json", help="Output JSON.")
     parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="Dataset split to score.")
+    parser.add_argument("--target", type=str, default=None, help="Optional target spectrum CSV/JSON. Defaults to config TARGET when set.")
+    parser.add_argument("--target-samples", type=int, default=None, help="Repeated target spectra to evaluate. Defaults to config N_TARGETS.")
     parser.add_argument("--max-samples", type=int, default=256, help="Maximum target spectra to process.")
     parser.add_argument("--batch-size", type=int, default=16, help="Target spectra per model batch.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
@@ -62,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--record-spectra", action="store_true", help="Store target and predicted spectra arrays.")
     parser.add_argument("--record-all-mc", action="store_true", help="Store every MC candidate, not only the best one.")
+    parser.add_argument("--plot-bundle", type=str, default=None, help="Optional dashboard .npz path. Defaults to config PLOT_BUNDLE_PATH.")
+    parser.add_argument("--no-plot-bundle", action="store_true", help="Do not save the dashboard plot bundle.")
     return parser.parse_args()
 
 
@@ -126,6 +131,48 @@ def make_eval_loader(cfg: dict[str, Any], args: argparse.Namespace) -> torch.uti
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=int(args.batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+
+def configured_target(cfg: dict[str, Any], args: argparse.Namespace) -> str | None:
+    target = args.target if args.target is not None else cfg.get("TARGET")
+    if target is None:
+        return None
+    target = str(target)
+    return target if target.strip() else None
+
+
+def make_target_loader(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    target: str,
+    msk_idx: int,
+) -> torch.utils.data.DataLoader:
+    if target == "random":
+        width = int(cfg["WAVELENGTHS"].numel() if torch.is_tensor(cfg["WAVELENGTHS"]) else len(cfg["WAVELENGTHS"]))
+        spectrum = torch.rand((3, width), dtype=torch.float32)
+    else:
+        spectrum = optollama.utils.load_spectra(target, cfg).to(torch.float32)
+    spectrum, _ = optollama.data.ensure_3w(spectrum)
+    spectrum = optollama.data.redistribute_mismatch(
+        spectrum,
+        str(cfg.get("MISMATCH_FILL_ORDER", "R>T>A")),
+        target_sum=1.0,
+    )
+
+    n_targets = int(args.target_samples if args.target_samples is not None else cfg.get("N_TARGETS", 1))
+    n_targets = max(1, n_targets)
+    spectra = spectrum.unsqueeze(0).repeat(n_targets, 1, 1).contiguous()
+    stacks = torch.full((n_targets, int(cfg["MAX_SEQ_LEN"])), int(msk_idx), dtype=torch.long)
+    indices = torch.arange(n_targets, dtype=torch.long)
+    dataset = torch.utils.data.TensorDataset(spectra, stacks, indices)
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=min(n_targets, int(args.batch_size)),
         shuffle=False,
         num_workers=int(args.num_workers),
         pin_memory=torch.cuda.is_available(),
@@ -289,9 +336,10 @@ def main() -> None:
 
     device = resolve_device(args.device)
     tmm_device = resolve_tmm_device(args.tmm_device, device)
-    loader = make_eval_loader(cfg, args)
 
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
+    target = configured_target(cfg, args)
+    loader = make_target_loader(cfg, args, target, msk_idx) if target is not None else make_eval_loader(cfg, args)
     vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
     material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     model, extra = load_depth_model(args.checkpoint, device)
@@ -310,6 +358,9 @@ def main() -> None:
     mae_all: list[float] = []
     selected_field_mae: list[float] = []
     selected_decoded_mae: list[float] = []
+    all_mc_mae_batches: list[torch.Tensor] = []
+    all_mc_ids_batches: list[torch.Tensor] = []
+    all_mc_pred_batches: list[torch.Tensor] = []
     mc_samples = int(args.mc_samples)
     score_mode = str(args.score_mode).lower()
     rank_by = str(args.rank_by).lower()
@@ -320,7 +371,8 @@ def main() -> None:
 
     print(
         "Depth-field inference: "
-        f"split={args.split}, mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
+        f"{'target=' + target if target is not None else 'split=' + args.split}, "
+        f"mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
         f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
         f"remask={args.remask_strategy}, "
         f"model_device={device}, tmm_device={tmm_device}"
@@ -396,6 +448,13 @@ def main() -> None:
 
         mae_matrix = mae.view(batch_size, mc_samples)
         best_mae, best_idx = mae_matrix.min(dim=1)
+        if args.record_all_mc:
+            all_mc_mae_batches.append(mae_matrix.detach().cpu().to(torch.float32))
+            all_mc_ids_batches.append(token_ids_cpu.reshape(batch_size, mc_samples, -1).detach().cpu().to(torch.long))
+            if args.record_spectra:
+                all_mc_pred_batches.append(
+                    pred_spectra_cpu.reshape(batch_size, mc_samples, *pred_spectra_cpu.shape[1:]).detach().cpu().to(torch.float32)
+                )
 
         for row_idx in range(batch_size):
             flat_idx = row_idx * mc_samples + int(best_idx[row_idx].item())
@@ -455,6 +514,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "config": str(args.config),
         "split": str(args.split),
+        "target": target,
         "samples": int(len(results)),
         "mc_samples": mc_samples,
         "score_mode": score_mode,
@@ -475,6 +535,25 @@ def main() -> None:
             "classes": list(vocab.material_names),
         },
     }
+    plot_bundle_path = None
+    if not args.no_plot_bundle and args.record_all_mc:
+        plot_bundle_path = str(args.plot_bundle or cfg.get("PLOT_BUNDLE_PATH") or "")
+        if plot_bundle_path:
+            bundle_output: dict[str, torch.Tensor] = {
+                "mae_grid": torch.cat(all_mc_mae_batches, dim=0) if all_mc_mae_batches else torch.empty((0, mc_samples)),
+                "ids_grid": torch.cat(all_mc_ids_batches, dim=0) if all_mc_ids_batches else torch.empty((0, mc_samples, 0), dtype=torch.long),
+            }
+            if all_mc_pred_batches:
+                bundle_output["pred_spectra_grid"] = torch.cat(all_mc_pred_batches, dim=0)
+            optollama.plotting.save_plot_bundle(
+                plot_bundle_path,
+                bundle_output,
+                wavelengths=cfg["WAVELENGTHS"],
+                roi_min=cfg.get("ROI_MIN"),
+                roi_max=cfg.get("ROI_MAX"),
+            )
+            summary["plot_bundle"] = plot_bundle_path
+            print(f"Saved depth-field plot bundle -> {plot_bundle_path}")
     out = {"summary": summary, "results": results}
     out_path = Path(args.out_json)
     os.makedirs(out_path.parent, exist_ok=True)

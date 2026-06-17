@@ -46,6 +46,64 @@ def continuous_layers_to_plot_tokens(sample: dict) -> list[str]:
     return tokens
 
 
+def field_runs_to_plot_tokens(sample: dict) -> list[str]:
+    """Return token-like strings from depth-field material runs."""
+    runs = sample.get("field_runs") or []
+    tokens: list[str] = []
+    for run in runs:
+        material = run.get("material")
+        thickness = run.get("thickness_nm")
+        if material is None or thickness is None:
+            continue
+        tokens.append(f"{material}_{float(thickness):.3g}")
+    return tokens
+
+
+def sample_target_spectrum(sample: dict) -> np.ndarray:
+    """Return target spectrum from either token-model or depth-field outputs."""
+    if "rat_target" in sample:
+        return np.asarray(sample["rat_target"], dtype=np.float32)
+    if "target_spectra" in sample:
+        return np.asarray(sample["target_spectra"], dtype=np.float32)
+    raise KeyError("Sample has neither 'rat_target' nor 'target_spectra'. Re-run inference with --record-spectra.")
+
+
+def sample_pred_spectrum(sample: dict) -> np.ndarray:
+    """Return predicted spectrum from either token-model or depth-field outputs."""
+    if "rat_pred" in sample:
+        return np.asarray(sample["rat_pred"], dtype=np.float32)
+    if "pred_spectra" in sample:
+        return np.asarray(sample["pred_spectra"], dtype=np.float32)
+    raise KeyError("Sample has neither 'rat_pred' nor 'pred_spectra'. Re-run inference with --record-spectra.")
+
+
+def sample_pred_tokens(sample: dict) -> list[str]:
+    """Return predicted stack tokens from any supported inference output."""
+    return (
+        continuous_layers_to_plot_tokens(sample)
+        or field_runs_to_plot_tokens(sample)
+        or list(sample.get("stack_pred_tokens", []))
+        or list(sample.get("tokens", []))
+    )
+
+
+def load_sample_results(path: str) -> list[dict]:
+    """Load old flat results or new depth-field wrapped results."""
+    payload = optollama.plotting.load_results(path)
+    if isinstance(payload, dict) and "results" in payload:
+        results = payload["results"]
+    else:
+        results = payload
+    if not isinstance(results, list):
+        raise TypeError(f"Expected a result list or a wrapper with 'results' at {path}.")
+    return results
+
+
+def samples_path(cfg: dict, args: argparse.Namespace) -> str:
+    """Return the sample JSON path selected by CLI or config."""
+    return str(args.samples_path or cfg["SAMPLES_PATH"])
+
+
 def parse_arguments() -> argparse.Namespace:
     """Parse plotting CLI arguments."""
     parser = argparse.ArgumentParser(description="Plot OptoLlama inference outputs.")
@@ -57,6 +115,8 @@ def parse_arguments() -> argparse.Namespace:
     sample.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     sample.add_argument("--index", type=int, default=None, help="Result index to plot. Defaults to the best-MAE sample.")
     sample.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
+    sample.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
+    sample.add_argument("--no-nn", action="store_true", help="Disable optional nearest-neighbor overlay.")
     sample.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
     sample.add_argument("--save", type=str, default=None, help="Output file for single-target mode, output directory for multi-target mode.")
 
@@ -65,12 +125,15 @@ def parse_arguments() -> argparse.Namespace:
     dashboard.add_argument("--topk", type=int, default=4, help="Number of best grid cells to detail below the heatmap.")
     dashboard.add_argument("--mae", choices=("native", "common"), default="native", help="MAE grid to display.")
     dashboard.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
+    dashboard.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
+    dashboard.add_argument("--plot-bundle", type=str, default=None, help="Override config PLOT_BUNDLE_PATH.")
     dashboard.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
     dashboard.add_argument("--save", type=str, default=None, help="Output file for single-target mode, output directory for multi-target mode.")
 
     nn_scatter = subparsers.add_parser("nn-scatter", help="Plot model-vs-nearest-neighbor MAE scatter.")
     nn_scatter.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     nn_scatter.add_argument("--nn-matches", type=str, default=None, help="Path to nearest-neighbor matches JSON.")
+    nn_scatter.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
     nn_scatter.add_argument("--max-points", type=int, default=1000, help="Maximum number of points to plot.")
     nn_scatter.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
     nn_scatter.add_argument("--save", type=str, default=None, help="Optional output path for the figure.")
@@ -151,12 +214,13 @@ def _sample_one(
     save_path: str | None = None,
 ) -> None:
     """Render a single-sample comparison plot from inference outputs."""
-    results = optollama.plotting.load_results(cfg["SAMPLES_PATH"])
+    path = samples_path(cfg, args)
+    results = load_sample_results(path)
     if not results:
-        raise RuntimeError(f"No inference results found at {cfg['SAMPLES_PATH']}")
+        raise RuntimeError(f"No inference results found at {path}")
 
     bundle = None
-    bundle_path = cfg.get("PLOT_BUNDLE_PATH")
+    bundle_path = getattr(args, "plot_bundle", None) or cfg.get("PLOT_BUNDLE_PATH")
     if bundle_path and os.path.exists(bundle_path):
         bundle = optollama.plotting.load_plot_bundle(bundle_path)
 
@@ -175,7 +239,7 @@ def _sample_one(
     nn_id = None
     nn_mae = None
 
-    if cfg.get("PLOT_SAMPLE_WITH_NN", False):
+    if cfg.get("PLOT_SAMPLE_WITH_NN", False) and not bool(getattr(args, "no_nn", False)):
         from template_matching import find_best_train_for_target, load_train_sample_by_global_id
 
         _, _, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
@@ -187,7 +251,7 @@ def _sample_one(
             plot_device,
         )
         nn_result = find_best_train_for_target(
-            torch.tensor(sample["rat_target"]),
+            torch.tensor(sample_target_spectrum(sample)),
             train_paths=train_paths_from_cfg(cfg),
             train_chunk_size=int(cfg.get("PLOT_NN_CHUNK_SIZE", 4096)),
             device=plot_device,
@@ -204,9 +268,9 @@ def _sample_one(
 
     fig = optollama.plotting.plot_sample_comparison(
         wavelengths=wavelengths,
-        target_spectrum=np.asarray(sample["rat_target"], dtype=np.float32),
-        predicted_spectrum=np.asarray(sample["rat_pred"], dtype=np.float32),
-        predicted_tokens=continuous_layers_to_plot_tokens(sample) or sample.get("stack_pred_tokens", []),
+        target_spectrum=sample_target_spectrum(sample),
+        predicted_spectrum=sample_pred_spectrum(sample),
+        predicted_tokens=sample_pred_tokens(sample),
         target_tokens=sample.get("stack_target_tokens", []),
         sample_acc=sample.get("acc"),
         sample_mae=sample.get("mae"),
@@ -253,7 +317,7 @@ def _dashboard_one(
     save_path: str | None = None,
 ) -> None:
     """Render the MC dashboard plot from the saved plot bundle."""
-    bundle_path = cfg.get("PLOT_BUNDLE_PATH")
+    bundle_path = args.plot_bundle or cfg.get("PLOT_BUNDLE_PATH")
     if not bundle_path or not os.path.exists(bundle_path):
         raise FileNotFoundError(
             "Plot bundle not found. Run inference first so it can write the compressed plotting bundle."
@@ -264,7 +328,7 @@ def _dashboard_one(
     if mae_grid is None:
         raise RuntimeError(f"No {args.mae} MAE grid found in plot bundle {bundle_path}")
 
-    results = optollama.plotting.load_results(cfg["SAMPLES_PATH"])
+    results = load_sample_results(samples_path(cfg, args))
     target_spec = optollama.plotting.results_target_spectra(results)
 
     pred_tokens_grid = None
@@ -325,7 +389,7 @@ def nn_scatter_command(cfg: dict, args: argparse.Namespace) -> None:
     if not os.path.exists(nn_matches_path):
         raise FileNotFoundError(f"NN matches file not found: {nn_matches_path}")
 
-    results = optollama.plotting.load_results(cfg["SAMPLES_PATH"])
+    results = load_sample_results(samples_path(cfg, args))
     nn_matches = optollama.utils.load_as_json(nn_matches_path)
 
     fig = optollama.plotting.plot_model_vs_nn_scatter(

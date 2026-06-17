@@ -7,16 +7,26 @@ import html
 import re
 
 from pathlib import Path
+from typing import Any
 
 
-MIN_PATTERN = re.compile(r"min test MAE:\s*([0-9.]+)")
-LAST_PATTERN = re.compile(r"last test MAE:\s*([0-9.]+)")
+FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+MIN_PATTERN = re.compile(rf"min test MAE:\s*({FLOAT_RE})")
+LAST_PATTERN = re.compile(rf"last test MAE:\s*({FLOAT_RE})")
 VALIDATION_PATTERN = re.compile(
     r"\((?P<trigger>mid_epoch|epoch_end),\s*"
     r"epoch=(?P<epoch>\d+),\s*"
     r"epoch_samples=(?P<epoch_samples>\d+),\s*"
     r"total_samples=(?P<total_samples>\d+)\)"
 )
+CHECKPOINT_BEST_PATTERN = re.compile(
+    rf"Saved best checkpoint\s*->.*?\("
+    rf"(?P<metric>tmm_mae_mean|mae_mean|test_mae|score)\s*=\s*(?P<value>{FLOAT_RE}),\s*"
+    r"trigger=(?P<trigger>[^)]+)\)"
+)
+LAST_CHECKPOINT_PATTERN = re.compile(r"Saved last checkpoint\s*->")
+SAMPLE_TRIGGER_PATTERN = re.compile(r"sample_(?P<samples>\d+)")
+FILENAME_SAMPLES_PATTERN = re.compile(r"(?<!\d)(?P<count>\d+(?:\.\d+)?)M(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 COLORS = [
@@ -44,6 +54,15 @@ def parse_arguments() -> argparse.Namespace:
         help="Optional labels for the logs. Must match the number of log files.",
     )
     parser.add_argument("--title", default="Min and Last Test MAE by Epoch", help="Plot title.")
+    parser.add_argument(
+        "--samples-per-epoch",
+        type=float,
+        default=None,
+        help=(
+            "Override samples per epoch for checkpoint-only logs with trigger=sample_N. "
+            "If omitted, values like 20M are inferred from the log filename when possible."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -56,7 +75,66 @@ def _position_from_metadata(point: dict[str, float], samples_per_epoch: int | No
     return float(epoch)
 
 
-def parse_log(path: Path) -> tuple[list[float], list[float], list[float]]:
+def _infer_samples_per_epoch(path: Path) -> float | None:
+    match = FILENAME_SAMPLES_PATTERN.search(path.stem)
+    if not match:
+        return None
+    return float(match.group("count")) * 1_000_000.0
+
+
+def _position_from_trigger(trigger: str, epoch_index: int, samples_per_epoch: float | None, event_index: int) -> float:
+    if trigger == "epoch_end":
+        return float(epoch_index + 1)
+
+    sample_match = SAMPLE_TRIGGER_PATTERN.search(trigger)
+    if sample_match and samples_per_epoch and samples_per_epoch > 0:
+        progress = min(1.0, max(0.0, float(sample_match.group("samples")) / float(samples_per_epoch)))
+        return float(epoch_index) + progress
+
+    return float(event_index + 1)
+
+
+def parse_checkpoint_best_log(path: Path, text: str, samples_per_epoch: float | None) -> dict[str, Any] | None:
+    x_values: list[float] = []
+    values: list[float] = []
+    metric_name: str | None = None
+    epoch_index = 0
+
+    if samples_per_epoch is None:
+        samples_per_epoch = _infer_samples_per_epoch(path)
+
+    for line in text.splitlines():
+        best_match = CHECKPOINT_BEST_PATTERN.search(line)
+        if best_match:
+            metric_name = best_match.group("metric")
+            x_values.append(
+                _position_from_trigger(
+                    best_match.group("trigger"),
+                    epoch_index=epoch_index,
+                    samples_per_epoch=samples_per_epoch,
+                    event_index=len(x_values),
+                )
+            )
+            values.append(float(best_match.group("value")))
+            continue
+
+        if LAST_CHECKPOINT_PATTERN.search(line):
+            epoch_index += 1
+
+    if not values:
+        return None
+
+    return {
+        "x_values": x_values,
+        "min_values": values,
+        "last_values": None,
+        "primary_name": "best",
+        "secondary_name": None,
+        "metric_name": metric_name or "mae",
+    }
+
+
+def parse_log(path: Path, samples_per_epoch: float | None = None) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="replace")
     points: list[dict[str, float]] = []
     pending: dict[str, float] | None = None
@@ -98,17 +176,36 @@ def parse_log(path: Path) -> tuple[list[float], list[float], list[float]]:
         x_values = [_position_from_metadata(point, samples_per_epoch) for point in points]
         min_values = [point["min"] for point in points]
         last_values = [point["last"] for point in points]
-        return x_values, min_values, last_values
+        return {
+            "x_values": x_values,
+            "min_values": min_values,
+            "last_values": last_values,
+            "primary_name": "min",
+            "secondary_name": "last",
+            "metric_name": "test MAE",
+        }
 
     # Backward-compatible fallback for older logs that only printed the MAE
     # pairs once per epoch and did not include validation metadata.
     min_values = [float(match.group(1)) for match in MIN_PATTERN.finditer(text)]
     last_values = [float(match.group(1)) for match in LAST_PATTERN.finditer(text)]
     count = min(len(min_values), len(last_values))
-    if count == 0:
-        raise ValueError(f"No matching MAE pairs found in {path}")
-    x_values = [float(index) for index in range(1, count + 1)]
-    return x_values, min_values[:count], last_values[:count]
+    if count > 0:
+        x_values = [float(index) for index in range(1, count + 1)]
+        return {
+            "x_values": x_values,
+            "min_values": min_values[:count],
+            "last_values": last_values[:count],
+            "primary_name": "min",
+            "secondary_name": "last",
+            "metric_name": "test MAE",
+        }
+
+    checkpoint_run = parse_checkpoint_best_log(path, text, samples_per_epoch)
+    if checkpoint_run is not None:
+        return checkpoint_run
+
+    raise ValueError(f"No matching MAE/checkpoint metric values found in {path}")
 
 
 def line_path(x_values: list[float], values: list[float], x_scale, y_scale) -> str:
@@ -134,7 +231,11 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
     plot_height = height - margin["top"] - margin["bottom"]
     min_epoch = 0.0
     max_epoch = max(max(run["x_values"]) for run in runs)
-    values = [value for run in runs for value in run["min_values"] + run["last_values"]]
+    values = []
+    for run in runs:
+        values.extend(run["min_values"])
+        if run.get("last_values") is not None:
+            values.extend(run["last_values"])
     y_min_raw = min(values)
     y_max_raw = max(values)
     y_pad = (y_max_raw - y_min_raw) * 0.08 or 0.01
@@ -216,12 +317,16 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
             f'<path d="{line_path(run["x_values"], run["min_values"], x_scale, y_scale)}" fill="none" '
             f'stroke="{run["min_color"]}" stroke-width="2.5"/>'
         )
-        parts.append(
-            f'<path d="{line_path(run["x_values"], run["last_values"], x_scale, y_scale)}" fill="none" '
-            f'stroke="{run["last_color"]}" stroke-width="2.5" stroke-dasharray="7 5"/>'
-        )
+        if run.get("last_values") is not None:
+            parts.append(
+                f'<path d="{line_path(run["x_values"], run["last_values"], x_scale, y_scale)}" fill="none" '
+                f'stroke="{run["last_color"]}" stroke-width="2.5" stroke-dasharray="7 5"/>'
+            )
         epoch = run["x_values"][-1]
-        for key, color_key in (("min_values", "min_color"), ("last_values", "last_color")):
+        marker_series = [("min_values", "min_color")]
+        if run.get("last_values") is not None:
+            marker_series.append(("last_values", "last_color"))
+        for key, color_key in marker_series:
             value = run[key][-1]
             parts.append(
                 f'<circle cx="{x_scale(epoch):.2f}" cy="{y_scale(value):.2f}" r="3.5" '
@@ -236,10 +341,9 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
     )
     legend_y += 26
     for run in runs:
-        entries = [
-            (f'{run["label"]} min', run["min_color"], ""),
-            (f'{run["label"]} last', run["last_color"], ' stroke-dasharray="7 5"'),
-        ]
+        entries = [(f'{run["label"]} {run["primary_name"]}', run["min_color"], "")]
+        if run.get("last_values") is not None:
+            entries.append((f'{run["label"]} {run["secondary_name"]}', run["last_color"], ' stroke-dasharray="7 5"'))
         for name, color, dash in entries:
             parts.append(
                 f'<line x1="{legend_x}" x2="{legend_x + 34}" y1="{legend_y}" y2="{legend_y}" '
@@ -264,10 +368,13 @@ def render_svg(runs: list[dict], title: str, source_text: str) -> str:
             f'font-size="12" fill="#374151">{html.escape(run["label"])}: epoch {run["x_values"][-1]:.2f}</text>'
         )
         legend_y += 18
+        if run.get("last_values") is not None:
+            value_text = f'{run["primary_name"]} {run["min_values"][-1]:.6f} | {run["secondary_name"]} {run["last_values"][-1]:.6f}'
+        else:
+            value_text = f'{run["primary_name"]} {run["min_values"][-1]:.6f} ({run.get("metric_name", "mae")})'
         parts.append(
             f'<text x="{legend_x}" y="{legend_y}" font-family="Segoe UI, Arial, sans-serif" '
-            f'font-size="12" fill="#374151">min {run["min_values"][-1]:.6f} | '
-            f'last {run["last_values"][-1]:.6f}</text>'
+            f'font-size="12" fill="#374151">{html.escape(value_text)}</text>'
         )
         legend_y += 26
 
@@ -282,17 +389,17 @@ def main() -> None:
 
     runs = []
     for index, log_path in enumerate(args.logs):
-        x_values, min_values, last_values = parse_log(log_path)
+        parsed = parse_log(log_path, samples_per_epoch=args.samples_per_epoch)
         min_color, last_color = COLORS[index % len(COLORS)]
-        runs.append(
+        parsed.update(
             {
                 "label": args.labels[index] if args.labels else label_from_path(log_path),
-                "x_values": x_values,
-                "min_values": min_values,
-                "last_values": last_values,
                 "min_color": min_color,
                 "last_color": last_color,
             }
+        )
+        runs.append(
+            parsed
         )
 
     source_text = "Parsed from " + ", ".join(path.name for path in args.logs)
@@ -301,10 +408,13 @@ def main() -> None:
     args.output.write_text(svg, encoding="utf-8")
 
     for run in runs:
-        print(
+        summary = (
             f'{run["label"]}: points={len(run["x_values"])}, epoch={run["x_values"][-1]:.2f}, '
-            f'min={run["min_values"][-1]:.6f}, last={run["last_values"][-1]:.6f}'
+            f'{run["primary_name"]}={run["min_values"][-1]:.6f}'
         )
+        if run.get("last_values") is not None:
+            summary += f', {run["secondary_name"]}={run["last_values"][-1]:.6f}'
+        print(summary)
     print(f"Wrote {args.output}")
 
 

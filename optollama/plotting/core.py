@@ -146,11 +146,16 @@ def results_target_spectra(results: list[dict[str, Any]]) -> np.ndarray:
     Args
     ----
     results : list[dict[str, Any]]
-        Per-sample inference results containing ``"rat_target"``.
+        Per-sample inference results containing ``"rat_target"`` or
+        depth-field ``"target_spectra"``.
     """
-    spectra = [np.asarray(item["rat_target"], dtype=np.float32) for item in results if "rat_target" in item]
+    spectra = [
+        np.asarray(item["rat_target"] if "rat_target" in item else item["target_spectra"], dtype=np.float32)
+        for item in results
+        if "rat_target" in item or "target_spectra" in item
+    ]
     if not spectra:
-        raise ValueError("No 'rat_target' entries were found in the provided results.")
+        raise ValueError("No 'rat_target' or 'target_spectra' entries were found in the provided results.")
     return np.stack(spectra, axis=0)
 
 
