@@ -99,6 +99,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-tmm-device", type=str, default=None, help='TMM validation device. "auto" uses model device.')
     parser.add_argument("--eval-tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM validation chunk.")
+    parser.add_argument(
+        "--save-eval-samples",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save TMM validation sample JSONs. Defaults to DEPTH_FIELD.EVAL.SAVE_SAMPLES or true.",
+    )
+    parser.add_argument(
+        "--eval-samples-dir",
+        type=str,
+        default=None,
+        help="Directory for TMM validation sample JSONs. Defaults to <out-dir>/validation_samples.",
+    )
+    parser.add_argument(
+        "--eval-record-spectra",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Store target/predicted spectra in validation sample JSONs. Defaults to true.",
+    )
+    parser.add_argument(
+        "--eval-record-all-mc",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Store every MC validation candidate, not only the selected best. Defaults to false.",
+    )
     return parser.parse_args()
 
 
@@ -214,6 +238,10 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_default(args, "eval_remask_strategy", nested_get(block, "EVAL", "REMASK_STRATEGY", default="confidence"))
     set_arg_default(args, "eval_tmm_device", nested_get(block, "EVAL", "TMM_DEVICE", default="auto"))
     set_arg_default(args, "eval_tmm_batch_size", nested_get(block, "EVAL", "TMM_BATCH_SIZE", default=64))
+    set_arg_default(args, "save_eval_samples", nested_get(block, "EVAL", "SAVE_SAMPLES", default=True))
+    set_arg_default(args, "eval_samples_dir", nested_get(block, "EVAL", "SAMPLES_DIR"))
+    set_arg_default(args, "eval_record_spectra", nested_get(block, "EVAL", "RECORD_SPECTRA", default=True))
+    set_arg_default(args, "eval_record_all_mc", nested_get(block, "EVAL", "RECORD_ALL_MC", default=False))
 
 
 def autocast_context(enabled: bool):
@@ -500,6 +528,75 @@ def simulate_field_runs(
     return torch.cat(outputs, dim=0)
 
 
+def safe_trigger_name(trigger: str) -> str:
+    """Return a filesystem-safe validation trigger label."""
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(trigger))
+
+
+def stack_total_thickness_nm(tokens: list[str]) -> float:
+    total = 0.0
+    for token in tokens:
+        parts = optollama.data.layer_token_parts(token)
+        if parts is not None:
+            total += float(parts[1])
+    return total
+
+
+def gather_validation_records(local_records: list[dict]) -> list[dict]:
+    """Gather JSON-serializable validation records to rank 0."""
+    if not ddp_active():
+        return local_records
+    gathered: list[list[dict]] = [[] for _ in range(ddp_world_size())]
+    torch.distributed.all_gather_object(gathered, local_records)
+    if ddp_rank() != 0:
+        return []
+    records: list[dict] = []
+    for part in gathered:
+        records.extend(part)
+    return records
+
+
+def validation_candidate_record(
+    *,
+    flat_idx: int,
+    fields_cpu: torch.Tensor,
+    token_ids_cpu: torch.Tensor,
+    mae_values: torch.Tensor,
+    pred_spectra_cpu: torch.Tensor,
+    target_spectrum_cpu: torch.Tensor,
+    vocab: optollama.data.DepthFieldVocab,
+    idx_to_token: dict[int, str],
+    eos_idx: int,
+    pad_idx: int,
+    dz_nm: float,
+    record_spectra: bool,
+) -> dict:
+    tokens = optollama.data.token_stack_strings(
+        token_ids_cpu[flat_idx],
+        idx_to_token,
+        eos_idx=eos_idx,
+        pad_idx=pad_idx,
+    )
+    active_bins = int(optollama.data.depth_field_active_bins(fields_cpu[flat_idx], vocab.void_id).item())
+    field_runs = optollama.data.depth_field_runs(fields_cpu[flat_idx], vocab, dz_nm=dz_nm)
+    mae = float(mae_values[flat_idx].item())
+    record = {
+        "mae": mae,
+        "field_mae": mae,
+        "tokens": tokens,
+        "material_layers": int(len(tokens)),
+        "decoded_total_thickness_nm": float(stack_total_thickness_nm(tokens)),
+        "field_active_thickness_nm": float(active_bins * dz_nm),
+        "field_material_runs": int(len(field_runs)),
+        "field_total_thickness_nm": float(sum(float(run["thickness_nm"]) for run in field_runs)),
+        "field_runs": field_runs,
+    }
+    if record_spectra:
+        record["target_spectra"] = target_spectrum_cpu.detach().cpu().tolist()
+        record["pred_spectra"] = pred_spectra_cpu[flat_idx].detach().cpu().tolist()
+    return record
+
+
 @torch.no_grad()
 def run_tmm_evaluation(
     *,
@@ -516,6 +613,8 @@ def run_tmm_evaluation(
     msk_idx: int,
     epoch: int,
     epochs: int,
+    trigger: str,
+    save_samples_path: Path | None,
 ) -> dict:
     """Run all-mask depth-field sampling and score native material runs by TMM MAE."""
     model.eval()
@@ -531,14 +630,22 @@ def run_tmm_evaluation(
     best_thickness: list[torch.Tensor] = []
     target_overlimit = 0
     samples_seen = 0
+    validation_records: list[dict] = []
     material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     show_progress = ddp_rank() == 0
+    save_samples = save_samples_path is not None
     pbar = tqdm.tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs} tmm", leave=True, disable=not show_progress)
 
     for batch in pbar:
         spectra_cpu, stacks_cpu = batch[0], batch[1]
         batch_size = int(spectra_cpu.size(0))
+        batch_start = samples_seen
         samples_seen += batch_size
+        indices_cpu = (
+            batch[2].detach().cpu()
+            if len(batch) > 2 and torch.is_tensor(batch[2])
+            else torch.arange(batch_start, batch_start + batch_size, dtype=torch.long)
+        )
         target_thickness = optollama.data.token_stack_total_thickness_nm(
             stacks_cpu,
             idx_to_token,
@@ -584,6 +691,68 @@ def run_tmm_evaluation(
         mae_values.append(best_mae)
         best_layers.append(run_layers)
         best_thickness.append(run_thickness)
+
+        if save_samples:
+            output_seq_len = int(args.output_seq_len or cfg["MAX_SEQ_LEN"])
+            token_ids_cpu = optollama.data.decode_depth_field_to_tokens(
+                fields_cpu,
+                vocab,
+                output_seq_len=output_seq_len,
+                dz_nm=float(args.dz_nm),
+                eos_idx=eos_idx,
+                pad_idx=pad_idx,
+            )
+            pred_spectra_cpu = pred_spectra.detach().cpu()
+            mae_flat = mae.reshape(-1)
+            for row_idx in range(batch_size):
+                selected_flat = int(flat_idx[row_idx].item())
+                record = {
+                    "dataset_index": int(indices_cpu[row_idx].item()),
+                    "best_mc": int(best_idx[row_idx].item()),
+                    "mc_samples": int(mc_samples),
+                    "target_tokens": optollama.data.token_stack_strings(
+                        stacks_cpu[row_idx],
+                        idx_to_token,
+                        eos_idx=eos_idx,
+                        pad_idx=pad_idx,
+                    ),
+                    "target_total_thickness_nm": float(target_thickness[row_idx].item()),
+                }
+                record.update(
+                    validation_candidate_record(
+                        flat_idx=selected_flat,
+                        fields_cpu=fields_cpu,
+                        token_ids_cpu=token_ids_cpu,
+                        mae_values=mae_flat,
+                        pred_spectra_cpu=pred_spectra_cpu,
+                        target_spectrum_cpu=spectra_cpu[row_idx],
+                        vocab=vocab,
+                        idx_to_token=idx_to_token,
+                        eos_idx=eos_idx,
+                        pad_idx=pad_idx,
+                        dz_nm=float(args.dz_nm),
+                        record_spectra=bool(args.eval_record_spectra),
+                    )
+                )
+                if bool(args.eval_record_all_mc):
+                    record["all_mc"] = [
+                        validation_candidate_record(
+                            flat_idx=row_idx * mc_samples + candidate_idx,
+                            fields_cpu=fields_cpu,
+                            token_ids_cpu=token_ids_cpu,
+                            mae_values=mae_flat,
+                            pred_spectra_cpu=pred_spectra_cpu,
+                            target_spectrum_cpu=spectra_cpu[row_idx],
+                            vocab=vocab,
+                            idx_to_token=idx_to_token,
+                            eos_idx=eos_idx,
+                            pad_idx=pad_idx,
+                            dz_nm=float(args.dz_nm),
+                            record_spectra=bool(args.eval_record_spectra),
+                        )
+                        for candidate_idx in range(mc_samples)
+                    ]
+                validation_records.append(record)
         if show_progress:
             all_mae = torch.cat(mae_values)
             pbar.set_postfix(
@@ -611,7 +780,7 @@ def run_tmm_evaluation(
     if all_mae.numel() == 0:
         raise RuntimeError("TMM validation produced no samples.")
 
-    return {
+    metrics = {
         "score": float(all_mae.mean().item()),
         "score_name": "tmm_mae_mean",
         "mae_mean": float(all_mae.mean().item()),
@@ -628,6 +797,38 @@ def run_tmm_evaluation(
         "remask_strategy": str(args.eval_remask_strategy),
         "tmm_batch_size": int(args.eval_tmm_batch_size),
     }
+    if save_samples:
+        all_records = gather_validation_records(validation_records)
+        if ddp_rank() == 0 and save_samples_path is not None:
+            all_records.sort(key=lambda item: int(item.get("dataset_index", 0)))
+            os.makedirs(save_samples_path.parent, exist_ok=True)
+            payload = {
+                "summary": {
+                    "config": str(args.config),
+                    "epoch": int(epoch),
+                    "epoch_1based": int(epoch + 1),
+                    "trigger": str(trigger),
+                    "samples": int(len(all_records)),
+                    "mc_samples": int(mc_samples),
+                    "score_mode": "field",
+                    "rank_by": "field",
+                    "remask_strategy": str(args.eval_remask_strategy),
+                    "record_spectra": bool(args.eval_record_spectra),
+                    "record_all_mc": bool(args.eval_record_all_mc),
+                    "depth_field": {
+                        "dz_nm": float(args.dz_nm),
+                        "max_thickness_nm": float(args.max_thickness_nm),
+                        "depth_bins": optollama.data.depth_bins_for(args.max_thickness_nm, args.dz_nm),
+                        "classes": list(vocab.material_names),
+                    },
+                    "metrics": metrics,
+                },
+                "results": all_records,
+            }
+            optollama.utils.save_as_json(str(save_samples_path), payload)
+            metrics["samples_path"] = str(save_samples_path)
+            metrics["samples_saved"] = int(len(all_records))
+    return metrics
 
 
 def run_epoch(
@@ -852,6 +1053,10 @@ def make_checkpoint_extra(
             "eval_deterministic": bool(args.eval_deterministic),
             "eval_remask_strategy": str(args.eval_remask_strategy),
             "eval_tmm_batch_size": int(args.eval_tmm_batch_size),
+            "save_eval_samples": bool(args.save_eval_samples),
+            "eval_samples_dir": args.eval_samples_dir,
+            "eval_record_spectra": bool(args.eval_record_spectra),
+            "eval_record_all_mc": bool(args.eval_record_all_mc),
         },
         "model_config": model_config.to_dict(),
         "config_path": str(args.config),
@@ -955,6 +1160,7 @@ def main() -> None:
     best_path = out_dir / "depth-field-best.pt"
     last_path = out_dir / "depth-field-last.pt"
     history_path = out_dir / "depth-field-history.json"
+    eval_samples_dir = Path(args.eval_samples_dir) if args.eval_samples_dir else out_dir / "validation_samples"
     primary_score_name = score_name_for_eval_mode(eval_mode)
     comparable_scores = [score for item in history if (score := comparable_record_score(item, primary_score_name)) is not None]
     best_score = min(comparable_scores, default=float("inf"))
@@ -994,6 +1200,11 @@ def main() -> None:
         if eval_mode in {"tmm", "both"}:
             if tmm_ctx is None:
                 raise RuntimeError("TMM validation requested but TMM context was not initialized.")
+            sample_path = (
+                eval_samples_dir / f"epoch_{epoch + 1:04d}_{safe_trigger_name(trigger)}.json"
+                if bool(args.save_eval_samples)
+                else None
+            )
             tmm_metrics = run_tmm_evaluation(
                 model=model,
                 loader=val_loader,
@@ -1008,6 +1219,8 @@ def main() -> None:
                 msk_idx=msk_idx,
                 epoch=epoch,
                 epochs=epochs,
+                trigger=trigger,
+                save_samples_path=sample_path,
             )
 
         if eval_mode == "denoise":
@@ -1053,6 +1266,11 @@ def main() -> None:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")
         if val_loader is not None:
             print(f"Validation mode: {eval_mode}.")
+            if eval_mode in {"tmm", "both"}:
+                if bool(args.save_eval_samples):
+                    print(f"TMM validation samples will be saved to {eval_samples_dir}.")
+                else:
+                    print("TMM validation sample saving disabled.")
 
     for epoch in range(start_epoch, epochs):
         mid_validation_callback = None
