@@ -90,6 +90,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-temperature", type=float, default=None, help="TMM validation sampling temperature.")
     parser.add_argument("--eval-top-k", type=int, default=None, help="TMM validation top-k material sampling filter.")
     parser.add_argument("--eval-deterministic", action=argparse.BooleanOptionalAction, default=None, help="Use argmax sampling for TMM validation.")
+    parser.add_argument(
+        "--eval-remask-strategy",
+        type=str,
+        default=None,
+        choices=["confidence", "random"],
+        help="TMM validation remasking strategy: confidence reopens least-confident bins, random uses Bernoulli remasking.",
+    )
     parser.add_argument("--eval-tmm-device", type=str, default=None, help='TMM validation device. "auto" uses model device.')
     parser.add_argument("--eval-tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM validation chunk.")
     return parser.parse_args()
@@ -204,6 +211,7 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_default(args, "eval_temperature", nested_get(block, "EVAL", "TEMPERATURE", default=1.0))
     set_arg_default(args, "eval_top_k", nested_get(block, "EVAL", "TOP_K", default=0))
     set_arg_default(args, "eval_deterministic", nested_get(block, "EVAL", "DETERMINISTIC", default=False))
+    set_arg_default(args, "eval_remask_strategy", nested_get(block, "EVAL", "REMASK_STRATEGY", default="confidence"))
     set_arg_default(args, "eval_tmm_device", nested_get(block, "EVAL", "TMM_DEVICE", default="auto"))
     set_arg_default(args, "eval_tmm_batch_size", nested_get(block, "EVAL", "TMM_BATCH_SIZE", default=64))
 
@@ -548,6 +556,7 @@ def run_tmm_evaluation(
             temperature=float(args.eval_temperature),
             top_k=int(args.eval_top_k),
             deterministic=bool(args.eval_deterministic or args.eval_temperature <= 0.0),
+            remask_strategy=str(args.eval_remask_strategy),
         )
         fields_cpu = fields.detach().cpu()
         pred_spectra = simulate_field_runs(
@@ -616,6 +625,7 @@ def run_tmm_evaluation(
         "samples_seen": int(target_totals[1].item()),
         "mc_samples": int(mc_samples),
         "sampling_steps": int(args.eval_sampling_steps or sample_model.timesteps),
+        "remask_strategy": str(args.eval_remask_strategy),
         "tmm_batch_size": int(args.eval_tmm_batch_size),
     }
 
@@ -840,6 +850,7 @@ def make_checkpoint_extra(
             "eval_temperature": float(args.eval_temperature),
             "eval_top_k": int(args.eval_top_k),
             "eval_deterministic": bool(args.eval_deterministic),
+            "eval_remask_strategy": str(args.eval_remask_strategy),
             "eval_tmm_batch_size": int(args.eval_tmm_batch_size),
         },
         "model_config": model_config.to_dict(),
@@ -1036,7 +1047,7 @@ def main() -> None:
             "Depth-field diffusion: "
             f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
-            f"ddp={ddp}, world={world_size}"
+            f"ddp={ddp}, world={world_size}, eval_remask={args.eval_remask_strategy}"
         )
         if validate_every_samples > 0:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")

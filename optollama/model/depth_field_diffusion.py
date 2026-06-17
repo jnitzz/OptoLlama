@@ -287,6 +287,21 @@ class DepthFieldDiffusion(nn.Module):
         sampled = torch.multinomial(flat, num_samples=1, generator=generator).view(logits.shape[:2])
         return sampled, probs.max(dim=-1).values
 
+    @staticmethod
+    def _normalize_remask_strategy(remask_strategy: str) -> str:
+        strategy = str(remask_strategy or "confidence").lower().replace("-", "_")
+        aliases = {
+            "confidence": "confidence",
+            "low_confidence": "confidence",
+            "least_confidence": "confidence",
+            "uncertain": "confidence",
+            "random": "random",
+            "bernoulli": "random",
+        }
+        if strategy not in aliases:
+            raise ValueError(f"Unknown remask_strategy={remask_strategy!r}; expected 'confidence' or 'random'.")
+        return aliases[strategy]
+
     @torch.no_grad()
     def sample(
         self,
@@ -296,18 +311,21 @@ class DepthFieldDiffusion(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         deterministic: bool = False,
+        remask_strategy: str = "confidence",
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """
         Sample clean material fields from all-mask initialization.
 
-        At each stage the model predicts a full clean field, then the least
-        confident bins are re-masked according to the next timestep's noise
-        level. This leaves room for large corrections during denoising.
+        At each stage the model predicts a full clean field, then bins are
+        re-masked according to the next timestep's noise level. Confidence
+        remasking reopens the least confident bins; random remasking uses the
+        original OptoLlama-style Bernoulli remask process.
         """
         self.eval()
         batch_size = int(spectra.size(0))
         device = spectra.device
+        remask_strategy = self._normalize_remask_strategy(remask_strategy)
         fields = torch.full((batch_size, self.depth_bins), int(self.mask_id), dtype=torch.long, device=device)
 
         total_steps = int(steps or self.timesteps)
@@ -337,8 +355,12 @@ class DepthFieldDiffusion(nn.Module):
             mask_count = int(round(mask_fraction * float(self.depth_bins)))
             fields = pred
             if mask_count > 0:
-                mask_count = min(mask_count, self.depth_bins)
-                low_confidence = torch.topk(confidence, k=mask_count, dim=1, largest=False).indices
-                fields.scatter_(1, low_confidence, int(self.mask_id))
+                if remask_strategy == "random":
+                    remask = torch.rand(pred.shape, device=device, generator=generator) < mask_fraction
+                    fields = torch.where(remask, torch.full_like(fields, int(self.mask_id)), fields)
+                else:
+                    mask_count = min(mask_count, self.depth_bins)
+                    low_confidence = torch.topk(confidence, k=mask_count, dim=1, largest=False).indices
+                    fields.scatter_(1, low_confidence, int(self.mask_id))
 
         return fields

@@ -36,6 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature. <=0 uses argmax.")
     parser.add_argument("--top-k", type=int, default=0, help="Top-k material sampling filter. 0 disables.")
     parser.add_argument("--deterministic", action="store_true", help="Use argmax instead of sampling.")
+    parser.add_argument(
+        "--remask-strategy",
+        type=str,
+        default="confidence",
+        choices=["confidence", "random"],
+        help="Denoising remask strategy: confidence reopens least-confident bins, random uses Bernoulli remasking.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed. Defaults to config SEED.")
 
     parser.add_argument("--tmm-batch-size", type=int, default=64, help="Decoded stacks per TMM chunk.")
@@ -315,6 +322,7 @@ def main() -> None:
         "Depth-field inference: "
         f"split={args.split}, mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
         f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
+        f"remask={args.remask_strategy}, "
         f"model_device={device}, tmm_device={tmm_device}"
     )
 
@@ -330,6 +338,7 @@ def main() -> None:
             temperature=float(args.temperature),
             top_k=int(args.top_k),
             deterministic=bool(args.deterministic or args.temperature <= 0.0),
+            remask_strategy=str(args.remask_strategy),
         )
         fields_cpu = fields.detach().cpu()
         token_ids_cpu = optollama.data.decode_depth_field_to_tokens(
@@ -450,6 +459,7 @@ def main() -> None:
         "mc_samples": mc_samples,
         "score_mode": score_mode,
         "rank_by": rank_by,
+        "remask_strategy": str(args.remask_strategy),
         "mae_mean": float(torch.tensor(mae_all).mean().item()) if mae_all else None,
         "mae_median": float(torch.tensor(mae_all).median().item()) if mae_all else None,
         "mae_min": float(min(mae_all)) if mae_all else None,
