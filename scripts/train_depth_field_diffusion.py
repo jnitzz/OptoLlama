@@ -208,6 +208,49 @@ def set_arg_default(args: argparse.Namespace, name: str, value: Any) -> None:
         setattr(args, name, value)
 
 
+def resume_value_to_path(value: Any, default_path: Path) -> tuple[Path | None, bool]:
+    if value is None:
+        return None, False
+    if isinstance(value, bool):
+        return (default_path, False) if value else (None, False)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"0", "false", "no", "none", "null", "off"}:
+            return None, False
+        if text.lower() in {"1", "true", "yes", "on"}:
+            return default_path, False
+        return Path(text), True
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return None, False
+        if value == 1:
+            return default_path, False
+    if isinstance(value, os.PathLike):
+        return Path(value), True
+    raise TypeError(f"Unsupported depth-field resume value {value!r} ({type(value).__name__}).")
+
+
+def resolve_resume_checkpoint(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    default_path: Path,
+) -> tuple[Path | None, str | None, bool]:
+    if args.resume:
+        return Path(args.resume), "--resume", True
+
+    block = depth_field_block(cfg)
+    candidates = (
+        ("DEPTH_FIELD.RESUME_PATH", nested_get(block, "RESUME_PATH")),
+        ("DEPTH_FIELD.RESUME", nested_get(block, "RESUME")),
+        ("CHECKPOINT.RESUME", cfg.get("RESUME_CHECKPOINT")),
+    )
+    for source, value in candidates:
+        path, required = resume_value_to_path(value, default_path)
+        if path is not None:
+            return path, source, required
+    return None, None, False
+
+
 def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     block = depth_field_block(cfg)
     set_arg_default(args, "out_dir", block.get("OUT_DIR", "data/checkpoints/depth_field_10um"))
@@ -1142,15 +1185,6 @@ def main() -> None:
         weight_decay=float(args.weight_decay),
     )
 
-    start_epoch = 0
-    history: list[dict] = []
-    if args.resume:
-        start_epoch_loaded, blob = optollama.utils.load_checkpoint(args.resume, model, optimizer=optimizer, map_location="cpu")
-        start_epoch = int(start_epoch_loaded or 0)
-        history = list(((blob.get("extra") or {}).get("history") or []))
-        if rank == 0:
-            print(f"Resumed depth-field checkpoint {args.resume} at epoch {start_epoch}.")
-
     epochs = int(args.epochs if args.epochs is not None else cfg.get("EPOCHS", 20))
     out_dir = Path(args.out_dir)
     if rank == 0:
@@ -1161,6 +1195,22 @@ def main() -> None:
     last_path = out_dir / "depth-field-last.pt"
     history_path = out_dir / "depth-field-history.json"
     eval_samples_dir = Path(args.eval_samples_dir) if args.eval_samples_dir else out_dir / "validation_samples"
+
+    start_epoch = 0
+    history: list[dict] = []
+    resume_path, resume_source, resume_required = resolve_resume_checkpoint(cfg, args, last_path)
+    if resume_path is not None:
+        if resume_path.exists():
+            start_epoch_loaded, blob = optollama.utils.load_checkpoint(str(resume_path), model, optimizer=optimizer, map_location="cpu")
+            start_epoch = int(start_epoch_loaded or 0)
+            history = list(((blob.get("extra") or {}).get("history") or []))
+            if rank == 0:
+                print(f"Resumed depth-field checkpoint {resume_path} at epoch {start_epoch} ({resume_source}).")
+        elif resume_required:
+            raise FileNotFoundError(f"{resume_source} checkpoint does not exist: {resume_path}")
+        elif rank == 0:
+            print(f"Depth-field resume is enabled via {resume_source}, but {resume_path} does not exist; starting fresh.")
+
     primary_score_name = score_name_for_eval_mode(eval_mode)
     comparable_scores = [score for item in history if (score := comparable_record_score(item, primary_score_name)) is not None]
     best_score = min(comparable_scores, default=float("inf"))
