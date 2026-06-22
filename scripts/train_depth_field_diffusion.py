@@ -55,6 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
     parser.add_argument("--n-blocks", type=int, default=None, help="Number of dilated Conv1d residual blocks.")
     parser.add_argument("--kernel-size", type=int, default=None, help="Conv1d kernel size.")
+    parser.add_argument(
+        "--conv-type",
+        type=str,
+        default=None,
+        choices=["full", "standard", "conv", "separable", "depthwise", "depthwise_separable", "depthwise-separable"],
+        help="Depth-field residual convolution type. 'separable' uses depthwise + pointwise Conv1d.",
+    )
     parser.add_argument("--dropout", type=float, default=None, help="Dropout inside residual blocks.")
     parser.add_argument("--diffusion-steps", type=int, default=None, help="Discrete depth-field diffusion timesteps.")
 
@@ -261,6 +268,7 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_default(args, "d_model", nested_get(block, "MODEL", "D_MODEL", default=192))
     set_arg_default(args, "n_blocks", nested_get(block, "MODEL", "N_BLOCKS", default=12))
     set_arg_default(args, "kernel_size", nested_get(block, "MODEL", "KERNEL_SIZE", default=7))
+    set_arg_default(args, "conv_type", nested_get(block, "MODEL", "CONV_TYPE", default="full"))
     set_arg_default(args, "dropout", nested_get(block, "MODEL", "DROPOUT", default=0.0))
     set_arg_default(args, "diffusion_steps", nested_get(block, "MODEL", "DIFFUSION_STEPS", default=100))
 
@@ -1169,6 +1177,7 @@ def main() -> None:
         d_model=int(args.d_model),
         n_blocks=int(args.n_blocks),
         kernel_size=int(args.kernel_size),
+        conv_type=str(args.conv_type),
         timesteps=int(args.diffusion_steps),
         dropout=float(args.dropout),
     )
@@ -1310,7 +1319,7 @@ def main() -> None:
             "Depth-field diffusion: "
             f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
-            f"ddp={ddp}, world={world_size}, eval_remask={args.eval_remask_strategy}"
+            f"ddp={ddp}, world={world_size}, conv={model_config.conv_type}, eval_remask={args.eval_remask_strategy}"
         )
         if validate_every_samples > 0:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")

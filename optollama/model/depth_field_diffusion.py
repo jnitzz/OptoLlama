@@ -38,19 +38,61 @@ class SinusoidalTimeEmbedding(nn.Module):
         return emb[:, : self.dim]
 
 
+class DepthwiseSeparableConv1d(nn.Module):
+    """Depthwise local filtering followed by pointwise channel mixing."""
+
+    def __init__(self, channels: int, *, kernel_size: int, padding: int, dilation: int) -> None:
+        super().__init__()
+        self.depthwise = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=channels,
+        )
+        self.pointwise = nn.Conv1d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply depthwise-separable convolution."""
+        return self.pointwise(self.depthwise(x))
+
+
+def _normalize_conv_type(conv_type: str | None) -> str:
+    value = str(conv_type or "full").lower().replace("-", "_")
+    aliases = {
+        "full": "full",
+        "standard": "full",
+        "conv": "full",
+        "separable": "separable",
+        "depthwise": "separable",
+        "depthwise_separable": "separable",
+    }
+    if value not in aliases:
+        raise ValueError(f"Unknown depth-field conv_type={conv_type!r}; expected 'full' or 'separable'.")
+    return aliases[value]
+
+
+def _make_depth_conv(channels: int, *, kernel_size: int, padding: int, dilation: int, conv_type: str) -> nn.Module:
+    if _normalize_conv_type(conv_type) == "separable":
+        return DepthwiseSeparableConv1d(channels, kernel_size=kernel_size, padding=padding, dilation=dilation)
+    return nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation)
+
+
 class DepthFieldBlock(nn.Module):
     """Denoising residual block for a depth-field sequence."""
 
-    def __init__(self, channels: int, *, kernel_size: int, dilation: int, dropout: float) -> None:
+    def __init__(self, channels: int, *, kernel_size: int, dilation: int, dropout: float, conv_type: str = "full") -> None:
         super().__init__()
         padding = int(dilation) * (int(kernel_size) // 2)
         groups = _group_count(channels)
+        conv_type = _normalize_conv_type(conv_type)
         self.norm1 = nn.GroupNorm(groups, channels)
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation)
+        self.conv1 = _make_depth_conv(channels, kernel_size=kernel_size, padding=padding, dilation=dilation, conv_type=conv_type)
         self.cond_proj = nn.Linear(channels, channels)
         self.norm2 = nn.GroupNorm(groups, channels)
         self.dropout = nn.Dropout(float(dropout))
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation)
+        self.conv2 = _make_depth_conv(channels, kernel_size=kernel_size, padding=padding, dilation=dilation, conv_type=conv_type)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """Apply one conditioned residual denoising block."""
@@ -72,6 +114,10 @@ class DepthFieldModelConfig:
     kernel_size: int = 7
     timesteps: int = 100
     dropout: float = 0.0
+    conv_type: str = "full"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "conv_type", _normalize_conv_type(self.conv_type))
 
     def to_dict(self) -> dict:
         """Return a JSON/checkpoint friendly constructor mapping."""
@@ -84,6 +130,7 @@ class DepthFieldModelConfig:
             "kernel_size": int(self.kernel_size),
             "timesteps": int(self.timesteps),
             "dropout": float(self.dropout),
+            "conv_type": _normalize_conv_type(self.conv_type),
         }
 
     @staticmethod
@@ -98,6 +145,7 @@ class DepthFieldModelConfig:
             kernel_size=int(data.get("kernel_size", 7)),
             timesteps=int(data.get("timesteps", 100)),
             dropout=float(data.get("dropout", 0.0)),
+            conv_type=_normalize_conv_type(data.get("conv_type", "full")),
         )
 
 
@@ -118,6 +166,7 @@ class DepthFieldDiffusion(nn.Module):
         self.d_model = int(config.d_model)
         self.timesteps = int(config.timesteps)
         self.mask_id = self.num_materials
+        self.conv_type = _normalize_conv_type(config.conv_type)
 
         spectrum_dim = int(math.prod(self.spectrum_shape))
         self.spectrum_encoder = nn.Sequential(
@@ -144,6 +193,7 @@ class DepthFieldDiffusion(nn.Module):
                     kernel_size=int(config.kernel_size),
                     dilation=dilation_cycle[idx % len(dilation_cycle)],
                     dropout=float(config.dropout),
+                    conv_type=self.conv_type,
                 )
                 for idx in range(int(config.n_blocks))
             ]
