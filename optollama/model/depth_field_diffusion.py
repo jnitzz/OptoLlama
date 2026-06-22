@@ -79,6 +79,20 @@ def _make_depth_conv(channels: int, *, kernel_size: int, padding: int, dilation:
     return nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation)
 
 
+def _match_depth_length(x: torch.Tensor, target_length: int) -> torch.Tensor:
+    current_length = int(x.size(-1))
+    target_length = int(target_length)
+    if current_length == target_length:
+        return x
+    if current_length > target_length:
+        offset = (current_length - target_length) // 2
+        return x[..., offset : offset + target_length]
+    missing = target_length - current_length
+    left = missing // 2
+    right = missing - left
+    return functional.pad(x, (left, right))
+
+
 class DepthFieldBlock(nn.Module):
     """Denoising residual block for a depth-field sequence."""
 
@@ -96,9 +110,12 @@ class DepthFieldBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """Apply one conditioned residual denoising block."""
+        target_length = int(x.size(-1))
         h = self.conv1(functional.silu(self.norm1(x)))
+        h = _match_depth_length(h, target_length)
         h = h + self.cond_proj(cond).unsqueeze(-1)
         h = self.conv2(self.dropout(functional.silu(self.norm2(h))))
+        h = _match_depth_length(h, target_length)
         return x + h
 
 
