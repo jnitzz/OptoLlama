@@ -22,50 +22,65 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sample and TMM-score the experimental depth-field diffusion model.")
     parser.add_argument("--config", type=str, default="configs/optollama.yaml", help="Project config YAML.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Depth-field .pt checkpoint.")
-    parser.add_argument("--out-json", type=str, default="data/output_depth_field_10um/samples.json", help="Output JSON.")
+    parser.add_argument(
+        "--out-json",
+        type=str,
+        default=None,
+        help="Output JSON. Required unless config SAMPLES_PATH is set.",
+    )
     parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="Dataset split to score.")
     parser.add_argument("--target", type=str, default=None, help="Optional target spectrum CSV/JSON. Defaults to config TARGET when set.")
-    parser.add_argument("--target-samples", type=int, default=None, help="Repeated target spectra to evaluate. Defaults to config N_TARGETS.")
-    parser.add_argument("--max-samples", type=int, default=256, help="Maximum target spectra to process.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Target spectra per model batch.")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument("--target-samples", type=int, default=None, help="Repeated target spectra to evaluate. Required unless config N_TARGETS is set.")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum split spectra to process. Required unless config NUM_SAMPLES_TEST is set.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Target spectra per model batch. Required unless config TEST_BATCH_SIZE is set.")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader workers. Required unless config NUM_WORKERS is set.")
     parser.add_argument("--sharded-loading", action="store_true", help="Force streaming shard loading.")
     parser.add_argument("--eager-loading", action="store_true", help="Force eager in-memory loading.")
     parser.add_argument("--device", type=str, default=None, help='Model device, e.g. "cuda", "cuda:0", or "cpu".')
-    parser.add_argument("--tmm-device", type=str, default="auto", help='TMM device. "auto" uses model device.')
+    parser.add_argument("--tmm-device", type=str, default=None, help='TMM device. "auto" uses model device.')
 
-    parser.add_argument("--mc-samples", type=int, default=4, help="Candidate fields per target spectrum.")
-    parser.add_argument("--sampling-steps", type=int, default=None, help="Denoising steps. Defaults to checkpoint timesteps.")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature. <=0 uses argmax.")
-    parser.add_argument("--top-k", type=int, default=0, help="Top-k material sampling filter. 0 disables.")
-    parser.add_argument("--deterministic", action="store_true", help="Use argmax instead of sampling.")
+    parser.add_argument("--mc-samples", type=int, default=None, help="Candidate fields per target spectrum.")
+    parser.add_argument("--sampling-steps", type=int, default=None, help="Denoising steps. Required unless DEPTH_FIELD.EVAL.SAMPLING_STEPS is set.")
+    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature. <=0 uses argmax.")
+    parser.add_argument("--top-k", type=int, default=None, help="Top-k material sampling filter. 0 disables.")
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=None, help="Use argmax instead of sampling.")
     parser.add_argument(
         "--remask-strategy",
         type=str,
-        default="confidence",
+        default=None,
         choices=["confidence", "random"],
         help="Denoising remask strategy: confidence reopens least-confident bins, random uses Bernoulli remasking.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Sampling seed. Defaults to config SEED.")
+    parser.add_argument("--seed", type=int, default=None, help="Sampling seed. Required unless config SEED is set.")
 
-    parser.add_argument("--tmm-batch-size", type=int, default=64, help="Decoded stacks per TMM chunk.")
+    parser.add_argument("--tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM chunk.")
     parser.add_argument(
         "--score-mode",
         type=str,
-        default="field",
+        default=None,
         choices=["field", "decoded", "both"],
         help="Score native depth-field material runs, decoded token stacks, or both.",
     )
     parser.add_argument(
         "--rank-by",
         type=str,
-        default="auto",
+        default=None,
         choices=["auto", "field", "decoded"],
         help="Candidate MAE used for MC ranking. Auto uses field for both/field mode and decoded for decoded mode.",
     )
-    parser.add_argument("--record-spectra", action="store_true", help="Store target and predicted spectra arrays.")
-    parser.add_argument("--record-all-mc", action="store_true", help="Store every MC candidate, not only the best one.")
-    parser.add_argument("--plot-bundle", type=str, default=None, help="Optional dashboard .npz path. Defaults to config PLOT_BUNDLE_PATH.")
+    parser.add_argument(
+        "--record-spectra",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Store target and predicted spectra arrays.",
+    )
+    parser.add_argument(
+        "--record-all-mc",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Store every MC candidate, not only the best one.",
+    )
+    parser.add_argument("--plot-bundle", type=str, default=None, help="Dashboard .npz path when recording all MC. Required unless config PLOT_BUNDLE_PATH is set.")
     parser.add_argument("--no-plot-bundle", action="store_true", help="Do not save the dashboard plot bundle.")
     return parser.parse_args()
 
@@ -93,6 +108,89 @@ def resolve_tmm_device(tmm_arg: str, default_device: torch.device) -> torch.devi
     return device
 
 
+def resolve_out_json(cfg: dict[str, Any], out_json_arg: str | None) -> str:
+    if out_json_arg:
+        return str(out_json_arg)
+    return str(cfg_required(cfg, "SAMPLES_PATH", "--out-json"))
+
+
+def depth_field_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    block = cfg.get("DEPTH_FIELD") or {}
+    return block if isinstance(block, dict) else {}
+
+
+def nested_get(block: dict[str, Any], *path: str, default: Any = None) -> Any:
+    value: Any = block
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return default
+        value = value[key]
+    return value
+
+
+MISSING = object()
+
+
+def nested_required(block: dict[str, Any], *path: str) -> Any:
+    value: Any = block
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return MISSING
+        value = value[key]
+    return value
+
+
+def set_arg_config_required(args: argparse.Namespace, name: str, value: Any, source: str) -> None:
+    if getattr(args, name) is not None:
+        return
+    if value is MISSING or value is None:
+        flag = f"--{name.replace('_', '-')}"
+        raise ValueError(f"Missing required setting {source}. Set it in the config or pass {flag}.")
+    setattr(args, name, value)
+
+
+def cfg_required(cfg: dict[str, Any], key: str, flag: str | None = None) -> Any:
+    if key in cfg and cfg[key] is not None:
+        return cfg[key]
+    suffix = f" or pass {flag}" if flag else ""
+    raise ValueError(f"Missing required setting {key}. Set it in the config{suffix}.")
+
+
+def apply_depth_field_eval_defaults(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    block = depth_field_block(cfg)
+    set_arg_config_required(args, "mc_samples", nested_required(block, "EVAL", "MC_SAMPLES"), "DEPTH_FIELD.EVAL.MC_SAMPLES")
+    set_arg_config_required(args, "sampling_steps", nested_required(block, "EVAL", "SAMPLING_STEPS"), "DEPTH_FIELD.EVAL.SAMPLING_STEPS")
+    set_arg_config_required(args, "temperature", nested_required(block, "EVAL", "TEMPERATURE"), "DEPTH_FIELD.EVAL.TEMPERATURE")
+    set_arg_config_required(args, "top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
+    set_arg_config_required(args, "deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
+    set_arg_config_required(args, "remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
+    set_arg_config_required(args, "tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
+    set_arg_config_required(args, "tmm_batch_size", nested_required(block, "EVAL", "TMM_BATCH_SIZE"), "DEPTH_FIELD.EVAL.TMM_BATCH_SIZE")
+    set_arg_config_required(args, "score_mode", nested_required(block, "EVAL", "SCORE_MODE"), "DEPTH_FIELD.EVAL.SCORE_MODE")
+    set_arg_config_required(args, "rank_by", nested_required(block, "EVAL", "RANK_BY"), "DEPTH_FIELD.EVAL.RANK_BY")
+    set_arg_config_required(args, "record_spectra", nested_required(block, "EVAL", "RECORD_SPECTRA"), "DEPTH_FIELD.EVAL.RECORD_SPECTRA")
+    set_arg_config_required(args, "record_all_mc", nested_required(block, "EVAL", "RECORD_ALL_MC"), "DEPTH_FIELD.EVAL.RECORD_ALL_MC")
+
+
+def resolve_plot_bundle_path(cfg: dict[str, Any], args: argparse.Namespace) -> str | None:
+    if args.no_plot_bundle or not bool(args.record_all_mc):
+        return None
+    if args.plot_bundle:
+        return str(args.plot_bundle)
+    return str(cfg_required(cfg, "PLOT_BUNDLE_PATH", "--plot-bundle"))
+
+
+def depth_field_metadata(cfg: dict[str, Any], depth_info: dict[str, Any], key: str, *config_path: str) -> Any:
+    value = depth_info.get(key)
+    if value is not None:
+        return value
+    config_value = nested_required(depth_field_block(cfg), *config_path)
+    if config_value is MISSING or config_value is None:
+        source = ".".join(("DEPTH_FIELD", *config_path))
+        raise ValueError(f"Checkpoint is missing depth_field.{key}, and {source} is not set in the config.")
+    return config_value
+
+
 def split_paths(cfg: dict[str, Any], split: str) -> list[str]:
     prefix = "DATA_PATH_TRAIN" if split == "train" else "DATA_PATH_TEST"
     paths = sorted([str(cfg[key]) for key in cfg.keys() if key == prefix or key.startswith(f"{prefix}_")])
@@ -105,34 +203,36 @@ def make_eval_loader(cfg: dict[str, Any], args: argparse.Namespace) -> torch.uti
     if args.sharded_loading and args.eager_loading:
         raise ValueError("Use only one of --sharded-loading or --eager-loading.")
 
-    use_shards = bool(cfg.get("SHARDED_LOADING", False))
     if args.sharded_loading:
         use_shards = True
-    if args.eager_loading:
+    elif args.eager_loading:
         use_shards = False
+    else:
+        use_shards = bool(cfg_required(cfg, "SHARDED_LOADING", "--sharded-loading/--eager-loading"))
 
     paths = split_paths(cfg, args.split)
     if use_shards:
         dataset = optollama.data.ShardedSpectraDataset(
             paths,
             split=args.split,
-            subset_n=args.max_samples,
+            subset_n=args.max_samples if args.max_samples is not None else cfg_required(cfg, "NUM_SAMPLES_TEST", "--max-samples"),
             rank=0,
             world_size=1,
-            seed=int(cfg.get("SEED", 0)),
+            seed=int(args.seed if args.seed is not None else cfg_required(cfg, "SEED", "--seed")),
             shuffle=False,
         )
     else:
         dataset = optollama.data.SpectraDataset(paths)
-        if args.max_samples is not None and args.max_samples < len(dataset):
-            indices = optollama.data.SpectraDataset.indices_of_unique_equidistant_subset(0, len(dataset) - 1, args.max_samples)
+        max_samples = int(args.max_samples if args.max_samples is not None else cfg_required(cfg, "NUM_SAMPLES_TEST", "--max-samples"))
+        if max_samples < len(dataset):
+            indices = optollama.data.SpectraDataset.indices_of_unique_equidistant_subset(0, len(dataset) - 1, max_samples)
             dataset = torch.utils.data.Subset(dataset, indices)
 
     return torch.utils.data.DataLoader(
         dataset,
-        batch_size=int(args.batch_size),
+        batch_size=int(args.batch_size if args.batch_size is not None else cfg_required(cfg, "TEST_BATCH_SIZE", "--batch-size")),
         shuffle=False,
-        num_workers=int(args.num_workers),
+        num_workers=int(args.num_workers if args.num_workers is not None else cfg_required(cfg, "NUM_WORKERS", "--num-workers")),
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
@@ -160,11 +260,11 @@ def make_target_loader(
     spectrum, _ = optollama.data.ensure_3w(spectrum)
     spectrum = optollama.data.redistribute_mismatch(
         spectrum,
-        str(cfg.get("MISMATCH_FILL_ORDER", "R>T>A")),
+        str(cfg_required(cfg, "MISMATCH_FILL_ORDER")),
         target_sum=1.0,
     )
 
-    n_targets = int(args.target_samples if args.target_samples is not None else cfg.get("N_TARGETS", 1))
+    n_targets = int(args.target_samples if args.target_samples is not None else cfg_required(cfg, "N_TARGETS", "--target-samples"))
     n_targets = max(1, n_targets)
     spectra = spectrum.unsqueeze(0).repeat(n_targets, 1, 1).contiguous()
     stacks = torch.full((n_targets, int(cfg["MAX_SEQ_LEN"])), int(msk_idx), dtype=torch.long)
@@ -172,9 +272,9 @@ def make_target_loader(
     dataset = torch.utils.data.TensorDataset(spectra, stacks, indices)
     return torch.utils.data.DataLoader(
         dataset,
-        batch_size=min(n_targets, int(args.batch_size)),
+        batch_size=min(n_targets, int(args.batch_size if args.batch_size is not None else cfg_required(cfg, "TEST_BATCH_SIZE", "--batch-size"))),
         shuffle=False,
-        num_workers=int(args.num_workers),
+        num_workers=int(args.num_workers if args.num_workers is not None else cfg_required(cfg, "NUM_WORKERS", "--num-workers")),
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
@@ -329,7 +429,9 @@ def candidate_record(
 def main() -> None:
     args = parse_args()
     cfg = optollama.utils.load_config(args)
-    seed = int(args.seed if args.seed is not None else cfg.get("SEED", 0))
+    apply_depth_field_eval_defaults(cfg, args)
+    out_json = resolve_out_json(cfg, args.out_json)
+    seed = int(args.seed if args.seed is not None else cfg_required(cfg, "SEED", "--seed"))
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -344,9 +446,9 @@ def main() -> None:
     material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     model, extra = load_depth_model(args.checkpoint, device)
     depth_info = extra.get("depth_field") or {}
-    dz_nm = float(depth_info.get("dz_nm", 10.0))
-    max_thickness_nm = float(depth_info.get("max_thickness_nm", 10_000.0))
-    output_seq_len = int(depth_info.get("output_seq_len", cfg["MAX_SEQ_LEN"]))
+    dz_nm = float(depth_field_metadata(cfg, depth_info, "dz_nm", "DZ_NM"))
+    max_thickness_nm = float(depth_field_metadata(cfg, depth_info, "max_thickness_nm", "MAX_THICKNESS_NM"))
+    output_seq_len = int(depth_field_metadata(cfg, depth_info, "output_seq_len", "OUTPUT_SEQ_LEN"))
 
     if vocab.num_clean_classes != model.num_materials:
         raise RuntimeError(
@@ -513,6 +615,7 @@ def main() -> None:
     summary = {
         "checkpoint": str(args.checkpoint),
         "config": str(args.config),
+        "out_json": out_json,
         "split": str(args.split),
         "target": target,
         "samples": int(len(results)),
@@ -535,27 +638,25 @@ def main() -> None:
             "classes": list(vocab.material_names),
         },
     }
-    plot_bundle_path = None
-    if not args.no_plot_bundle and args.record_all_mc:
-        plot_bundle_path = str(args.plot_bundle or cfg.get("PLOT_BUNDLE_PATH") or "")
-        if plot_bundle_path:
-            bundle_output: dict[str, torch.Tensor] = {
-                "mae_grid": torch.cat(all_mc_mae_batches, dim=0) if all_mc_mae_batches else torch.empty((0, mc_samples)),
-                "ids_grid": torch.cat(all_mc_ids_batches, dim=0) if all_mc_ids_batches else torch.empty((0, mc_samples, 0), dtype=torch.long),
-            }
-            if all_mc_pred_batches:
-                bundle_output["pred_spectra_grid"] = torch.cat(all_mc_pred_batches, dim=0)
-            optollama.plotting.save_plot_bundle(
-                plot_bundle_path,
-                bundle_output,
-                wavelengths=cfg["WAVELENGTHS"],
-                roi_min=cfg.get("ROI_MIN"),
-                roi_max=cfg.get("ROI_MAX"),
-            )
-            summary["plot_bundle"] = plot_bundle_path
-            print(f"Saved depth-field plot bundle -> {plot_bundle_path}")
+    plot_bundle_path = resolve_plot_bundle_path(cfg, args)
+    if plot_bundle_path:
+        bundle_output: dict[str, torch.Tensor] = {
+            "mae_grid": torch.cat(all_mc_mae_batches, dim=0) if all_mc_mae_batches else torch.empty((0, mc_samples)),
+            "ids_grid": torch.cat(all_mc_ids_batches, dim=0) if all_mc_ids_batches else torch.empty((0, mc_samples, 0), dtype=torch.long),
+        }
+        if all_mc_pred_batches:
+            bundle_output["pred_spectra_grid"] = torch.cat(all_mc_pred_batches, dim=0)
+        optollama.plotting.save_plot_bundle(
+            plot_bundle_path,
+            bundle_output,
+            wavelengths=cfg["WAVELENGTHS"],
+            roi_min=cfg.get("ROI_MIN"),
+            roi_max=cfg.get("ROI_MAX"),
+        )
+        summary["plot_bundle"] = plot_bundle_path
+        print(f"Saved depth-field plot bundle -> {plot_bundle_path}")
     out = {"summary": summary, "results": results}
-    out_path = Path(args.out_json)
+    out_path = Path(out_json)
     os.makedirs(out_path.parent, exist_ok=True)
     optollama.utils.save_as_json(str(out_path), out)
     print(f"Saved {len(results)} depth-field samples -> {out_path}")

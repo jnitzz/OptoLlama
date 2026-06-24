@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override VALIDATE_EVERY_N_TRAIN_SAMPLES. 0 disables mid-epoch validation.",
     )
+    parser.add_argument(
+        "--validate-at-epoch-end",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run validation at epoch end. Defaults to VALIDATION.AT_EPOCH_END.",
+    )
     parser.add_argument("--sharded-loading", action="store_true", help="Force sharded streaming dataset loading.")
     parser.add_argument("--eager-loading", action="store_true", help="Force eager in-memory dataset loading.")
     parser.add_argument(
@@ -110,25 +116,25 @@ def parse_args() -> argparse.Namespace:
         "--save-eval-samples",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Save TMM validation sample JSONs. Defaults to DEPTH_FIELD.EVAL.SAVE_SAMPLES or true.",
+        help="Save TMM validation sample JSONs. Required unless DEPTH_FIELD.EVAL.SAVE_SAMPLES is set.",
     )
     parser.add_argument(
         "--eval-samples-dir",
         type=str,
         default=None,
-        help="Directory for TMM validation sample JSONs. Defaults to <out-dir>/validation_samples.",
+        help="Directory for TMM validation sample JSONs. Required when validation sample saving is enabled.",
     )
     parser.add_argument(
         "--eval-record-spectra",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Store target/predicted spectra in validation sample JSONs. Defaults to true.",
+        help="Store target/predicted spectra in validation sample JSONs. Required unless DEPTH_FIELD.EVAL.RECORD_SPECTRA is set.",
     )
     parser.add_argument(
         "--eval-record-all-mc",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Store every MC validation candidate, not only the selected best. Defaults to false.",
+        help="Store every MC validation candidate, not only the selected best. Required unless DEPTH_FIELD.EVAL.RECORD_ALL_MC is set.",
     )
     return parser.parse_args()
 
@@ -210,6 +216,34 @@ def nested_get(block: dict[str, Any], *path: str, default: Any = None) -> Any:
     return value
 
 
+MISSING = object()
+
+
+def nested_required(block: dict[str, Any], *path: str) -> Any:
+    value: Any = block
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return MISSING
+        value = value[key]
+    return value
+
+
+def set_arg_config_required(args: argparse.Namespace, name: str, value: Any, source: str) -> None:
+    if getattr(args, name) is not None:
+        return
+    if value is MISSING or value is None:
+        flag = f"--{name.replace('_', '-')}"
+        raise ValueError(f"Missing required setting {source}. Set it in the config or pass {flag}.")
+    setattr(args, name, value)
+
+
+def cfg_required(cfg: dict[str, Any], key: str, flag: str | None = None) -> Any:
+    if key in cfg and cfg[key] is not None:
+        return cfg[key]
+    suffix = f" or pass {flag}" if flag else ""
+    raise ValueError(f"Missing required setting {key}. Set it in the config{suffix}.")
+
+
 def set_arg_default(args: argparse.Namespace, name: str, value: Any) -> None:
     if getattr(args, name) is None and value is not None:
         setattr(args, name, value)
@@ -260,39 +294,56 @@ def resolve_resume_checkpoint(
 
 def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     block = depth_field_block(cfg)
-    set_arg_default(args, "out_dir", block.get("OUT_DIR", "data/checkpoints/depth_field_10um"))
-    set_arg_default(args, "dz_nm", block.get("DZ_NM", 10.0))
-    set_arg_default(args, "max_thickness_nm", block.get("MAX_THICKNESS_NM", 10_000.0))
-    set_arg_default(args, "output_seq_len", block.get("OUTPUT_SEQ_LEN"))
+    set_arg_config_required(args, "out_dir", block.get("OUT_DIR", MISSING), "DEPTH_FIELD.OUT_DIR")
+    set_arg_config_required(args, "dz_nm", block.get("DZ_NM", MISSING), "DEPTH_FIELD.DZ_NM")
+    set_arg_config_required(args, "max_thickness_nm", block.get("MAX_THICKNESS_NM", MISSING), "DEPTH_FIELD.MAX_THICKNESS_NM")
+    set_arg_config_required(args, "output_seq_len", block.get("OUTPUT_SEQ_LEN", MISSING), "DEPTH_FIELD.OUTPUT_SEQ_LEN")
 
-    set_arg_default(args, "d_model", nested_get(block, "MODEL", "D_MODEL", default=192))
-    set_arg_default(args, "n_blocks", nested_get(block, "MODEL", "N_BLOCKS", default=12))
-    set_arg_default(args, "kernel_size", nested_get(block, "MODEL", "KERNEL_SIZE", default=7))
-    set_arg_default(args, "conv_type", nested_get(block, "MODEL", "CONV_TYPE", default="full"))
-    set_arg_default(args, "dropout", nested_get(block, "MODEL", "DROPOUT", default=0.0))
-    set_arg_default(args, "diffusion_steps", nested_get(block, "MODEL", "DIFFUSION_STEPS", default=100))
+    set_arg_config_required(args, "d_model", nested_required(block, "MODEL", "D_MODEL"), "DEPTH_FIELD.MODEL.D_MODEL")
+    set_arg_config_required(args, "n_blocks", nested_required(block, "MODEL", "N_BLOCKS"), "DEPTH_FIELD.MODEL.N_BLOCKS")
+    set_arg_config_required(args, "kernel_size", nested_required(block, "MODEL", "KERNEL_SIZE"), "DEPTH_FIELD.MODEL.KERNEL_SIZE")
+    set_arg_config_required(args, "conv_type", nested_required(block, "MODEL", "CONV_TYPE"), "DEPTH_FIELD.MODEL.CONV_TYPE")
+    set_arg_config_required(args, "dropout", nested_required(block, "MODEL", "DROPOUT"), "DEPTH_FIELD.MODEL.DROPOUT")
+    set_arg_config_required(args, "diffusion_steps", nested_required(block, "MODEL", "DIFFUSION_STEPS"), "DEPTH_FIELD.MODEL.DIFFUSION_STEPS")
 
-    set_arg_default(args, "weight_decay", nested_get(block, "TRAIN", "WEIGHT_DECAY", default=0.01))
-    set_arg_default(args, "grad_clip", nested_get(block, "TRAIN", "GRAD_CLIP", default=1.0))
-    set_arg_default(args, "amp", nested_get(block, "TRAIN", "AMP", default=False))
-    set_arg_default(args, "keep_overlimit_stacks", nested_get(block, "TRAIN", "KEEP_OVERLIMIT_STACKS", default=False))
-    set_arg_default(args, "void_loss_weight", nested_get(block, "TRAIN", "VOID_LOSS_WEIGHT", default=0.25))
-    set_arg_default(args, "random_replace_prob", nested_get(block, "TRAIN", "RANDOM_REPLACE_PROB", default=0.10))
-    set_arg_default(args, "loss_on_corrupted_only", nested_get(block, "TRAIN", "LOSS_ON_CORRUPTED_ONLY", default=False))
+    set_arg_config_required(args, "weight_decay", nested_required(block, "TRAIN", "WEIGHT_DECAY"), "DEPTH_FIELD.TRAIN.WEIGHT_DECAY")
+    set_arg_config_required(args, "grad_clip", nested_required(block, "TRAIN", "GRAD_CLIP"), "DEPTH_FIELD.TRAIN.GRAD_CLIP")
+    set_arg_config_required(args, "amp", nested_required(block, "TRAIN", "AMP"), "DEPTH_FIELD.TRAIN.AMP")
+    set_arg_config_required(
+        args,
+        "keep_overlimit_stacks",
+        nested_required(block, "TRAIN", "KEEP_OVERLIMIT_STACKS"),
+        "DEPTH_FIELD.TRAIN.KEEP_OVERLIMIT_STACKS",
+    )
+    set_arg_config_required(args, "void_loss_weight", nested_required(block, "TRAIN", "VOID_LOSS_WEIGHT"), "DEPTH_FIELD.TRAIN.VOID_LOSS_WEIGHT")
+    set_arg_config_required(
+        args,
+        "random_replace_prob",
+        nested_required(block, "TRAIN", "RANDOM_REPLACE_PROB"),
+        "DEPTH_FIELD.TRAIN.RANDOM_REPLACE_PROB",
+    )
+    set_arg_config_required(
+        args,
+        "loss_on_corrupted_only",
+        nested_required(block, "TRAIN", "LOSS_ON_CORRUPTED_ONLY"),
+        "DEPTH_FIELD.TRAIN.LOSS_ON_CORRUPTED_ONLY",
+    )
 
-    set_arg_default(args, "eval_mode", nested_get(block, "EVAL", "MODE", default="tmm"))
-    set_arg_default(args, "eval_mc_samples", nested_get(block, "EVAL", "MC_SAMPLES", default=4))
-    set_arg_default(args, "eval_sampling_steps", nested_get(block, "EVAL", "SAMPLING_STEPS"))
-    set_arg_default(args, "eval_temperature", nested_get(block, "EVAL", "TEMPERATURE", default=1.0))
-    set_arg_default(args, "eval_top_k", nested_get(block, "EVAL", "TOP_K", default=0))
-    set_arg_default(args, "eval_deterministic", nested_get(block, "EVAL", "DETERMINISTIC", default=False))
-    set_arg_default(args, "eval_remask_strategy", nested_get(block, "EVAL", "REMASK_STRATEGY", default="confidence"))
-    set_arg_default(args, "eval_tmm_device", nested_get(block, "EVAL", "TMM_DEVICE", default="auto"))
-    set_arg_default(args, "eval_tmm_batch_size", nested_get(block, "EVAL", "TMM_BATCH_SIZE", default=64))
-    set_arg_default(args, "save_eval_samples", nested_get(block, "EVAL", "SAVE_SAMPLES", default=True))
+    set_arg_config_required(args, "eval_mode", nested_required(block, "EVAL", "MODE"), "DEPTH_FIELD.EVAL.MODE")
+    set_arg_config_required(args, "eval_mc_samples", nested_required(block, "EVAL", "MC_SAMPLES"), "DEPTH_FIELD.EVAL.MC_SAMPLES")
+    set_arg_config_required(args, "eval_sampling_steps", nested_required(block, "EVAL", "SAMPLING_STEPS"), "DEPTH_FIELD.EVAL.SAMPLING_STEPS")
+    set_arg_config_required(args, "eval_temperature", nested_required(block, "EVAL", "TEMPERATURE"), "DEPTH_FIELD.EVAL.TEMPERATURE")
+    set_arg_config_required(args, "eval_top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
+    set_arg_config_required(args, "eval_deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
+    set_arg_config_required(args, "eval_remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
+    set_arg_config_required(args, "eval_tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
+    set_arg_config_required(args, "eval_tmm_batch_size", nested_required(block, "EVAL", "TMM_BATCH_SIZE"), "DEPTH_FIELD.EVAL.TMM_BATCH_SIZE")
+    set_arg_config_required(args, "save_eval_samples", nested_required(block, "EVAL", "SAVE_SAMPLES"), "DEPTH_FIELD.EVAL.SAVE_SAMPLES")
     set_arg_default(args, "eval_samples_dir", nested_get(block, "EVAL", "SAMPLES_DIR"))
-    set_arg_default(args, "eval_record_spectra", nested_get(block, "EVAL", "RECORD_SPECTRA", default=True))
-    set_arg_default(args, "eval_record_all_mc", nested_get(block, "EVAL", "RECORD_ALL_MC", default=False))
+    if bool(args.save_eval_samples) and args.eval_samples_dir is None:
+        raise ValueError("Missing required setting DEPTH_FIELD.EVAL.SAMPLES_DIR. Set it in the config or pass --eval-samples-dir.")
+    set_arg_config_required(args, "eval_record_spectra", nested_required(block, "EVAL", "RECORD_SPECTRA"), "DEPTH_FIELD.EVAL.RECORD_SPECTRA")
+    set_arg_config_required(args, "eval_record_all_mc", nested_required(block, "EVAL", "RECORD_ALL_MC"), "DEPTH_FIELD.EVAL.RECORD_ALL_MC")
 
 
 def autocast_context(enabled: bool):
@@ -744,7 +795,7 @@ def run_tmm_evaluation(
         best_thickness.append(run_thickness)
 
         if save_samples:
-            output_seq_len = int(args.output_seq_len or cfg["MAX_SEQ_LEN"])
+            output_seq_len = int(args.output_seq_len)
             token_ids_cpu = optollama.data.decode_depth_field_to_tokens(
                 fields_cpu,
                 vocab,
@@ -1092,7 +1143,7 @@ def make_checkpoint_extra(
             "dz_nm": float(args.dz_nm),
             "max_thickness_nm": float(args.max_thickness_nm),
             "depth_bins": optollama.data.depth_bins_for(args.max_thickness_nm, args.dz_nm),
-            "output_seq_len": int(args.output_seq_len or cfg["MAX_SEQ_LEN"]),
+            "output_seq_len": int(args.output_seq_len),
             "vocab": vocab.to_dict(),
             "representation": "material_depth_field_with_void",
             "filter_overlimit_stacks": not bool(args.keep_overlimit_stacks),
@@ -1158,8 +1209,8 @@ def main() -> None:
     vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
     depth_bins = optollama.data.depth_bins_for(args.max_thickness_nm, args.dz_nm)
 
-    train_subset = args.max_train_samples if args.max_train_samples is not None else cfg.get("NUM_SAMPLES_TRAIN")
-    val_subset = args.max_val_samples if args.max_val_samples is not None else cfg.get("NUM_SAMPLES_TEST")
+    train_subset = args.max_train_samples if args.max_train_samples is not None else cfg_required(cfg, "NUM_SAMPLES_TRAIN", "--max-train-samples")
+    val_subset = args.max_val_samples if args.max_val_samples is not None else cfg_required(cfg, "NUM_SAMPLES_TEST", "--max-val-samples")
     train_ds, train_loader, _ = optollama.data.SpectraDataset.make_loader(cfg, split="train", subset_n=train_subset, ddp=ddp)
     val_loader = None
     if not args.no_val:
@@ -1190,11 +1241,11 @@ def main() -> None:
         )
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(args.learning_rate if args.learning_rate is not None else cfg["LEARNING_RATE"]),
+        lr=float(args.learning_rate if args.learning_rate is not None else cfg_required(cfg, "LEARNING_RATE", "--learning-rate")),
         weight_decay=float(args.weight_decay),
     )
 
-    epochs = int(args.epochs if args.epochs is not None else cfg.get("EPOCHS", 20))
+    epochs = int(args.epochs if args.epochs is not None else cfg_required(cfg, "EPOCHS", "--epochs"))
     out_dir = Path(args.out_dir)
     if rank == 0:
         os.makedirs(out_dir, exist_ok=True)
@@ -1203,7 +1254,7 @@ def main() -> None:
     best_path = out_dir / "depth-field-best.pt"
     last_path = out_dir / "depth-field-last.pt"
     history_path = out_dir / "depth-field-history.json"
-    eval_samples_dir = Path(args.eval_samples_dir) if args.eval_samples_dir else out_dir / "validation_samples"
+    eval_samples_dir = Path(args.eval_samples_dir) if args.eval_samples_dir is not None else None
 
     start_epoch = 0
     history: list[dict] = []
@@ -1226,7 +1277,12 @@ def main() -> None:
     validate_every_samples = (
         int(args.validate_every_n_train_samples)
         if args.validate_every_n_train_samples is not None
-        else int(cfg.get("VALIDATE_EVERY_N_TRAIN_SAMPLES") or 0)
+        else int(cfg_required(cfg, "VALIDATE_EVERY_N_TRAIN_SAMPLES", "--validate-every-n-train-samples"))
+    )
+    validate_at_epoch_end = (
+        bool(args.validate_at_epoch_end)
+        if args.validate_at_epoch_end is not None
+        else bool(cfg_required(cfg, "VALIDATE_AT_EPOCH_END", "--validate-at-epoch-end"))
     )
     if val_loader is None:
         validate_every_samples = 0
@@ -1261,7 +1317,7 @@ def main() -> None:
                 raise RuntimeError("TMM validation requested but TMM context was not initialized.")
             sample_path = (
                 eval_samples_dir / f"epoch_{epoch + 1:04d}_{safe_trigger_name(trigger)}.json"
-                if bool(args.save_eval_samples)
+                if bool(args.save_eval_samples) and eval_samples_dir is not None
                 else None
             )
             tmm_metrics = run_tmm_evaluation(
@@ -1319,10 +1375,13 @@ def main() -> None:
             "Depth-field diffusion: "
             f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
-            f"ddp={ddp}, world={world_size}, conv={model_config.conv_type}, eval_remask={args.eval_remask_strategy}"
+            f"ddp={ddp}, world={world_size}, conv={model_config.conv_type}, "
+            f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
+            f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
         )
         if validate_every_samples > 0:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")
+        print(f"Epoch-end validation: {validate_at_epoch_end}.")
         if val_loader is not None:
             print(f"Validation mode: {eval_mode}.")
             if eval_mode in {"tmm", "both"}:
@@ -1356,7 +1415,7 @@ def main() -> None:
             validate_every_samples=validate_every_samples,
         )
 
-        if val_loader is not None:
+        if val_loader is not None and validate_at_epoch_end:
             run_validation_trigger(
                 epoch=epoch,
                 trigger="epoch_end",
