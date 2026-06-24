@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tmm-device", type=str, default=None, help='TMM device. "auto" uses model device.')
 
     parser.add_argument("--mc-samples", type=int, default=None, help="Candidate fields per target spectrum.")
+    parser.add_argument(
+        "--mc-batch-size",
+        type=int,
+        default=None,
+        help="Maximum MC candidates per target to sample/score at once. Set this below --mc-samples to reduce VRAM.",
+    )
     parser.add_argument("--sampling-steps", type=int, default=None, help="Denoising steps. Required unless DEPTH_FIELD.EVAL.SAMPLING_STEPS is set.")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature. <=0 uses argmax.")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k material sampling filter. 0 disables.")
@@ -159,6 +165,10 @@ def cfg_required(cfg: dict[str, Any], key: str, flag: str | None = None) -> Any:
 def apply_depth_field_eval_defaults(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     block = depth_field_block(cfg)
     set_arg_config_required(args, "mc_samples", nested_required(block, "EVAL", "MC_SAMPLES"), "DEPTH_FIELD.EVAL.MC_SAMPLES")
+    if args.mc_batch_size is None:
+        mc_batch_size = nested_get(block, "EVAL", "MC_BATCH_SIZE")
+        if mc_batch_size is not None:
+            args.mc_batch_size = mc_batch_size
     set_arg_config_required(args, "sampling_steps", nested_required(block, "EVAL", "SAMPLING_STEPS"), "DEPTH_FIELD.EVAL.SAMPLING_STEPS")
     set_arg_config_required(args, "temperature", nested_required(block, "EVAL", "TEMPERATURE"), "DEPTH_FIELD.EVAL.TEMPERATURE")
     set_arg_config_required(args, "top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
@@ -548,6 +558,12 @@ def main() -> None:
     all_mc_ids_batches: list[torch.Tensor] = []
     all_mc_pred_batches: list[torch.Tensor] = []
     mc_samples = int(args.mc_samples)
+    mc_batch_size = int(args.mc_batch_size) if args.mc_batch_size is not None else mc_samples
+    if mc_samples <= 0:
+        raise ValueError(f"--mc-samples must be positive, got {mc_samples}")
+    if mc_batch_size <= 0:
+        raise ValueError(f"--mc-batch-size must be positive when set, got {mc_batch_size}")
+    mc_batch_size = min(mc_batch_size, mc_samples)
     score_mode = str(args.score_mode).lower()
     rank_by = str(args.rank_by).lower()
     if rank_by == "auto":
@@ -560,80 +576,118 @@ def main() -> None:
         f"{'target=' + target if target is not None else 'split=' + args.split}, "
         f"mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
         f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
-        f"remask={args.remask_strategy}, "
+        f"remask={args.remask_strategy}, mc_batch={mc_batch_size}, "
         f"model_device={device}, tmm_device={tmm_device}"
     )
 
-    for batch in tqdm.tqdm(loader, desc="depth-field inference", leave=True):
+    mc_chunks_per_batch = (mc_samples + mc_batch_size - 1) // mc_batch_size
+    progress_total = len(loader) * mc_chunks_per_batch if hasattr(loader, "__len__") else None
+    progress = tqdm.tqdm(
+        total=progress_total,
+        desc="depth-field inference",
+        unit="mc-batch",
+        leave=True,
+    )
+
+    for loader_batch_idx, batch in enumerate(loader, start=1):
         spectra_cpu, _, indices = batch[0], batch[1], batch[2]
         batch_size = int(spectra_cpu.size(0))
         score_spectra_cpu, conditioning_spectra_cpu = score_spectra_for_batch(spectra_cpu, score_spectrum_cpu)
         spectra = spectra_cpu.to(device, non_blocking=True)
-        spectra_rep = spectra.repeat_interleave(mc_samples, dim=0)
 
-        fields = model.sample(
-            spectra_rep,
-            steps=args.sampling_steps,
-            temperature=float(args.temperature),
-            top_k=int(args.top_k),
-            deterministic=bool(args.deterministic or args.temperature <= 0.0),
-            remask_strategy=str(args.remask_strategy),
-        )
-        fields_cpu = fields.detach().cpu()
-        token_ids_cpu = optollama.data.decode_depth_field_to_tokens(
-            fields_cpu,
-            vocab,
-            output_seq_len=output_seq_len,
-            dz_nm=dz_nm,
-            eos_idx=eos_idx,
-            pad_idx=pad_idx,
-        )
+        fields_chunks: list[torch.Tensor] = []
+        token_chunks: list[torch.Tensor] = []
+        mae_chunks: list[torch.Tensor] = []
+        pred_spectra_chunks: list[torch.Tensor] = []
+        field_mae_chunks: list[torch.Tensor] = []
+        decoded_mae_chunks: list[torch.Tensor] = []
 
-        target_rep = score_spectra_cpu.to(tmm_device).repeat_interleave(mc_samples, dim=0)
-        field_mae = None
-        decoded_mae = None
-        field_spectra_cpu = None
-        decoded_spectra_cpu = None
+        for mc_start in range(0, mc_samples, mc_batch_size):
+            chunk_n = min(mc_batch_size, mc_samples - mc_start)
+            spectra_rep = spectra.repeat_interleave(chunk_n, dim=0)
 
-        if score_mode in {"field", "both"}:
-            field_spectra = simulate_field_runs(
-                fields_cpu,
-                vocab=vocab,
-                tmm_ctx=tmm_ctx,
-                material_to_token_id=material_to_token_id,
+            fields = model.sample(
+                spectra_rep,
+                steps=args.sampling_steps,
+                temperature=float(args.temperature),
+                top_k=int(args.top_k),
+                deterministic=bool(args.deterministic or args.temperature <= 0.0),
+                remask_strategy=str(args.remask_strategy),
+            )
+            fields_cpu_chunk = fields.detach().cpu()
+            token_ids_cpu_chunk = optollama.data.decode_depth_field_to_tokens(
+                fields_cpu_chunk,
+                vocab,
+                output_seq_len=output_seq_len,
                 dz_nm=dz_nm,
                 eos_idx=eos_idx,
                 pad_idx=pad_idx,
-                msk_idx=msk_idx,
-                tmm_batch_size=int(args.tmm_batch_size),
             )
-            field_mae = mae_per_sample(field_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
-            field_spectra_cpu = field_spectra.detach().cpu()
 
-        if score_mode in {"decoded", "both"}:
-            decoded_spectra = simulate_decoded(
-                token_ids_cpu,
-                tmm_ctx=tmm_ctx,
-                eos_idx=eos_idx,
-                pad_idx=pad_idx,
-                msk_idx=msk_idx,
-                tmm_batch_size=int(args.tmm_batch_size),
+            target_rep = score_spectra_cpu.to(tmm_device).repeat_interleave(chunk_n, dim=0)
+            field_mae_chunk = None
+            decoded_mae_chunk = None
+            field_spectra_cpu_chunk = None
+            decoded_spectra_cpu_chunk = None
+
+            if score_mode in {"field", "both"}:
+                field_spectra = simulate_field_runs(
+                    fields_cpu_chunk,
+                    vocab=vocab,
+                    tmm_ctx=tmm_ctx,
+                    material_to_token_id=material_to_token_id,
+                    dz_nm=dz_nm,
+                    eos_idx=eos_idx,
+                    pad_idx=pad_idx,
+                    msk_idx=msk_idx,
+                    tmm_batch_size=int(args.tmm_batch_size),
+                )
+                field_mae_chunk = mae_per_sample(field_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
+                field_spectra_cpu_chunk = field_spectra.detach().cpu()
+                field_mae_chunks.append(field_mae_chunk.reshape(batch_size, chunk_n))
+
+            if score_mode in {"decoded", "both"}:
+                decoded_spectra = simulate_decoded(
+                    token_ids_cpu_chunk,
+                    tmm_ctx=tmm_ctx,
+                    eos_idx=eos_idx,
+                    pad_idx=pad_idx,
+                    msk_idx=msk_idx,
+                    tmm_batch_size=int(args.tmm_batch_size),
+                )
+                decoded_mae_chunk = mae_per_sample(decoded_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
+                decoded_spectra_cpu_chunk = decoded_spectra.detach().cpu()
+                decoded_mae_chunks.append(decoded_mae_chunk.reshape(batch_size, chunk_n))
+
+            if rank_by == "field":
+                if field_mae_chunk is None or field_spectra_cpu_chunk is None:
+                    raise RuntimeError("Field MAE requested for ranking but was not computed.")
+                mae_chunk = field_mae_chunk
+                pred_spectra_cpu_chunk = field_spectra_cpu_chunk
+            else:
+                if decoded_mae_chunk is None or decoded_spectra_cpu_chunk is None:
+                    raise RuntimeError("Decoded MAE requested for ranking but was not computed.")
+                mae_chunk = decoded_mae_chunk
+                pred_spectra_cpu_chunk = decoded_spectra_cpu_chunk
+
+            fields_chunks.append(fields_cpu_chunk.reshape(batch_size, chunk_n, -1))
+            token_chunks.append(token_ids_cpu_chunk.reshape(batch_size, chunk_n, -1))
+            mae_chunks.append(mae_chunk.reshape(batch_size, chunk_n))
+            pred_spectra_chunks.append(pred_spectra_cpu_chunk.reshape(batch_size, chunk_n, *pred_spectra_cpu_chunk.shape[1:]))
+            progress.update(1)
+            progress.set_postfix(
+                batch=f"{loader_batch_idx}/{len(loader) if hasattr(loader, '__len__') else '?'}",
+                mc=f"{mc_start + chunk_n}/{mc_samples}",
             )
-            decoded_mae = mae_per_sample(decoded_spectra, target_rep, cfg["WAVELENGTHS"], cfg).detach().cpu()
-            decoded_spectra_cpu = decoded_spectra.detach().cpu()
 
-        if rank_by == "field":
-            if field_mae is None or field_spectra_cpu is None:
-                raise RuntimeError("Field MAE requested for ranking but was not computed.")
-            mae = field_mae
-            pred_spectra_cpu = field_spectra_cpu
-        else:
-            if decoded_mae is None or decoded_spectra_cpu is None:
-                raise RuntimeError("Decoded MAE requested for ranking but was not computed.")
-            mae = decoded_mae
-            pred_spectra_cpu = decoded_spectra_cpu
+        fields_cpu = torch.cat(fields_chunks, dim=1).reshape(batch_size * mc_samples, -1)
+        token_ids_cpu = torch.cat(token_chunks, dim=1).reshape(batch_size * mc_samples, -1)
+        mae_matrix = torch.cat(mae_chunks, dim=1)
+        mae = mae_matrix.reshape(batch_size * mc_samples)
+        pred_spectra_cpu = torch.cat(pred_spectra_chunks, dim=1).reshape(batch_size * mc_samples, *pred_spectra_chunks[0].shape[2:])
+        field_mae = torch.cat(field_mae_chunks, dim=1).reshape(batch_size * mc_samples) if field_mae_chunks else None
+        decoded_mae = torch.cat(decoded_mae_chunks, dim=1).reshape(batch_size * mc_samples) if decoded_mae_chunks else None
 
-        mae_matrix = mae.view(batch_size, mc_samples)
         best_mae, best_idx = mae_matrix.min(dim=1)
         if args.record_all_mc:
             all_mc_mae_batches.append(mae_matrix.detach().cpu().to(torch.float32))
@@ -696,6 +750,8 @@ def main() -> None:
                 selected_field_mae.append(float(field_mae[flat_idx].item()))
             if decoded_mae is not None:
                 selected_decoded_mae.append(float(decoded_mae[flat_idx].item()))
+
+    progress.close()
 
     field_mae_tensor = torch.tensor(selected_field_mae) if selected_field_mae else None
     decoded_mae_tensor = torch.tensor(selected_decoded_mae) if selected_decoded_mae else None
