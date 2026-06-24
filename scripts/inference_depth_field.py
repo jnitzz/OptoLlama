@@ -246,31 +246,83 @@ def configured_target(cfg: dict[str, Any], args: argparse.Namespace) -> str | No
     return target if target.strip() else None
 
 
+def target_physicalize_enabled(cfg: dict[str, Any]) -> bool:
+    return bool((cfg.get("TARGET_PHYSICALIZE") or {}).get("ENABLED", False))
+
+
+def selection_target_mode(cfg: dict[str, Any]) -> str:
+    if not target_physicalize_enabled(cfg):
+        return "conditioned"
+    block = cfg.get("TARGET_PHYSICALIZE") or {}
+    if "SELECTION_TARGET" not in block or block["SELECTION_TARGET"] is None:
+        raise ValueError("Missing required setting TARGET_PHYSICALIZE.SELECTION_TARGET.")
+    mode = str(block["SELECTION_TARGET"]).lower()
+    if mode not in {"conditioned", "original"}:
+        raise ValueError("TARGET_PHYSICALIZE.SELECTION_TARGET must be 'conditioned' or 'original'.")
+    return mode
+
+
+def log_physicalization(info: dict[str, Any], cfg: dict[str, Any]) -> None:
+    if not info.get("enabled"):
+        return
+    parts = [
+        "TARGET_PHYSICALIZE enabled",
+        f"selection_target={selection_target_mode(cfg)}",
+    ]
+    ae = info.get("autoencoder")
+    if ae:
+        parts.append(
+            "AE "
+            f"mae_to_input={ae['mae_to_input']:.6f} "
+            f"latent_dim={ae['latent_dim']} "
+            f"mode={ae['mode']}"
+        )
+    nn = info.get("nn")
+    if nn:
+        parts.append(
+            f"NN id={nn['global_index']} mae={nn['mae']:.6f} "
+            f"file={nn['file']}:{nn['local_index']}"
+        )
+    print(", ".join(parts) + ".")
+
+
+def load_target_spectra(
+    target: str,
+    cfg: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any]]:
+    if target == "random":
+        width = int(cfg["WAVELENGTHS"].numel() if torch.is_tensor(cfg["WAVELENGTHS"]) else len(cfg["WAVELENGTHS"]))
+        original = torch.rand((3, width), dtype=torch.float32, device=device)
+    else:
+        original = optollama.utils.load_spectra(target, cfg).to(device=device, dtype=torch.float32)
+
+    conditioned, info = optollama.data.physicalize_target_spectrum(original, cfg, device=device)
+    score_spectrum = None
+    if info.get("enabled"):
+        log_physicalization(info, cfg)
+        if selection_target_mode(cfg) == "original":
+            score_spectrum, _ = optollama.data.ensure_3w(original)
+            score_spectrum = score_spectrum.to(torch.float32)
+
+    return conditioned.detach().cpu(), None if score_spectrum is None else score_spectrum.detach().cpu(), info
+
+
 def make_target_loader(
     cfg: dict[str, Any],
     args: argparse.Namespace,
     target: str,
     msk_idx: int,
-) -> torch.utils.data.DataLoader:
-    if target == "random":
-        width = int(cfg["WAVELENGTHS"].numel() if torch.is_tensor(cfg["WAVELENGTHS"]) else len(cfg["WAVELENGTHS"]))
-        spectrum = torch.rand((3, width), dtype=torch.float32)
-    else:
-        spectrum = optollama.utils.load_spectra(target, cfg).to(torch.float32)
-    spectrum, _ = optollama.data.ensure_3w(spectrum)
-    spectrum = optollama.data.redistribute_mismatch(
-        spectrum,
-        str(cfg_required(cfg, "MISMATCH_FILL_ORDER")),
-        target_sum=1.0,
-    )
-
+    device: torch.device,
+) -> tuple[torch.utils.data.DataLoader, torch.Tensor | None, dict[str, Any]]:
+    spectrum, score_spectrum, physicalize_info = load_target_spectra(target, cfg, device)
     n_targets = int(args.target_samples if args.target_samples is not None else cfg_required(cfg, "N_TARGETS", "--target-samples"))
     n_targets = max(1, n_targets)
     spectra = spectrum.unsqueeze(0).repeat(n_targets, 1, 1).contiguous()
     stacks = torch.full((n_targets, int(cfg["MAX_SEQ_LEN"])), int(msk_idx), dtype=torch.long)
     indices = torch.arange(n_targets, dtype=torch.long)
     dataset = torch.utils.data.TensorDataset(spectra, stacks, indices)
-    return torch.utils.data.DataLoader(
+    loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=min(n_targets, int(args.batch_size if args.batch_size is not None else cfg_required(cfg, "TEST_BATCH_SIZE", "--batch-size"))),
         shuffle=False,
@@ -278,6 +330,30 @@ def make_target_loader(
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
+    return loader, score_spectrum, physicalize_info
+
+
+def score_spectra_for_batch(
+    spectra_cpu: torch.Tensor,
+    score_spectrum_cpu: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if score_spectrum_cpu is None:
+        return spectra_cpu, None
+
+    batch_size = int(spectra_cpu.size(0))
+    score = torch.as_tensor(score_spectrum_cpu, dtype=spectra_cpu.dtype)
+    if score.dim() == 2:
+        score = score.unsqueeze(0).expand(batch_size, -1, -1)
+    elif score.dim() == 3 and score.size(0) == 1:
+        score = score.expand(batch_size, -1, -1)
+    elif score.dim() == 3 and score.size(0) == batch_size:
+        pass
+    else:
+        raise ValueError(
+            "score_spectrum must have shape [3,W], [1,3,W], or [B,3,W], "
+            f"got {tuple(score.shape)} for batch size {batch_size}"
+        )
+    return score.contiguous(), spectra_cpu
 
 
 def load_depth_model(checkpoint: str, device: torch.device) -> tuple[optollama.model.DepthFieldDiffusion, dict]:
@@ -389,6 +465,7 @@ def candidate_record(
     mae_values: torch.Tensor,
     pred_spectra_cpu: torch.Tensor,
     target_spectrum_cpu: torch.Tensor,
+    conditioning_spectrum_cpu: torch.Tensor | None,
     field_mae_values: torch.Tensor | None,
     decoded_mae_values: torch.Tensor | None,
     vocab: optollama.data.DepthFieldVocab,
@@ -423,6 +500,8 @@ def candidate_record(
     if record_spectra:
         record["target_spectra"] = target_spectrum_cpu.detach().cpu().tolist()
         record["pred_spectra"] = pred_spectra_cpu[flat_idx].detach().cpu().tolist()
+        if conditioning_spectrum_cpu is not None:
+            record["rat_conditioning"] = conditioning_spectrum_cpu.detach().cpu().tolist()
     return record
 
 
@@ -441,7 +520,12 @@ def main() -> None:
 
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
     target = configured_target(cfg, args)
-    loader = make_target_loader(cfg, args, target, msk_idx) if target is not None else make_eval_loader(cfg, args)
+    score_spectrum_cpu = None
+    physicalize_info: dict[str, Any] = {"enabled": False}
+    if target is not None:
+        loader, score_spectrum_cpu, physicalize_info = make_target_loader(cfg, args, target, msk_idx, device)
+    else:
+        loader = make_eval_loader(cfg, args)
     vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
     material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     model, extra = load_depth_model(args.checkpoint, device)
@@ -483,6 +567,7 @@ def main() -> None:
     for batch in tqdm.tqdm(loader, desc="depth-field inference", leave=True):
         spectra_cpu, _, indices = batch[0], batch[1], batch[2]
         batch_size = int(spectra_cpu.size(0))
+        score_spectra_cpu, conditioning_spectra_cpu = score_spectra_for_batch(spectra_cpu, score_spectrum_cpu)
         spectra = spectra_cpu.to(device, non_blocking=True)
         spectra_rep = spectra.repeat_interleave(mc_samples, dim=0)
 
@@ -504,7 +589,7 @@ def main() -> None:
             pad_idx=pad_idx,
         )
 
-        target_rep = spectra_cpu.to(tmm_device).repeat_interleave(mc_samples, dim=0)
+        target_rep = score_spectra_cpu.to(tmm_device).repeat_interleave(mc_samples, dim=0)
         field_mae = None
         decoded_mae = None
         field_spectra_cpu = None
@@ -572,7 +657,8 @@ def main() -> None:
                     token_ids_cpu=token_ids_cpu,
                     mae_values=mae,
                     pred_spectra_cpu=pred_spectra_cpu,
-                    target_spectrum_cpu=spectra_cpu[row_idx],
+                    target_spectrum_cpu=score_spectra_cpu[row_idx],
+                    conditioning_spectrum_cpu=conditioning_spectra_cpu[row_idx] if conditioning_spectra_cpu is not None else None,
                     field_mae_values=field_mae,
                     decoded_mae_values=decoded_mae,
                     vocab=vocab,
@@ -591,7 +677,8 @@ def main() -> None:
                         token_ids_cpu=token_ids_cpu,
                         mae_values=mae,
                         pred_spectra_cpu=pred_spectra_cpu,
-                        target_spectrum_cpu=spectra_cpu[row_idx],
+                        target_spectrum_cpu=score_spectra_cpu[row_idx],
+                        conditioning_spectrum_cpu=conditioning_spectra_cpu[row_idx] if conditioning_spectra_cpu is not None else None,
                         field_mae_values=field_mae,
                         decoded_mae_values=decoded_mae,
                         vocab=vocab,
@@ -638,6 +725,13 @@ def main() -> None:
             "classes": list(vocab.material_names),
         },
     }
+    if physicalize_info.get("enabled"):
+        summary["target_physicalize"] = {
+            "enabled": True,
+            "selection_target": selection_target_mode(cfg),
+            "autoencoder": physicalize_info.get("autoencoder"),
+            "nn": physicalize_info.get("nn"),
+        }
     plot_bundle_path = resolve_plot_bundle_path(cfg, args)
     if plot_bundle_path:
         bundle_output: dict[str, torch.Tensor] = {
