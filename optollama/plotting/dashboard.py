@@ -16,6 +16,7 @@ def wrap_tokens(tokens: Sequence[str], width: int = 60) -> str:
 def plot_mc_dashboard(
     mae_grid: Union[np.ndarray, Sequence[Sequence[float]]],
     target_spec: Union[np.ndarray, Sequence[Sequence[Sequence[float]]]],
+    conditioning_spec: Optional[Union[np.ndarray, Sequence[Sequence[Sequence[float]]]]] = None,
     pred_spec_grid: Optional[Union[np.ndarray, Sequence]] = None,
     pred_tokens_grid: Optional[Sequence[Sequence[Sequence[str]]]] = None,
     wavelengths: Optional[Union[np.ndarray, Sequence[float]]] = None,
@@ -31,6 +32,10 @@ def plot_mc_dashboard(
     target_spec_np = np.asarray(target_spec, dtype=float)
     if target_spec_np.shape[0] == 1 and n_targets > 1:
         target_spec_np = np.repeat(target_spec_np, n_targets, axis=0)
+
+    conditioning_spec_np = np.asarray(conditioning_spec, dtype=float) if conditioning_spec is not None else None
+    if conditioning_spec_np is not None and conditioning_spec_np.shape[0] == 1 and n_targets > 1:
+        conditioning_spec_np = np.repeat(conditioning_spec_np, n_targets, axis=0)
 
     pred_spec_grid_np = np.asarray(pred_spec_grid, dtype=float) if pred_spec_grid is not None else None
     x_axis = np.arange(target_spec_np.shape[-1]) if wavelengths is None else np.asarray(wavelengths, dtype=float)
@@ -70,6 +75,12 @@ def plot_mc_dashboard(
         ax_plot.plot(x_axis, target_row[0], label="R_target")
         ax_plot.plot(x_axis, target_row[1], label="A_target")
         ax_plot.plot(x_axis, target_row[2], label="T_target")
+
+        if conditioning_spec_np is not None:
+            conditioning_row = conditioning_spec_np[target_idx]
+            ax_plot.plot(x_axis, conditioning_row[0], ls="-.", label="R_cond")
+            ax_plot.plot(x_axis, conditioning_row[1], ls="-.", label="A_cond")
+            ax_plot.plot(x_axis, conditioning_row[2], ls="-.", label="T_cond")
 
         if pred_spec_grid_np is not None:
             pred_row = pred_spec_grid_np[target_idx, mc_idx]
@@ -160,4 +171,3 @@ def plot_mae_band(
     ax.legend()
     plt.tight_layout()
     return fig
-

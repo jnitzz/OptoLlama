@@ -330,6 +330,7 @@ def _dashboard_one(
 
     results = load_sample_results(samples_path(cfg, args))
     target_spec = optollama.plotting.results_target_spectra(results)
+    conditioning_spec = optollama.plotting.results_conditioning_spectra(results)
 
     pred_tokens_grid = None
     if bundle.ids_grid is not None:
@@ -351,6 +352,7 @@ def _dashboard_one(
     fig = optollama.plotting.plot_mc_dashboard(
         mae_grid=mae_grid,
         target_spec=target_spec,
+        conditioning_spec=conditioning_spec,
         pred_spec_grid=bundle.pred_spectra_grid,
         pred_tokens_grid=pred_tokens_grid,
         wavelengths=wavelengths,

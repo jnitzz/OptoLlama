@@ -159,6 +159,20 @@ def results_target_spectra(results: list[dict[str, Any]]) -> np.ndarray:
     return np.stack(spectra, axis=0)
 
 
+def results_conditioning_spectra(results: list[dict[str, Any]]) -> np.ndarray | None:
+    """
+    Stack optional conditioning spectra from inference results into ``[N, 3, W]``.
+    """
+    spectra = []
+    for item in results:
+        if "rat_conditioning" not in item:
+            return None
+        spectra.append(np.asarray(item["rat_conditioning"], dtype=np.float32))
+    if not spectra:
+        return None
+    return np.stack(spectra, axis=0)
+
+
 def build_pred_tokens_grid(
     ids_grid: np.ndarray,
     idx_to_token: dict[int, str],
