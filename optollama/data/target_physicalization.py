@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 
 from pathlib import Path
@@ -43,6 +46,104 @@ def _collect_safetensors(paths: list[str]) -> list[Path]:
         raise FileNotFoundError("No .safetensors files found for TARGET_PHYSICALIZE.NN_BLEND.")
 
     return sorted(files, key=_shard_sort_key)
+
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _tensor_fingerprint(tensor: torch.Tensor) -> dict[str, Any]:
+    cpu = tensor.detach().to(dtype=torch.float32, device="cpu").contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tuple(cpu.shape)).encode("utf-8"))
+    digest.update(cpu.numpy().tobytes())
+    return {
+        "shape": list(cpu.shape),
+        "dtype": "float32",
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _cache_key(
+    target: torch.Tensor,
+    wavelengths: torch.Tensor,
+    block: dict[str, Any],
+    files: list[Path],
+) -> str:
+    metric_roi_min = float(block.get("METRIC_ROI_MIN", float(wavelengths.min())))
+    metric_roi_max = float(block.get("METRIC_ROI_MAX", float(wavelengths.max())))
+    payload = {
+        "version": 1,
+        "target": _tensor_fingerprint(target),
+        "wavelengths": _tensor_fingerprint(wavelengths),
+        "metric_roi_min": metric_roi_min,
+        "metric_roi_max": metric_roi_max,
+        "metric_channels": [str(channel).upper() for channel in block.get("METRIC_CHANNELS", ["R", "T"])],
+        "source_files": [_file_fingerprint(path) for path in files],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _nn_cache_path(cfg: dict[str, Any], block: dict[str, Any]) -> Path:
+    configured = block.get("CACHE_PATH")
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(str(configured))))
+    return Path(str(cfg.get("OUTPUT_PATH", "."))) / "target_physicalize_nn_cache.json"
+
+
+def _load_nn_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "entries": {}}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError:
+        return {"version": 1, "entries": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "entries": {}}
+    data.setdefault("version", 1)
+    if not isinstance(data.get("entries"), dict):
+        data["entries"] = {}
+    return data
+
+
+def _save_nn_cache(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(cache, handle, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _load_cached_match(entry: dict[str, Any], target_width: int) -> dict[str, Any] | None:
+    file_path = Path(str(entry.get("file", "")))
+    local_index = int(entry.get("local_index", -1))
+    if local_index < 0 or not file_path.exists():
+        return None
+
+    with safe_open(str(file_path), framework="pt", device="cpu") as handle:
+        if "spectra" not in handle.keys():
+            return None
+        spectra = handle.get_tensor("spectra")
+
+    if spectra.dim() != 3 or spectra.size(1) != 3 or spectra.size(-1) != target_width:
+        return None
+    if local_index >= spectra.size(0):
+        return None
+
+    return {
+        "spectrum": spectra[local_index].to(torch.float32).clone(),
+        "mae": float(entry["mae"]),
+        "global_index": int(entry["global_index"]),
+        "file": str(file_path),
+        "local_index": local_index,
+    }
 
 
 def _shard_sort_key(path: Path) -> tuple[str, int | float]:
@@ -175,6 +276,7 @@ def find_nearest_training_spectrum(
     block: dict[str, Any],
     wavelengths: torch.Tensor,
     device: torch.device | str | None = None,
+    files: list[Path] | None = None,
 ) -> dict[str, Any]:
     """
     Stream dataset shards and return the closest training/test spectrum.
@@ -185,8 +287,9 @@ def find_nearest_training_spectrum(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device_t = torch.device(device)
 
-    paths = _dataset_paths_from_cfg(cfg, block)
-    files = _collect_safetensors(paths)
+    if files is None:
+        paths = _dataset_paths_from_cfg(cfg, block)
+        files = _collect_safetensors(paths)
     chunk_size = int(block.get("CHUNK_SIZE", 512000))
     channels = _channel_indices(block.get("METRIC_CHANNELS", ["R", "T"])).to(device_t)
 
@@ -253,6 +356,51 @@ def find_nearest_training_spectrum(
     }
 
 
+@torch.no_grad()
+def find_nearest_training_spectrum_cached(
+    target: torch.Tensor,
+    cfg: dict[str, Any],
+    block: dict[str, Any],
+    wavelengths: torch.Tensor,
+    device: torch.device | str | None = None,
+) -> dict[str, Any]:
+    """
+    Return the nearest training/test spectrum, using a persistent metadata cache when enabled.
+    """
+    paths = _dataset_paths_from_cfg(cfg, block)
+    files = _collect_safetensors(paths)
+    cache_enabled = bool(block.get("CACHE_ENABLED", True))
+    cache_path = _nn_cache_path(cfg, block)
+    key = _cache_key(target, wavelengths, block, files)
+
+    if cache_enabled:
+        cache = _load_nn_cache(cache_path)
+        entry = cache.get("entries", {}).get(key)
+        if isinstance(entry, dict):
+            cached = _load_cached_match(entry, target_width=int(target.size(-1)))
+            if cached is not None:
+                cached["cache"] = {"hit": True, "path": str(cache_path), "key": key}
+                return cached
+    else:
+        cache = {"version": 1, "entries": {}}
+
+    match = find_nearest_training_spectrum(target, cfg, block, wavelengths, device=device, files=files)
+    match["cache"] = {"hit": False, "path": str(cache_path), "key": key}
+
+    if cache_enabled:
+        cache.setdefault("version", 1)
+        cache.setdefault("entries", {})
+        cache["entries"][key] = {
+            "mae": float(match["mae"]),
+            "global_index": int(match["global_index"]),
+            "file": str(match["file"]),
+            "local_index": int(match["local_index"]),
+        }
+        _save_nn_cache(cache_path, cache)
+
+    return match
+
+
 def _apply_nn_blend(
     spectrum: torch.Tensor,
     cfg: dict[str, Any],
@@ -271,7 +419,7 @@ def _apply_nn_blend(
     nn_device = nn_cfg.get("DEVICE")
     if nn_device is None:
         nn_device = device
-    match = find_nearest_training_spectrum(spectrum, cfg, nn_cfg, wavelengths, device=nn_device)
+    match = find_nearest_training_spectrum_cached(spectrum, cfg, nn_cfg, wavelengths, device=nn_device)
     nn_spectrum = match["spectrum"].to(spectrum.device, dtype=spectrum.dtype)
 
     mode = str(nn_cfg.get("MODE", "outside_roi")).lower()
@@ -364,6 +512,7 @@ def physicalize_target_spectrum(
             "global_index": nn_info["global_index"],
             "file": nn_info["file"],
             "local_index": nn_info["local_index"],
+            "cache": nn_info.get("cache"),
         },
     }
     return conditioned, info

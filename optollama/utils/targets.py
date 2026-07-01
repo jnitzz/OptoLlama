@@ -5,6 +5,7 @@ import os
 import re
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,11 +55,39 @@ def _expand_target_globs(patterns: list[Any]) -> list[str]:
     targets: list[str] = []
     for pattern in patterns:
         pattern = os.path.expandvars(os.path.expanduser(str(pattern)))
+        if os.path.isdir(pattern):
+            pattern = os.path.join(pattern, "*.csv")
         matches = [match for match in sorted(glob.glob(pattern)) if os.path.isfile(match)]
         if not matches:
             raise FileNotFoundError(f"TARGET_GLOB did not match any files: {pattern}")
         targets.extend(matches)
     return targets
+
+
+def make_run_stamp(now: datetime | None = None) -> str:
+    """Return the default timestamp key for inference sample artifacts."""
+    return (now or datetime.now()).strftime("%y%m%d-%H%M")
+
+
+def timestamped_sample_path(path: str, stamp: str) -> str:
+    """Insert a run timestamp into a sample JSON filename."""
+    sample_path = Path(path)
+    stem = sample_path.stem
+    if re.search(r"(?:^|-)\d{6}-\d{4}(?:-|$)", stem):
+        return str(sample_path)
+    if stem.endswith("-samples"):
+        stem = f"{stem[: -len('-samples')]}-{stamp}-samples"
+    else:
+        stem = f"{stem}-{stamp}"
+    return str(sample_path.with_name(f"{stem}{sample_path.suffix}"))
+
+
+def cfg_with_timestamped_samples_path(cfg: dict[str, Any], stamp: str | None) -> dict[str, Any]:
+    """Return a shallow config copy with timestamped ``SAMPLES_PATH`` when configured."""
+    stamped_cfg = dict(cfg)
+    if stamp and stamped_cfg.get("SAMPLES_PATH"):
+        stamped_cfg["SAMPLES_PATH"] = timestamped_sample_path(str(stamped_cfg["SAMPLES_PATH"]), stamp)
+    return stamped_cfg
 
 
 def has_multi_target_config(cfg: dict[str, Any]) -> bool:
@@ -86,19 +115,21 @@ def resolve_target_specs(cfg: dict[str, Any]) -> tuple[list[TargetSpec], bool]:
     return [TargetSpec(target=target, name=name) for target, name in zip(targets, names)], multi_target
 
 
-def cfg_for_target(cfg: dict[str, Any], spec: TargetSpec, multi_target: bool) -> dict[str, Any]:
+def cfg_for_target(
+    cfg: dict[str, Any],
+    spec: TargetSpec,
+    multi_target: bool,
+    sample_stamp: str | None = None,
+) -> dict[str, Any]:
     """
     Return a shallow config copy for one target.
 
-    Single-target mode preserves the configured output paths. Multi-target mode
-    writes inference artifacts into ``OUTPUT_PATH/<target_name>/``.
+    Target runs write inference artifacts into ``OUTPUT_PATH/<target_name>/``.
+    Validation-dataset runs without a target keep the configured root paths.
     """
     target_cfg = dict(cfg)
     target_cfg["TARGET"] = spec.target
     target_cfg["TARGET_NAME"] = spec.name
-
-    if not multi_target:
-        return target_cfg
 
     output_path = os.path.join(str(cfg["OUTPUT_PATH"]), spec.name)
     target_cfg["OUTPUT_PATH"] = output_path
@@ -106,10 +137,13 @@ def cfg_for_target(cfg: dict[str, Any], spec: TargetSpec, multi_target: bool) ->
     target_cfg["GRID_PATH"] = os.path.join(output_path, "grid.json")
     target_cfg["IDS_PATH"] = os.path.join(output_path, "ids.json")
     target_cfg["PLOT_BUNDLE_PATH"] = os.path.join(output_path, "plot-bundle.npz")
-    return target_cfg
+    return cfg_with_timestamped_samples_path(target_cfg, sample_stamp)
 
 
-def target_cfgs(cfg: dict[str, Any]) -> tuple[list[tuple[TargetSpec, dict[str, Any]]], bool]:
+def target_cfgs(
+    cfg: dict[str, Any],
+    sample_stamp: str | None = None,
+) -> tuple[list[tuple[TargetSpec, dict[str, Any]]], bool]:
     """Resolve targets and return per-target configs."""
     specs, multi_target = resolve_target_specs(cfg)
-    return [(spec, cfg_for_target(cfg, spec, multi_target)) for spec in specs], multi_target
+    return [(spec, cfg_for_target(cfg, spec, multi_target, sample_stamp)) for spec in specs], multi_target

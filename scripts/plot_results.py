@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 
 from pathlib import Path
 from typing import Optional
@@ -17,9 +18,40 @@ import optollama.plotting
 import optollama.utils
 
 
+SAMPLE_STAMP_RE = re.compile(r"(?:^|-)(\d{6}-\d{4})(?:-samples)?\.json$")
+
+
 def train_paths_from_cfg(cfg: dict) -> list[str]:
     """Collect configured training shard paths."""
     return sorted([cfg[key] for key in cfg.keys() if key.startswith("DATA_PATH_TRAIN")])
+
+
+def plot_nn_cache_block(cfg: dict, plot_device: str | torch.device) -> dict:
+    """Build cached nearest-neighbor settings for sample plots."""
+    cache_path = cfg.get("PLOT_NN_CACHE_PATH")
+    if cache_path is None:
+        cache_path = str(Path(cfg["OUTPUT_PATH"]) / "plot_nn_cache.json")
+    return {
+        "SOURCE_PATHS": train_paths_from_cfg(cfg),
+        "CHUNK_SIZE": int(cfg.get("PLOT_NN_CHUNK_SIZE", 4096)),
+        "DEVICE": str(plot_device),
+        "METRIC_ROI_MIN": cfg.get("ROI_MIN", float(cfg["WAVELENGTHS"].min())),
+        "METRIC_ROI_MAX": cfg.get("ROI_MAX", float(cfg["WAVELENGTHS"].max())),
+        "METRIC_CHANNELS": cfg.get("PLOT_NN_METRIC_CHANNELS", ["R", "A", "T"]),
+        "CACHE_ENABLED": bool(cfg.get("PLOT_NN_CACHE_ENABLED", True)),
+        "CACHE_PATH": cache_path,
+    }
+
+
+def load_train_ids_from_nn_match(match: dict) -> torch.Tensor:
+    """Load the token sequence for a cached nearest-neighbor match."""
+    from safetensors.torch import safe_open
+
+    with safe_open(str(match["file"]), framework="pt", device="cpu") as handle:
+        if "thin_films" not in handle.keys():
+            raise KeyError(f"{match['file']} must contain a 'thin_films' tensor.")
+        thin_films = handle.get_tensor("thin_films")
+    return thin_films[int(match["local_index"])]
 
 
 def decode_ids(ids: torch.Tensor, idx_to_token: dict[int, str], eos_idx: int, pad_idx: int, msk_idx: int) -> list[str]:
@@ -99,9 +131,137 @@ def load_sample_results(path: str) -> list[dict]:
     return results
 
 
+def _latest_path(paths: list[Path]) -> Path | None:
+    """Return the newest path, using filename timestamp order before mtime."""
+    if not paths:
+        return None
+    return sorted(paths, key=lambda path: (path.name, path.stat().st_mtime_ns), reverse=True)[0]
+
+
+def _resolve_samples_file(path: str) -> str:
+    """Resolve explicit or timestamped sample result paths."""
+    sample_path = Path(path)
+    if sample_path.is_file():
+        return str(sample_path)
+    if sample_path.is_dir():
+        candidates = list(sample_path.glob("*samples*.json"))
+        latest = _latest_path(candidates)
+        if latest is not None:
+            return str(latest)
+        raise FileNotFoundError(f"No sample JSON matching '*samples*.json' found in {sample_path}.")
+
+    parent = sample_path.parent
+    if parent.exists():
+        patterns = []
+        if sample_path.stem == "samples":
+            patterns.append("samples-*.json")
+        elif sample_path.stem.endswith("-samples"):
+            prefix = sample_path.stem[: -len("-samples")]
+            patterns.append(f"{prefix}-*-samples{sample_path.suffix}")
+        patterns.append(sample_path.name)
+
+        candidates: list[Path] = []
+        for pattern in patterns:
+            candidates.extend(path for path in parent.glob(pattern) if path.is_file())
+        latest = _latest_path(candidates)
+        if latest is not None:
+            return str(latest)
+
+    return str(sample_path)
+
+
+def _sample_stamp(path: Path) -> str | None:
+    """Return a YYMMDD-HHMM sample timestamp from a result filename."""
+    match = SAMPLE_STAMP_RE.search(path.name)
+    return None if match is None else match.group(1)
+
+
+def _sample_plot_filename(sample_path: str, sample_index: int) -> str:
+    """Build the default sample plot filename from the sample result timestamp."""
+    stamp = _sample_stamp(Path(sample_path)) or optollama.utils.make_run_stamp()
+    return f"sample_{sample_index}_{stamp}.pdf"
+
+
+def _latest_sample_entries_by_folder(
+    cfg: dict,
+    target_selector: str | None,
+    samples_root: str | None = None,
+) -> list[tuple[optollama.utils.TargetSpec, dict]]:
+    """Discover target folders and use each folder's newest timestamped samples file."""
+    root = Path(samples_root) if samples_root else Path(cfg["OUTPUT_PATH"])
+    if not root.is_dir():
+        return []
+
+    latest_by_name: dict[str, tuple[Path, optollama.utils.TargetSpec]] = {}
+    for target_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        spec = optollama.utils.TargetSpec(target=str(target_dir), name=target_dir.name)
+        if target_selector is not None and not _target_matches(spec, target_selector):
+            continue
+        candidates: list[Path] = []
+        for sample_file in target_dir.glob("*samples*.json"):
+            stamp = _sample_stamp(sample_file)
+            if stamp is not None:
+                candidates.append(sample_file)
+        latest = _latest_path(candidates)
+        if latest is not None:
+            latest_by_name[spec.name] = (latest, spec)
+
+    entries: list[tuple[optollama.utils.TargetSpec, dict]] = []
+    for name in sorted(latest_by_name):
+        sample_file, spec = latest_by_name[name]
+        target_dir = sample_file.parent
+        target_cfg = dict(cfg)
+        target_cfg["TARGET_NAME"] = spec.name
+        target_cfg["OUTPUT_PATH"] = str(target_dir)
+        target_cfg["SAMPLES_PATH"] = str(sample_file)
+        target_cfg["GRID_PATH"] = str(target_dir / "grid.json")
+        target_cfg["IDS_PATH"] = str(target_dir / "ids.json")
+        target_cfg["PLOT_BUNDLE_PATH"] = str(target_dir / "plot-bundle.npz")
+        entries.append((spec, target_cfg))
+
+    return entries
+
+
 def samples_path(cfg: dict, args: argparse.Namespace) -> str:
     """Return the sample JSON path selected by CLI or config."""
-    return str(args.samples_path or cfg["SAMPLES_PATH"])
+    return _resolve_samples_file(str(args.samples_path or cfg["SAMPLES_PATH"]))
+
+
+def plot_bundle_path(cfg: dict, explicit: str | None = None) -> str | None:
+    """Return a plot bundle path, accepting either a file or containing folder."""
+    raw_path = explicit or cfg.get("PLOT_BUNDLE_PATH")
+    if not raw_path:
+        return None
+    path = Path(str(raw_path))
+    if path.is_dir():
+        latest = _latest_path([candidate for candidate in path.glob("*plot-bundle*.npz") if candidate.is_file()])
+        return None if latest is None else str(latest)
+    return str(path)
+
+
+def _args_for_target_artifacts(args: argparse.Namespace, spec: optollama.utils.TargetSpec) -> argparse.Namespace:
+    """Resolve artifact-folder overrides for one target in a multi-target run."""
+    copied = argparse.Namespace(**vars(args))
+    if args.samples_path:
+        samples_root = Path(args.samples_path)
+        target_samples_dir = samples_root / spec.name
+        if samples_root.is_dir() and target_samples_dir.is_dir():
+            copied.samples_path = str(target_samples_dir)
+    plot_bundle = getattr(args, "plot_bundle", None)
+    if plot_bundle:
+        bundle_root = Path(plot_bundle)
+        target_bundle_dir = bundle_root / spec.name
+        if bundle_root.is_dir() and target_bundle_dir.is_dir():
+            copied.plot_bundle = str(target_bundle_dir)
+    return copied
+
+
+def _should_discover_target_folders(cfg: dict, args: argparse.Namespace) -> bool:
+    """Return whether plotting should discover per-target result folders."""
+    samples_override = getattr(args, "samples_path", None)
+    if samples_override is not None:
+        return Path(samples_override).is_dir()
+    return bool(getattr(args, "target", None)) or optollama.utils.has_multi_target_config(cfg)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -112,26 +272,26 @@ def parse_arguments() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sample = subparsers.add_parser("sample", help="Plot one target/prediction sample.")
-    sample.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
+    sample.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to YAML config file.")
     sample.add_argument("--index", type=int, default=None, help="Result index to plot. Defaults to the best-MAE sample.")
     sample.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
     sample.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
     sample.add_argument("--no-nn", action="store_true", help="Disable optional nearest-neighbor overlay.")
     sample.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
-    sample.add_argument("--save", type=str, default=None, help="Output file for single-target mode, output directory for multi-target mode.")
+    sample.add_argument("--save", type=str, default=None, help="Output file for one target, output directory for multiple targets.")
 
     dashboard = subparsers.add_parser("dashboard", help="Plot the MC dashboard over all saved samples.")
-    dashboard.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
+    dashboard.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to YAML config file.")
     dashboard.add_argument("--topk", type=int, default=4, help="Number of best grid cells to detail below the heatmap.")
     dashboard.add_argument("--mae", choices=("native", "common"), default="native", help="MAE grid to display.")
     dashboard.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
     dashboard.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
     dashboard.add_argument("--plot-bundle", type=str, default=None, help="Override config PLOT_BUNDLE_PATH.")
     dashboard.add_argument("--show", action="store_true", help="Display the figure in addition to saving it.")
-    dashboard.add_argument("--save", type=str, default=None, help="Output file for single-target mode, output directory for multi-target mode.")
+    dashboard.add_argument("--save", type=str, default=None, help="Output file for one target, output directory for multiple targets.")
 
     nn_scatter = subparsers.add_parser("nn-scatter", help="Plot model-vs-nearest-neighbor MAE scatter.")
-    nn_scatter.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
+    nn_scatter.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to YAML config file.")
     nn_scatter.add_argument("--nn-matches", type=str, default=None, help="Path to nearest-neighbor matches JSON.")
     nn_scatter.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
     nn_scatter.add_argument("--max-points", type=int, default=1000, help="Maximum number of points to plot.")
@@ -190,6 +350,8 @@ def _plot_target_entries(
     if not entries:
         return [(None, cfg)], False
     if not multi_target:
+        if target_selector is not None and not _target_matches(entries[0][0], target_selector):
+            raise ValueError(f"Configured target did not match --target {target_selector!r}.")
         return [(entries[0][0], entries[0][1])], False
 
     if target_selector is not None:
@@ -200,10 +362,23 @@ def _plot_target_entries(
     return entries, True
 
 
-def _multi_plot_path(cfg: dict, save_dir: str | None, spec: optollama.utils.TargetSpec, filename: str) -> str:
-    """Build a central multi-target plot path."""
-    plot_dir = Path(save_dir) if save_dir else Path(cfg["OUTPUT_PATH"]) / "plots"
-    return str(plot_dir / f"{spec.name}_{filename}")
+def _target_batch_plot_path(
+    save_arg: str | None,
+    spec: optollama.utils.TargetSpec,
+    filename: str,
+    target_count: int,
+) -> str | None:
+    """Return an explicit target-batch plot path when --save was provided."""
+    if save_arg is None:
+        return None
+
+    save_path = Path(save_arg)
+    if save_path.suffix:
+        if target_count == 1:
+            return str(save_path)
+        raise ValueError("--save must be a directory when plotting multiple targets.")
+
+    return str(save_path / f"{spec.name}_{filename}")
 
 
 def _sample_one(
@@ -220,7 +395,7 @@ def _sample_one(
         raise RuntimeError(f"No inference results found at {path}")
 
     bundle = None
-    bundle_path = getattr(args, "plot_bundle", None) or cfg.get("PLOT_BUNDLE_PATH")
+    bundle_path = plot_bundle_path(cfg, getattr(args, "plot_bundle", None))
     if bundle_path and os.path.exists(bundle_path):
         bundle = optollama.plotting.load_plot_bundle(bundle_path)
 
@@ -240,31 +415,23 @@ def _sample_one(
     nn_mae = None
 
     if cfg.get("PLOT_SAMPLE_WITH_NN", False) and not bool(getattr(args, "no_nn", False)):
-        from template_matching import find_best_train_for_target, load_train_sample_by_global_id
-
         _, _, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
         plot_device = cfg.get("PLOT_NN_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
-        roi_mask = optollama.data.spectra.wavelength_mask(
-            cfg["WAVELENGTHS"],
-            cfg.get("ROI_MIN"),
-            cfg.get("ROI_MAX"),
-            plot_device,
-        )
-        nn_result = find_best_train_for_target(
+        nn_match = optollama.data.find_nearest_training_spectrum_cached(
             torch.tensor(sample_target_spectrum(sample)),
-            train_paths=train_paths_from_cfg(cfg),
-            train_chunk_size=int(cfg.get("PLOT_NN_CHUNK_SIZE", 4096)),
+            cfg,
+            plot_nn_cache_block(cfg, plot_device),
+            cfg["WAVELENGTHS"],
             device=plot_device,
-            wl_range=roi_mask,
         )
-        nn_spectrum, nn_ids, _, _ = load_train_sample_by_global_id(
-            nn_result["best_global_index"],
-            train_paths=train_paths_from_cfg(cfg),
-        )
+        nn_spectrum = nn_match["spectrum"]
+        nn_ids = load_train_ids_from_nn_match(nn_match)
         nn_tokens = decode_ids(nn_ids, idx_to_token, eos_idx, pad_idx, msk_idx)
-        nn_id = nn_result["best_global_index"]
-        nn_mae = nn_result["best_mae"]
-        print(f"NN match for sample {sample_index}: train index {nn_id}, MAE={nn_mae:.6f}")
+        nn_id = nn_match["global_index"]
+        nn_mae = nn_match["mae"]
+        cache = nn_match.get("cache") or {}
+        cache_note = f", cache={'hit' if cache.get('hit') else 'miss'}" if cache else ""
+        print(f"NN match for sample {sample_index}: train index {nn_id}, MAE={nn_mae:.6f}{cache_note}")
 
     fig = optollama.plotting.plot_sample_comparison(
         wavelengths=wavelengths,
@@ -291,7 +458,11 @@ def _sample_one(
     )
 
     if save_path is None and args.save is None:
-        save_path = os.path.join(ensure_plot_dir(cfg), f"sample_{sample_index}.pdf")
+        default_filename = _sample_plot_filename(path, sample_index)
+        if cfg.get("TARGET_NAME"):
+            save_path = os.path.join(str(cfg["OUTPUT_PATH"]), default_filename)
+        else:
+            save_path = os.path.join(ensure_plot_dir(cfg), default_filename)
     else:
         save_path = save_path or args.save
     save_figure(fig, save_path, args.show)
@@ -299,14 +470,25 @@ def _sample_one(
 
 def sample_command(cfg: dict, args: argparse.Namespace) -> None:
     """Render one sample plot, or one plot per configured target."""
-    entries, multi_target = _plot_target_entries(cfg, args.target)
+    entries = (
+        _latest_sample_entries_by_folder(cfg, args.target, args.samples_path)
+        if _should_discover_target_folders(cfg, args)
+        else []
+    )
+    multi_target = bool(entries)
+    if entries:
+        print(f"Plotting latest samples per target folder: {len(entries)} targets.")
+    else:
+        entries, multi_target = _plot_target_entries(cfg, args.target)
     if not multi_target:
         _sample_one(entries[0][1], args)
         return
 
+    target_count = len(entries)
     for spec, target_cfg in entries:
-        save_path = _multi_plot_path(cfg, args.save, spec, "sample.pdf")
-        _sample_one(target_cfg, args, title_prefix=spec.name, save_path=save_path)
+        save_path = _target_batch_plot_path(args.save, spec, "sample.pdf", target_count)
+        target_args = _args_for_target_artifacts(args, spec)
+        _sample_one(target_cfg, target_args, title_prefix=spec.name, save_path=save_path)
 
 
 def _dashboard_one(
@@ -317,7 +499,7 @@ def _dashboard_one(
     save_path: str | None = None,
 ) -> None:
     """Render the MC dashboard plot from the saved plot bundle."""
-    bundle_path = args.plot_bundle or cfg.get("PLOT_BUNDLE_PATH")
+    bundle_path = plot_bundle_path(cfg, args.plot_bundle)
     if not bundle_path or not os.path.exists(bundle_path):
         raise FileNotFoundError(
             "Plot bundle not found. Run inference first so it can write the compressed plotting bundle."
@@ -365,7 +547,10 @@ def _dashboard_one(
     )
 
     if save_path is None and args.save is None:
-        save_path = os.path.join(ensure_plot_dir(cfg), "dashboard.pdf")
+        if cfg.get("TARGET_NAME"):
+            save_path = os.path.join(str(cfg["OUTPUT_PATH"]), "dashboard.pdf")
+        else:
+            save_path = os.path.join(ensure_plot_dir(cfg), "dashboard.pdf")
     else:
         save_path = save_path or args.save
     save_figure(fig, save_path, args.show)
@@ -373,14 +558,25 @@ def _dashboard_one(
 
 def dashboard_command(cfg: dict, args: argparse.Namespace) -> None:
     """Render one dashboard, or one dashboard per configured target."""
-    entries, multi_target = _plot_target_entries(cfg, args.target)
+    entries = (
+        _latest_sample_entries_by_folder(cfg, args.target, args.samples_path)
+        if _should_discover_target_folders(cfg, args)
+        else []
+    )
+    multi_target = bool(entries)
+    if entries:
+        print(f"Plotting dashboards for latest samples per target folder: {len(entries)} targets.")
+    else:
+        entries, multi_target = _plot_target_entries(cfg, args.target)
     if not multi_target:
         _dashboard_one(entries[0][1], args)
         return
 
+    target_count = len(entries)
     for spec, target_cfg in entries:
-        save_path = _multi_plot_path(cfg, args.save, spec, "dashboard.pdf")
-        _dashboard_one(target_cfg, args, title_prefix=spec.name, save_path=save_path)
+        save_path = _target_batch_plot_path(args.save, spec, "dashboard.pdf", target_count)
+        target_args = _args_for_target_artifacts(args, spec)
+        _dashboard_one(target_cfg, target_args, title_prefix=spec.name, save_path=save_path)
 
 
 def nn_scatter_command(cfg: dict, args: argparse.Namespace) -> None:

@@ -293,6 +293,9 @@ def log_physicalization(info: dict[str, Any], cfg: dict[str, Any]) -> None:
             f"NN id={nn['global_index']} mae={nn['mae']:.6f} "
             f"file={nn['file']}:{nn['local_index']}"
         )
+        cache = nn.get("cache") or {}
+        if cache:
+            parts.append(f"NN cache={'hit' if cache.get('hit') else 'miss'}")
     print(", ".join(parts) + ".")
 
 
@@ -515,30 +518,28 @@ def candidate_record(
     return record
 
 
-def main() -> None:
-    args = parse_args()
-    cfg = optollama.utils.load_config(args)
-    apply_depth_field_eval_defaults(cfg, args)
-    out_json = resolve_out_json(cfg, args.out_json)
-    seed = int(args.seed if args.seed is not None else cfg_required(cfg, "SEED", "--seed"))
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    device = resolve_device(args.device)
-    tmm_device = resolve_tmm_device(args.tmm_device, device)
-
-    tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
-    target = configured_target(cfg, args)
-    score_spectrum_cpu = None
-    physicalize_info: dict[str, Any] = {"enabled": False}
-    if target is not None:
-        loader, score_spectrum_cpu, physicalize_info = make_target_loader(cfg, args, target, msk_idx, device)
-    else:
-        loader = make_eval_loader(cfg, args)
+def run_depth_field_inference(
+    *,
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    out_json: str,
+    target: str | None,
+    loader: torch.utils.data.DataLoader,
+    score_spectrum_cpu: torch.Tensor | None,
+    physicalize_info: dict[str, Any],
+    model: optollama.model.DepthFieldDiffusion,
+    extra: dict[str, Any],
+    tokens: list[str],
+    token_to_idx: dict[str, int],
+    idx_to_token: dict[int, str],
+    eos_idx: int,
+    pad_idx: int,
+    msk_idx: int,
+    device: torch.device,
+    tmm_device: torch.device,
+) -> dict[str, Any]:
     vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
     material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
-    model, extra = load_depth_model(args.checkpoint, device)
     depth_info = extra.get("depth_field") or {}
     dz_nm = float(depth_field_metadata(cfg, depth_info, "dz_nm", "DZ_NM"))
     max_thickness_nm = float(depth_field_metadata(cfg, depth_info, "max_thickness_nm", "MAX_THICKNESS_NM"))
@@ -812,6 +813,116 @@ def main() -> None:
     print(f"Saved {len(results)} depth-field samples -> {out_path}")
     if mae_all:
         print(f"MAE mean={summary['mae_mean']:.6f}, median={summary['mae_median']:.6f}, best={summary['mae_min']:.6f}")
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = optollama.utils.load_config(args)
+    apply_depth_field_eval_defaults(cfg, args)
+    sample_stamp = optollama.utils.make_run_stamp()
+    seed = int(args.seed if args.seed is not None else cfg_required(cfg, "SEED", "--seed"))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = resolve_device(args.device)
+    tmm_device = resolve_tmm_device(args.tmm_device, device)
+    tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
+    model, extra = load_depth_model(args.checkpoint, device)
+
+    explicit_target = configured_target(cfg, args) if args.target is not None else None
+    if explicit_target is not None:
+        target_spec = optollama.utils.TargetSpec(
+            target=explicit_target,
+            name=optollama.utils.safe_target_name(explicit_target),
+        )
+        run_cfg = optollama.utils.cfg_for_target(
+            cfg,
+            target_spec,
+            multi_target=False,
+            sample_stamp=None if args.out_json else sample_stamp,
+        )
+        loader, score_spectrum_cpu, physicalize_info = make_target_loader(run_cfg, args, explicit_target, msk_idx, device)
+        run_depth_field_inference(
+            cfg=run_cfg,
+            args=args,
+            out_json=resolve_out_json(run_cfg, args.out_json),
+            target=explicit_target,
+            loader=loader,
+            score_spectrum_cpu=score_spectrum_cpu,
+            physicalize_info=physicalize_info,
+            model=model,
+            extra=extra,
+            tokens=tokens,
+            token_to_idx=token_to_idx,
+            idx_to_token=idx_to_token,
+            eos_idx=eos_idx,
+            pad_idx=pad_idx,
+            msk_idx=msk_idx,
+            device=device,
+            tmm_device=tmm_device,
+        )
+        return
+
+    target_entries, multi_target = optollama.utils.target_cfgs(cfg, sample_stamp=sample_stamp)
+    if target_entries:
+        if multi_target and args.out_json:
+            raise ValueError(
+                "--out-json cannot be used with TARGETS/TARGET_GLOB because each target writes its own samples file."
+            )
+        if multi_target and args.plot_bundle:
+            raise ValueError(
+                "--plot-bundle cannot be used with TARGETS/TARGET_GLOB because each target writes its own plot bundle."
+            )
+        if multi_target:
+            print(f"Depth-field multi-target inference enabled: {len(target_entries)} targets.")
+        for index, (spec, target_cfg) in enumerate(target_entries, start=1):
+            if multi_target:
+                print(f"\n[{index}/{len(target_entries)}] Target {spec.name}: {spec.target}")
+            loader, score_spectrum_cpu, physicalize_info = make_target_loader(target_cfg, args, spec.target, msk_idx, device)
+            run_depth_field_inference(
+                cfg=target_cfg,
+                args=args,
+                out_json=resolve_out_json(target_cfg, args.out_json),
+                target=spec.target,
+                loader=loader,
+                score_spectrum_cpu=score_spectrum_cpu,
+                physicalize_info=physicalize_info,
+                model=model,
+                extra=extra,
+                tokens=tokens,
+                token_to_idx=token_to_idx,
+                idx_to_token=idx_to_token,
+                eos_idx=eos_idx,
+                pad_idx=pad_idx,
+                msk_idx=msk_idx,
+                device=device,
+                tmm_device=tmm_device,
+            )
+        return
+
+    run_cfg = optollama.utils.cfg_with_timestamped_samples_path(cfg, None if args.out_json else sample_stamp)
+    loader = make_eval_loader(run_cfg, args)
+    run_depth_field_inference(
+        cfg=run_cfg,
+        args=args,
+        out_json=resolve_out_json(run_cfg, args.out_json),
+        target=None,
+        loader=loader,
+        score_spectrum_cpu=None,
+        physicalize_info={"enabled": False},
+        model=model,
+        extra=extra,
+        tokens=tokens,
+        token_to_idx=token_to_idx,
+        idx_to_token=idx_to_token,
+        eos_idx=eos_idx,
+        pad_idx=pad_idx,
+        msk_idx=msk_idx,
+        device=device,
+        tmm_device=tmm_device,
+    )
 
 
 if __name__ == "__main__":

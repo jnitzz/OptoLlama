@@ -99,6 +99,9 @@ def _load_target_spectra(target: str, cfg: dict[str, Any], device: torch.device)
                 f"NN id={nn['global_index']} mae={nn['mae']:.6f} "
                 f"file={nn['file']}:{nn['local_index']}"
             )
+            cache = nn.get("cache") or {}
+            if cache:
+                parts.append(f"NN cache={'hit' if cache.get('hit') else 'miss'}")
         print(", ".join(parts) + ".")
 
         if selection_target == "original":
@@ -263,13 +266,15 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cudnn.benchmark = True
 
+    sample_stamp = optollama.utils.make_run_stamp()
+
     # --- distributed computation setup ---
     device, _, rank, world_size = optollama.utils.setup_run(cfg, make_dirs=True)
 
     # --- tokens ---
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
 
-    target_entries, multi_target = optollama.utils.target_cfgs(cfg)
+    target_entries, multi_target = optollama.utils.target_cfgs(cfg, sample_stamp=sample_stamp)
     first_target_loader: tuple[torch.utils.data.Dataset, torch.utils.data.DataLoader, torch.Tensor | None] | None = None
 
     if target_entries:
@@ -279,6 +284,7 @@ def inference(cfg: dict) -> tuple[dict[str, Any], dict[int, str], int, int, int]
         if rank == 0 and multi_target:
             print(f"Multi-target inference enabled: {len(target_entries)} targets.")
     else:
+        cfg = optollama.utils.cfg_with_timestamped_samples_path(cfg, sample_stamp)
         test_ds, test_loader, _ = optollama.data.SpectraDataset.make_loader(
             cfg, split="test", subset_n=cfg["NUM_SAMPLES_TEST"], ddp=False
         )

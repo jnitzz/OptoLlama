@@ -2,6 +2,9 @@ import os
 import random
 import subprocess
 
+from datetime import timedelta
+from typing import Any
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -29,7 +32,36 @@ def _slurm_master_addr() -> str:
     return nodelist.split(",", 1)[0].split("[", 1)[0]
 
 
-def init_distributed() -> tuple[str, int, int, int]:
+def _parse_timeout_minutes(value: Any, *, source: str) -> float | None:
+    """Parse an optional DDP timeout value in minutes."""
+    if value is None:
+        return None
+    minutes = float(value)
+    if minutes <= 0:
+        raise ValueError(f"{source} must be positive minutes, got {value!r}.")
+    return minutes
+
+
+def ddp_timeout_minutes(cfg: dict[str, Any] | None = None) -> float | None:
+    """Return configured DDP process-group timeout in minutes, if set."""
+    for env_name in ("OPTOLLAMA_DDP_TIMEOUT_MINUTES", "NCCL_TIMEOUT_MINUTES"):
+        if os.getenv(env_name) is not None:
+            return _parse_timeout_minutes(os.getenv(env_name), source=env_name)
+
+    if cfg is None:
+        return None
+    if cfg.get("DDP_TIMEOUT_MINUTES") is not None:
+        return _parse_timeout_minutes(cfg.get("DDP_TIMEOUT_MINUTES"), source="DDP_TIMEOUT_MINUTES")
+
+    distributed = cfg.get("DISTRIBUTED") or {}
+    if isinstance(distributed, dict):
+        value = distributed.get("TIMEOUT_MINUTES")
+        if value is not None:
+            return _parse_timeout_minutes(value, source="DISTRIBUTED.TIMEOUT_MINUTES")
+    return None
+
+
+def init_distributed(timeout_minutes: float | None = None) -> tuple[str, int, int, int]:
     """
     Init torch.distributed if plausible.
 
@@ -67,15 +99,18 @@ def init_distributed() -> tuple[str, int, int, int]:
             "rank": rank,
             "world_size": world_size,
         }
+        if timeout_minutes is not None:
+            init_kwargs["timeout"] = timedelta(minutes=float(timeout_minutes))
         if device.type == "cuda":
             init_kwargs["device_id"] = device
 
         dist.init_process_group(**init_kwargs)
 
+    timeout_note = f" timeout={float(timeout_minutes):g}min" if timeout_minutes is not None else ""
     print(
         f"[DDP={ddp}] backend={backend} world={world_size} rank={rank} "
         f"local_rank={local_rank} "
-        f"device={device}"
+        f"device={device}{timeout_note}"
     )
 
     return device, local_rank, rank, world_size
@@ -123,7 +158,7 @@ def setup_run(cfg: dict, make_dirs: bool = False) -> tuple[str, int, int, int]:
     tuple[str, int, int, int]
         The device string, node local rank, global rank and world size
     """
-    device, local_rank, rank, world_size = init_distributed()
+    device, local_rank, rank, world_size = init_distributed(timeout_minutes=ddp_timeout_minutes(cfg))
     seed = cfg["SEED"] or random.randint(1, int(1e6))
     set_all_seeds(seed)
     set_torch_options()

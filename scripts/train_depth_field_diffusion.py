@@ -374,15 +374,38 @@ def all_reduce_sum(values: torch.Tensor) -> torch.Tensor:
     return values
 
 
+def ddp_collective_device() -> torch.device:
+    """Return the tensor device required by the active distributed backend."""
+    backend = str(torch.distributed.get_backend()).lower()
+    if "nccl" in backend:
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def gather_1d_tensor(values: torch.Tensor) -> torch.Tensor:
     values = values.detach().cpu().reshape(-1)
     if not ddp_active():
         return values
-    gathered = [torch.empty(0, dtype=values.dtype) for _ in range(ddp_world_size())]
-    torch.distributed.all_gather_object(gathered, values)
-    if not gathered:
-        return values
-    return torch.cat(gathered, dim=0)
+
+    device = ddp_collective_device()
+    local = values.to(device=device)
+    local_count = torch.tensor([local.numel()], dtype=torch.long, device=device)
+    counts = [torch.zeros_like(local_count) for _ in range(ddp_world_size())]
+    torch.distributed.all_gather(counts, local_count)
+    count_values = [int(count.item()) for count in counts]
+    max_count = max(count_values, default=0)
+    if max_count == 0:
+        return torch.empty(0, dtype=values.dtype)
+
+    padded = torch.zeros(max_count, dtype=local.dtype, device=device)
+    if local.numel() > 0:
+        padded[: local.numel()] = local
+    gathered = [torch.empty_like(padded) for _ in range(ddp_world_size())]
+    torch.distributed.all_gather(gathered, padded)
+
+    parts = [tensor[:count].cpu() for tensor, count in zip(gathered, count_values) if count > 0]
+    return torch.cat(parts, dim=0) if parts else torch.empty(0, dtype=values.dtype)
+
 
 
 def depth_field_training_loss(
