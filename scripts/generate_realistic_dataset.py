@@ -153,6 +153,10 @@ CONFIG_DEFAULT_PATHS = {
     "thickness_min": (("REALISTIC_DATASET", "THICKNESS", "MIN"), ("REALISTIC_DATASET", "THICKNESS_MIN")),
     "thickness_max": (("REALISTIC_DATASET", "THICKNESS", "MAX"), ("REALISTIC_DATASET", "THICKNESS_MAX")),
     "thickness_step": (("REALISTIC_DATASET", "THICKNESS", "STEP"), ("REALISTIC_DATASET", "THICKNESS_STEP")),
+    "max_total_thickness_nm": (
+        ("REALISTIC_DATASET", "THICKNESS", "MAX_TOTAL_NM"),
+        ("REALISTIC_DATASET", "MAX_TOTAL_THICKNESS_NM"),
+    ),
     "wavelength_min": (
         ("REALISTIC_DATASET", "SPECTRUM", "WAVELENGTH_MIN"),
         ("REALISTIC_DATASET", "WAVELENGTH_MIN"),
@@ -313,6 +317,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--thickness-min", type=int, default=10, help="Minimum token thickness in nm.")
     p.add_argument("--thickness-max", type=int, default=500, help="Maximum token thickness in nm.")
     p.add_argument("--thickness-step", type=int, default=5, help="Token thickness step in nm.")
+    p.add_argument(
+        "--max-total-thickness-nm",
+        type=float,
+        default=None,
+        help="Optional maximum summed layer thickness per generated stack in nm, e.g. 10000 for 10 um.",
+    )
     p.add_argument("--wavelength-min", type=int, default=300, help="Minimum simulated wavelength in nm.")
     p.add_argument("--wavelength-max", type=int, default=1700, help="Maximum simulated wavelength in nm.")
     p.add_argument("--wavelength-step", type=int, default=5, help="Wavelength step in nm.")
@@ -355,6 +365,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--thickness-max must be >= --thickness-min.")
     if (args.thickness_max - args.thickness_min) % args.thickness_step != 0:
         raise ValueError("Thickness range must be divisible by --thickness-step.")
+    if args.max_total_thickness_nm is not None:
+        if args.max_total_thickness_nm <= 0:
+            raise ValueError("--max-total-thickness-nm must be positive when set.")
+        if args.min_layers * args.thickness_min > args.max_total_thickness_nm:
+            raise ValueError(
+                "--max-total-thickness-nm is too small for --min-layers and --thickness-min "
+                f"({args.min_layers} * {args.thickness_min} nm)."
+            )
     if args.wavelength_max < args.wavelength_min:
         raise ValueError("--wavelength-max must be >= --wavelength-min.")
     if args.wavelength_step <= 0:
@@ -541,6 +559,7 @@ def generate_stack_batch(
             center_max_nm=float(args.center_max),
             jitter_fraction=float(args.structure_jitter_fraction),
             generator=generator,
+            max_total_thickness_nm=args.max_total_thickness_nm,
         )
         stacks.append(
             optollama.data.encode_layer_tokens(
@@ -685,6 +704,8 @@ def main() -> None:
     print(f"Using device: {device}")
     print(f"Wavelengths: {args.wavelength_min}-{args.wavelength_max} nm step {args.wavelength_step} ({wavelengths.numel()} points)")
     print(f"Vocabulary: {len(tokens)} tokens ({len(materials)} materials, {args.thickness_step} nm thickness grid)")
+    if args.max_total_thickness_nm is not None:
+        print(f"Max total stack thickness: {float(args.max_total_thickness_nm):g} nm")
     print(f"Family weights: {family_weights}")
     print(f"Family targets: {family_targets}")
     print(
@@ -805,6 +826,7 @@ def main() -> None:
             "max": int(args.thickness_max),
             "step": int(args.thickness_step),
         },
+        "max_total_thickness_nm": None if args.max_total_thickness_nm is None else float(args.max_total_thickness_nm),
         "wavelength_grid_nm": {
             "min": int(args.wavelength_min),
             "max": int(args.wavelength_max),

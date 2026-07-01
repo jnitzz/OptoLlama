@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-batch-size", type=int, default=512, help="Number of stacks simulated per TMM batch.")
     p.add_argument("--min-layers", type=int, default=21, help="Minimum material layers in generated stacks.")
     p.add_argument("--max-layers", type=int, default=100, help="Maximum material layers in generated stacks.")
+    p.add_argument(
+        "--max-total-thickness-nm",
+        type=float,
+        default=None,
+        help="Optional maximum summed layer thickness per generated stack in nm, e.g. 10000 for 10 um.",
+    )
     p.add_argument("--output-seq-len", type=int, default=None, help="Saved thin_films width. Defaults to max_layers + 1.")
     p.add_argument(
         "--families",
@@ -186,6 +192,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-layers must be positive.")
     if args.max_layers < args.min_layers:
         raise ValueError("--max-layers must be >= --min-layers.")
+    if args.max_total_thickness_nm is not None and args.max_total_thickness_nm <= 0:
+        raise ValueError("--max-total-thickness-nm must be positive when set.")
     if args.jitter_fraction < 0.0:
         raise ValueError("--jitter-fraction must be non-negative.")
     if not args.families:
@@ -273,6 +281,7 @@ def main() -> None:
             jitter_fraction=float(args.jitter_fraction),
             generator=generator,
             device=device,
+            max_total_thickness_nm=args.max_total_thickness_nm,
         )
         generated_total += candidate_count
         family_generated.update(families)
@@ -373,6 +382,7 @@ def main() -> None:
         ),
         "min_layers": int(args.min_layers),
         "max_layers": int(args.max_layers),
+        "max_total_thickness_nm": None if args.max_total_thickness_nm is None else float(args.max_total_thickness_nm),
         "output_seq_len": int(output_seq_len),
         "center_min": float(center_min),
         "center_max": float(center_max),

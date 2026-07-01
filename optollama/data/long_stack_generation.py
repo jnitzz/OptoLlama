@@ -225,6 +225,16 @@ def _thickness_bounds(library: LongStackLibrary) -> tuple[int, int]:
     return min(thicknesses), max(thicknesses)
 
 
+def layer_total_thickness_nm(layers: Sequence[int], library: LongStackLibrary) -> float:
+    """Return total token thickness for a generated layer-id sequence."""
+    total = 0.0
+    for token_id in layers:
+        thickness = library.index.token_thicknesses[int(token_id)]
+        if thickness is not None:
+            total += float(thickness)
+    return total
+
+
 def _random_thickness(library: LongStackLibrary, generator: torch.Generator, max_nm: Optional[int] = None) -> int:
     min_thickness, max_thickness = _thickness_bounds(library)
     if max_nm is not None:
@@ -876,10 +886,53 @@ def generate_long_stack_layers(
     center_max_nm: float,
     jitter_fraction: float,
     generator: torch.Generator,
+    max_total_thickness_nm: Optional[float] = None,
+    max_total_thickness_attempts: int = 100,
 ) -> list[int]:
     """
     Generate one tokenized layer list from a named family.
     """
+    if max_total_thickness_nm is not None:
+        min_thickness, _ = _thickness_bounds(library)
+        min_possible = float(max(0, int(min_layers)) * min_thickness)
+        if min_possible > float(max_total_thickness_nm):
+            raise ValueError(
+                f"min_layers={min_layers} with minimum token thickness {min_thickness} nm "
+                f"cannot satisfy max_total_thickness_nm={max_total_thickness_nm:g}."
+            )
+
+    attempts = max(1, int(max_total_thickness_attempts))
+    for _ in range(attempts):
+        layers = _generate_long_stack_layers_once(
+            family,
+            library=library,
+            min_layers=min_layers,
+            max_layers=max_layers,
+            center_min_nm=center_min_nm,
+            center_max_nm=center_max_nm,
+            jitter_fraction=jitter_fraction,
+            generator=generator,
+        )
+        if max_total_thickness_nm is None or layer_total_thickness_nm(layers, library) <= float(max_total_thickness_nm):
+            return layers
+
+    raise RuntimeError(
+        f"Could not generate {family!r} stack within max_total_thickness_nm={max_total_thickness_nm:g} "
+        f"after {attempts} attempts. Reduce min/max layers or increase the thickness limit."
+    )
+
+
+def _generate_long_stack_layers_once(
+    family: str,
+    library: LongStackLibrary,
+    min_layers: int,
+    max_layers: int,
+    center_min_nm: float,
+    center_max_nm: float,
+    jitter_fraction: float,
+    generator: torch.Generator,
+) -> list[int]:
+    """Generate one tokenized layer list without total-thickness rejection."""
     if family == "random":
         return generate_random_layers(library, min_layers, max_layers, generator)
     if family == "random_dielectric":
@@ -931,6 +984,7 @@ def generate_long_stack_batch(
     jitter_fraction: float,
     generator: torch.Generator,
     device: torch.device,
+    max_total_thickness_nm: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     """
     Generate a batch of encoded long stacks.
@@ -950,6 +1004,7 @@ def generate_long_stack_batch(
             center_max_nm=center_max_nm,
             jitter_fraction=jitter_fraction,
             generator=generator,
+            max_total_thickness_nm=max_total_thickness_nm,
         )
         stacks.append(encode_layer_tokens(layers, output_seq_len, eos=eos, pad=pad, device=device))
         lengths.append(len(layers))
