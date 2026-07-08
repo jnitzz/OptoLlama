@@ -296,6 +296,14 @@ def log_physicalization(info: dict[str, Any], cfg: dict[str, Any]) -> None:
         cache = nn.get("cache") or {}
         if cache:
             parts.append(f"NN cache={'hit' if cache.get('hit') else 'miss'}")
+    random_info = info.get("random")
+    if random_info:
+        parts.append(
+            "RANDOM "
+            f"variants={random_info['variants']} "
+            f"sigma_abs={random_info['sigma_abs']:g} "
+            f"sigma_rel={random_info['sigma_rel']:g}"
+        )
     print(", ".join(parts) + ".")
 
 
@@ -313,7 +321,6 @@ def load_target_spectra(
     conditioned, info = optollama.data.physicalize_target_spectrum(original, cfg, device=device)
     score_spectrum = None
     if info.get("enabled"):
-        log_physicalization(info, cfg)
         if selection_target_mode(cfg) == "original":
             score_spectrum, _ = optollama.data.ensure_3w(original)
             score_spectrum = score_spectrum.to(torch.float32)
@@ -332,6 +339,11 @@ def make_target_loader(
     n_targets = int(args.target_samples if args.target_samples is not None else cfg_required(cfg, "N_TARGETS", "--target-samples"))
     n_targets = max(1, n_targets)
     spectra = spectrum.unsqueeze(0).repeat(n_targets, 1, 1).contiguous()
+    spectra, random_info = optollama.data.randomize_target_spectra(spectra, cfg)
+    if random_info.get("enabled"):
+        physicalize_info = dict(physicalize_info)
+        physicalize_info["random"] = random_info
+    log_physicalization(physicalize_info, cfg)
     stacks = torch.full((n_targets, int(cfg["MAX_SEQ_LEN"])), int(msk_idx), dtype=torch.long)
     indices = torch.arange(n_targets, dtype=torch.long)
     dataset = torch.utils.data.TensorDataset(spectra, stacks, indices)
@@ -375,7 +387,7 @@ def load_depth_model(checkpoint: str, device: torch.device) -> tuple[optollama.m
     if "model_config" not in extra:
         raise RuntimeError("Depth-field checkpoint is missing extra['model_config']; use the .pt checkpoint from training.")
     model_config = optollama.model.DepthFieldModelConfig.from_dict(extra["model_config"])
-    model = optollama.model.DepthFieldDiffusion(model_config)
+    model = optollama.model.build_depth_field_model(model_config)
     model.load_state_dict(blob["model_state"], strict=True)
     model.to(device)
     model.eval()
@@ -788,6 +800,7 @@ def run_depth_field_inference(
             "selection_target": selection_target_mode(cfg),
             "autoencoder": physicalize_info.get("autoencoder"),
             "nn": physicalize_info.get("nn"),
+            "random": physicalize_info.get("random"),
         }
     plot_bundle_path = resolve_plot_bundle_path(cfg, args)
     if plot_bundle_path:

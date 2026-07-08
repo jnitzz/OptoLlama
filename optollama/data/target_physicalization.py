@@ -187,6 +187,100 @@ def _normalize_rat(spectrum: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
     )
 
 
+def randomize_target_spectra(
+    spectra: torch.Tensor,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Apply optional per-sample target noise after target physicalization.
+
+    The first repeated target sample is kept unchanged by default so a target
+    run always contains an exact conditioned target baseline.
+    """
+    block = cfg.get("TARGET_PHYSICALIZE") or {}
+    random_cfg = block.get("RANDOM") or {}
+    info: dict[str, Any] = {"enabled": False}
+    if not _enabled(cfg) or not bool(random_cfg.get("ENABLED", False)):
+        return spectra, info
+
+    original_dim = spectra.dim()
+    if original_dim == 2:
+        spectra, _ = ensure_3w(spectra)
+        spectra = spectra.unsqueeze(0)
+    elif original_dim == 3:
+        spectra, _ = ensure_3w(spectra)
+    else:
+        raise ValueError(f"Expected target spectra with shape [3,W] or [B,3,W], got {tuple(spectra.shape)}")
+
+    mode = str(random_cfg.get("MODE", "gaussian")).lower()
+    if mode not in {"gaussian", "noise", "gaussian_noise"}:
+        raise ValueError(f"Unknown TARGET_PHYSICALIZE.RANDOM.MODE: {mode!r}")
+
+    out = spectra.to(torch.float32).clone()
+    batch_size, channels, width = out.shape
+    skip_index_0 = bool(random_cfg.get("SKIP_INDEX_0", True))
+    start_index = 1 if skip_index_0 else 0
+    affected = max(batch_size - start_index, 0)
+
+    sigma_abs = float(random_cfg.get("SIGMA_ABS", 0.0))
+    sigma_rel = float(random_cfg.get("SIGMA_REL", 0.0))
+    per_channel_raw = random_cfg.get("PER_CHANNEL", [1.0, 1.0, 1.0])
+    if not isinstance(per_channel_raw, (list, tuple)):
+        per_channel_raw = [float(per_channel_raw)] * channels
+    if len(per_channel_raw) != channels:
+        raise ValueError(
+            "TARGET_PHYSICALIZE.RANDOM.PER_CHANNEL must have one value per RAT channel "
+            f"({channels}), got {len(per_channel_raw)}"
+        )
+
+    wavelengths = torch.as_tensor(cfg["WAVELENGTHS"], dtype=torch.float32, device=out.device)
+    wl_min_raw = random_cfg.get("WL_MIN")
+    wl_max_raw = random_cfg.get("WL_MAX")
+    if wl_min_raw is None and wl_max_raw is None:
+        mask = torch.ones(width, dtype=torch.bool, device=out.device)
+        wl_min = None
+        wl_max = None
+    else:
+        wl_min = float(wl_min_raw if wl_min_raw is not None else wavelengths.min().item())
+        wl_max = float(wl_max_raw if wl_max_raw is not None else wavelengths.max().item())
+        mask = (wavelengths >= wl_min) & (wavelengths <= wl_max)
+
+    base_seed = int(random_cfg.get("SEED", cfg.get("SEED", 0)))
+    per_channel = torch.tensor(per_channel_raw, dtype=out.dtype, device=out.device).view(channels, 1)
+    clip_0_1 = bool(random_cfg.get("CLIP_0_1", True))
+    renormalize = bool(random_cfg.get("RENORMALIZE", True))
+
+    if affected > 0 and mask.any() and (sigma_abs != 0.0 or sigma_rel != 0.0):
+        for sample_idx in range(start_index, batch_size):
+            generator = torch.Generator(device=out.device)
+            generator.manual_seed(base_seed + sample_idx)
+            noise = torch.randn((channels, width), generator=generator, device=out.device, dtype=out.dtype)
+            scale = (sigma_abs + sigma_rel * out[sample_idx]).clamp_min(0.0) * per_channel
+            noised = out[sample_idx] + noise * scale
+            out[sample_idx] = torch.where(mask.view(1, width), noised, out[sample_idx])
+
+        if clip_0_1:
+            out[start_index:] = out[start_index:].clamp(0.0, 1.0)
+        if renormalize:
+            out[start_index:] = _normalize_rat(out[start_index:], cfg)
+
+    info = {
+        "enabled": True,
+        "mode": "gaussian",
+        "seed": base_seed,
+        "skip_index_0": skip_index_0,
+        "variants": int(affected),
+        "sigma_abs": sigma_abs,
+        "sigma_rel": sigma_rel,
+        "per_channel": [float(value) for value in per_channel_raw],
+        "wl_min": wl_min,
+        "wl_max": wl_max,
+        "clip_0_1": clip_0_1,
+        "renormalize": renormalize,
+    }
+    return (out.squeeze(0) if original_dim == 2 else out), info
+
+
 def _apply_level_relaxation(spectrum: torch.Tensor, block: dict[str, Any], cfg: dict[str, Any]) -> torch.Tensor:
     level_cfg = block.get("LEVEL_RELAXATION") or {}
     if not bool(level_cfg.get("ENABLED", False)):

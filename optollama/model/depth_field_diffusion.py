@@ -73,6 +73,25 @@ def _normalize_conv_type(conv_type: str | None) -> str:
     return aliases[value]
 
 
+def _normalize_model_type(model_type: str | None) -> str:
+    value = str(model_type or "conv").lower().replace("-", "_")
+    aliases = {
+        "conv": "conv",
+        "convolution": "conv",
+        "cnn": "conv",
+        "dilated_conv": "conv",
+        "attention": "attention",
+        "attn": "attention",
+        "mha": "attention",
+        "multihead_attention": "attention",
+        "multi_head_attention": "attention",
+        "transformer": "attention",
+    }
+    if value not in aliases:
+        raise ValueError(f"Unknown depth-field model_type={model_type!r}; expected 'conv' or 'attention'.")
+    return aliases[value]
+
+
 def _make_depth_conv(channels: int, *, kernel_size: int, padding: int, dilation: int, conv_type: str) -> nn.Module:
     if _normalize_conv_type(conv_type) == "separable":
         return DepthwiseSeparableConv1d(channels, kernel_size=kernel_size, padding=padding, dilation=dilation)
@@ -119,6 +138,44 @@ class DepthFieldBlock(nn.Module):
         return x + h
 
 
+class DepthFieldAttentionBlock(nn.Module):
+    """Conditioned self-attention block for a complete depth-field sequence."""
+
+    def __init__(self, channels: int, *, n_heads: int, dropout: float, ffn_multiplier: float) -> None:
+        super().__init__()
+        channels = int(channels)
+        n_heads = int(n_heads)
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be positive, got {n_heads}")
+        if channels % n_heads != 0:
+            raise ValueError(f"channels={channels} must be divisible by n_heads={n_heads}.")
+        hidden = max(channels, int(round(channels * float(ffn_multiplier))))
+        self.cond_proj = nn.Linear(channels, channels)
+        self.norm1 = nn.LayerNorm(channels)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=channels,
+            num_heads=n_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(channels)
+        self.ff = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.SiLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, channels),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """Apply global self-attention and position-wise feed-forward mixing."""
+        h = self.norm1(x + self.cond_proj(cond).unsqueeze(1))
+        attended, _ = self.self_attn(h, h, h, need_weights=False)
+        x = x + self.dropout(attended)
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x
+
+
 @dataclass(frozen=True)
 class DepthFieldModelConfig:
     """Serializable constructor config for depth-field diffusion."""
@@ -126,15 +183,27 @@ class DepthFieldModelConfig:
     spectrum_shape: tuple[int, ...]
     num_materials: int
     depth_bins: int
+    model_type: str = "conv"
     d_model: int = 192
     n_blocks: int = 12
     kernel_size: int = 7
+    n_heads: int = 8
+    ffn_multiplier: float = 4.0
     timesteps: int = 100
     dropout: float = 0.0
     conv_type: str = "full"
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "model_type", _normalize_model_type(self.model_type))
         object.__setattr__(self, "conv_type", _normalize_conv_type(self.conv_type))
+        object.__setattr__(self, "n_heads", int(self.n_heads))
+        object.__setattr__(self, "ffn_multiplier", float(self.ffn_multiplier))
+        if int(self.n_heads) <= 0:
+            raise ValueError(f"n_heads must be positive, got {self.n_heads}.")
+        if float(self.ffn_multiplier) <= 0.0:
+            raise ValueError(f"ffn_multiplier must be positive, got {self.ffn_multiplier}.")
+        if self.model_type == "attention" and int(self.d_model) % int(self.n_heads) != 0:
+            raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
 
     def to_dict(self) -> dict:
         """Return a JSON/checkpoint friendly constructor mapping."""
@@ -142,9 +211,12 @@ class DepthFieldModelConfig:
             "spectrum_shape": list(self.spectrum_shape),
             "num_materials": int(self.num_materials),
             "depth_bins": int(self.depth_bins),
+            "model_type": _normalize_model_type(self.model_type),
             "d_model": int(self.d_model),
             "n_blocks": int(self.n_blocks),
             "kernel_size": int(self.kernel_size),
+            "n_heads": int(self.n_heads),
+            "ffn_multiplier": float(self.ffn_multiplier),
             "timesteps": int(self.timesteps),
             "dropout": float(self.dropout),
             "conv_type": _normalize_conv_type(self.conv_type),
@@ -157,9 +229,12 @@ class DepthFieldModelConfig:
             spectrum_shape=tuple(int(v) for v in data["spectrum_shape"]),
             num_materials=int(data["num_materials"]),
             depth_bins=int(data["depth_bins"]),
+            model_type=_normalize_model_type(data.get("model_type", data.get("type", "conv"))),
             d_model=int(data.get("d_model", 192)),
             n_blocks=int(data.get("n_blocks", 12)),
             kernel_size=int(data.get("kernel_size", 7)),
+            n_heads=int(data.get("n_heads", 8)),
+            ffn_multiplier=float(data.get("ffn_multiplier", 4.0)),
             timesteps=int(data.get("timesteps", 100)),
             dropout=float(data.get("dropout", 0.0)),
             conv_type=_normalize_conv_type(data.get("conv_type", "full")),
@@ -431,3 +506,81 @@ class DepthFieldDiffusion(nn.Module):
                     fields.scatter_(1, low_confidence, int(self.mask_id))
 
         return fields
+
+
+class DepthFieldAttentionDiffusion(DepthFieldDiffusion):
+    """
+    Conditional diffusion model with global multi-head self-attention.
+
+    The denoising/sample API is inherited from :class:`DepthFieldDiffusion`,
+    but every residual block attends over the full depth sequence at once.
+    """
+
+    def __init__(self, config: DepthFieldModelConfig) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.spectrum_shape = tuple(int(v) for v in config.spectrum_shape)
+        self.num_materials = int(config.num_materials)
+        self.depth_bins = int(config.depth_bins)
+        self.d_model = int(config.d_model)
+        self.timesteps = int(config.timesteps)
+        self.mask_id = self.num_materials
+        self.conv_type = _normalize_conv_type(config.conv_type)
+
+        spectrum_dim = int(math.prod(self.spectrum_shape))
+        self.spectrum_encoder = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(spectrum_dim),
+            nn.Linear(spectrum_dim, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.time_encoder = nn.Sequential(
+            SinusoidalTimeEmbedding(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.input_embedding = nn.Embedding(self.num_materials + 1, self.d_model)
+        self.position_embedding = nn.Parameter(torch.empty(1, self.depth_bins, self.d_model))
+        self.blocks = nn.ModuleList(
+            [
+                DepthFieldAttentionBlock(
+                    self.d_model,
+                    n_heads=int(config.n_heads),
+                    dropout=float(config.dropout),
+                    ffn_multiplier=float(config.ffn_multiplier),
+                )
+                for _ in range(int(config.n_blocks))
+            ]
+        )
+        self.output_norm = nn.LayerNorm(self.d_model)
+        self.output = nn.Linear(self.d_model, self.num_materials)
+        self.reset_parameters()
+
+    def forward(self, spectra: torch.Tensor, noised_fields: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Predict clean material logits for every depth bin with global attention."""
+        if spectra.shape[1:] != self.spectrum_shape:
+            raise ValueError(f"Expected spectra shape [B,{self.spectrum_shape}], got {tuple(spectra.shape)}")
+        if noised_fields.shape != (spectra.size(0), self.depth_bins):
+            raise ValueError(
+                f"Expected noised_fields shape [{spectra.size(0)},{self.depth_bins}], got {tuple(noised_fields.shape)}"
+            )
+
+        cond = self.spectrum_encoder(spectra.float()) + self.time_encoder(timesteps)
+        x = self.input_embedding(noised_fields.long().clamp(0, self.mask_id))
+        x = x + self.position_embedding
+        for block in self.blocks:
+            x = block(x, cond)
+        logits = self.output(functional.silu(self.output_norm(x)))
+        return logits
+
+
+def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
+    """Build the configured depth-field diffusion model."""
+    model_type = _normalize_model_type(config.model_type)
+    if model_type == "attention":
+        return DepthFieldAttentionDiffusion(config)
+    if model_type == "conv":
+        return DepthFieldDiffusion(config)
+    raise ValueError(f"Unsupported depth-field model_type={config.model_type!r}.")

@@ -58,8 +58,28 @@ def parse_args() -> argparse.Namespace:
         help="Keep stacks thicker than --max-thickness-nm by clipping them. Default skips them.",
     )
 
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=[
+            "conv",
+            "convolution",
+            "cnn",
+            "dilated_conv",
+            "dilated-conv",
+            "attention",
+            "attn",
+            "mha",
+            "multihead_attention",
+            "multi-head-attention",
+            "multi_head_attention",
+            "transformer",
+        ],
+        help="Depth-field backbone type. 'conv' uses dilated Conv1d blocks; 'attention' uses global multi-head self-attention.",
+    )
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
-    parser.add_argument("--n-blocks", type=int, default=None, help="Number of dilated Conv1d residual blocks.")
+    parser.add_argument("--n-blocks", type=int, default=None, help="Number of denoising blocks.")
     parser.add_argument("--kernel-size", type=int, default=None, help="Conv1d kernel size.")
     parser.add_argument(
         "--conv-type",
@@ -68,6 +88,8 @@ def parse_args() -> argparse.Namespace:
         choices=["full", "standard", "conv", "separable", "depthwise", "depthwise_separable", "depthwise-separable"],
         help="Depth-field residual convolution type. 'separable' uses depthwise + pointwise Conv1d.",
     )
+    parser.add_argument("--n-heads", type=int, default=None, help="Attention heads when --model-type=attention.")
+    parser.add_argument("--ffn-multiplier", type=float, default=None, help="Attention feed-forward width multiplier.")
     parser.add_argument("--dropout", type=float, default=None, help="Dropout inside residual blocks.")
     parser.add_argument("--diffusion-steps", type=int, default=None, help="Discrete depth-field diffusion timesteps.")
 
@@ -299,10 +321,18 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_config_required(args, "max_thickness_nm", block.get("MAX_THICKNESS_NM", MISSING), "DEPTH_FIELD.MAX_THICKNESS_NM")
     set_arg_config_required(args, "output_seq_len", block.get("OUTPUT_SEQ_LEN", MISSING), "DEPTH_FIELD.OUTPUT_SEQ_LEN")
 
+    if args.model_type is None:
+        args.model_type = nested_get(block, "MODEL", "TYPE", default=nested_get(block, "MODEL", "MODEL_TYPE", default="conv"))
     set_arg_config_required(args, "d_model", nested_required(block, "MODEL", "D_MODEL"), "DEPTH_FIELD.MODEL.D_MODEL")
     set_arg_config_required(args, "n_blocks", nested_required(block, "MODEL", "N_BLOCKS"), "DEPTH_FIELD.MODEL.N_BLOCKS")
-    set_arg_config_required(args, "kernel_size", nested_required(block, "MODEL", "KERNEL_SIZE"), "DEPTH_FIELD.MODEL.KERNEL_SIZE")
-    set_arg_config_required(args, "conv_type", nested_required(block, "MODEL", "CONV_TYPE"), "DEPTH_FIELD.MODEL.CONV_TYPE")
+    if args.kernel_size is None:
+        args.kernel_size = nested_get(block, "MODEL", "KERNEL_SIZE", default=7)
+    if args.conv_type is None:
+        args.conv_type = nested_get(block, "MODEL", "CONV_TYPE", default="full")
+    if args.n_heads is None:
+        args.n_heads = nested_get(block, "MODEL", "N_HEADS", default=8)
+    if args.ffn_multiplier is None:
+        args.ffn_multiplier = nested_get(block, "MODEL", "FFN_MULTIPLIER", default=4.0)
     set_arg_config_required(args, "dropout", nested_required(block, "MODEL", "DROPOUT"), "DEPTH_FIELD.MODEL.DROPOUT")
     set_arg_config_required(args, "diffusion_steps", nested_required(block, "MODEL", "DIFFUSION_STEPS"), "DEPTH_FIELD.MODEL.DIFFUSION_STEPS")
 
@@ -1248,14 +1278,17 @@ def main() -> None:
         spectrum_shape=tuple(int(v) for v in example_spectrum(train_ds).shape),
         num_materials=vocab.num_clean_classes,
         depth_bins=depth_bins,
+        model_type=str(args.model_type),
         d_model=int(args.d_model),
         n_blocks=int(args.n_blocks),
         kernel_size=int(args.kernel_size),
+        n_heads=int(args.n_heads),
+        ffn_multiplier=float(args.ffn_multiplier),
         conv_type=str(args.conv_type),
         timesteps=int(args.diffusion_steps),
         dropout=float(args.dropout),
     )
-    model = optollama.model.DepthFieldDiffusion(model_config).to(device)
+    model = optollama.model.build_depth_field_model(model_config).to(device)
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -1394,11 +1427,16 @@ def main() -> None:
         optollama.utils.save_as_json(str(history_path), history)
 
     if rank == 0:
+        model_desc = f"type={model_config.model_type}"
+        if model_config.model_type == "attention":
+            model_desc += f", heads={model_config.n_heads}, ffn={model_config.ffn_multiplier:g}"
+        else:
+            model_desc += f", conv={model_config.conv_type}, kernel={model_config.kernel_size}"
         print(
             "Depth-field diffusion: "
             f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
-            f"ddp={ddp}, world={world_size}, conv={model_config.conv_type}, "
+            f"ddp={ddp}, world={world_size}, {model_desc}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
             f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
         )
