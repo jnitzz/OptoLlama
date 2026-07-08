@@ -1,0 +1,285 @@
+EXPERIMENT:
+  MODEL: optollama
+  RUN: DEPTH_FIELD_25UM_CLEAN_OPTOLLAMA_DEPTH_07
+  SEED: 3
+
+PATHS:
+  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data
+  MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
+  TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
+  OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
+  SAMPLES_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-samples.json
+  GRID_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-grid.json
+  IDS_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-ids.json
+  PLOT_BUNDLE_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-plot-bundle.npz
+  TRAIN:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/00
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/01
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/02
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/03
+  TEST:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_test
+
+DATA_LOADING:
+  NUM_WORKERS: 8
+  SHARDED_LOADING: true
+  NUM_SAMPLES_TRAIN: 20000000
+  NUM_SAMPLES_TEST: 512
+  TRAIN_BATCH_SIZE: 1
+  TEST_BATCH_SIZE: 1
+
+SPECTRAL_GRID:
+  WAVELENGTH_MIN: 300
+  WAVELENGTH_MAX: 1700
+  WAVELENGTH_STEPS: 5
+
+CHECKPOINT:
+  RESUME: true
+
+SEQUENCE:
+  MAX_SEQ_LEN: 101
+  MAX_EMIT_LEN: ${SEQUENCE.MAX_SEQ_LEN}
+
+DEPTH_FIELD:
+  ENABLED: true
+  OUT_DIR: ${PATHS.OUTPUT_PATH}
+  DZ_NM: 5
+  MAX_THICKNESS_NM: 10000
+  OUTPUT_SEQ_LEN: 2000
+  MODEL:
+    TYPE: optollama_depth
+    D_MODEL: 512
+    N_BLOCKS: 6
+    N_HEADS: 8
+    FFN_MULTIPLIER: 4.0
+    # Ignored when TYPE is optollama_depth; kept so conv/attention configs stay comparable.
+    KERNEL_SIZE: 7
+    CONV_TYPE: full
+    DROPOUT: 0.0
+    DIFFUSION_STEPS: 200
+  TRAIN:
+    AMP: true
+    WEIGHT_DECAY: 0.01
+    GRAD_CLIP: 1.0
+    KEEP_OVERLIMIT_STACKS: false
+    VOID_LOSS_WEIGHT: 0.05
+    RANDOM_REPLACE_PROB: 0.15
+    LOSS_ON_CORRUPTED_ONLY: false
+  EVAL:
+    MODE: tmm
+    SCORE_MODE: field
+    RANK_BY: auto
+    MC_SAMPLES: 10
+    SAMPLING_STEPS: 200
+    REMASK_STRATEGY: random
+    TEMPERATURE: 1.0
+    TOP_K: 0
+    DETERMINISTIC: false
+    TMM_DEVICE: auto
+    TMM_BATCH_SIZE: 16
+    SAVE_SAMPLES: true
+    SAMPLES_DIR: ${DEPTH_FIELD.OUT_DIR}/validation_samples
+    RECORD_SPECTRA: true
+    RECORD_ALL_MC: false
+
+OPTIMIZATION:
+  LEARNING_RATE: 0.0001
+  EPOCHS: 1000
+
+VALIDATION:
+  EVERY_N_TRAIN_SAMPLES: 10000000
+  AT_EPOCH_END: true
+
+EVALUATION:
+  VALID_SIM: TMM_FAST
+  INCIDENCE_ANGLE: 0
+  ROI_MIN: 300
+  ROI_MAX: 1700
+  MAE_CHANNELS: null
+  COMMON_MAE:
+    ENABLED: true
+    WAVELENGTH_MIN: 300
+    WAVELENGTH_MAX: 1700
+    WAVELENGTH_STEPS: 10
+
+TARGET_SELECTION:
+  TARGET: null
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGETS: []
+  TARGET_GLOB: null # ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
+  N_TARGETS: 1
+
+TARGET_PREPROCESS:
+  MISMATCH_FILL_ORDER: R>T>A
+  NOISE:
+    ENABLED: false
+    SIGMA_ABS: 0.1
+    SIGMA_REL: 0.0
+    PER_CHANNEL:
+      - 1.0
+      - 1.0
+      - 1.0
+    WL_MIN: 300
+    WL_MAX: 1700
+    CLIP_0_1: true
+  SMOOTH:
+    ENABLED: false
+    METHOD: gaussian
+    WIN: 10
+    SIGMA: 1.5
+  FILL_OUTSIDE_ROI:
+    ENABLED: false
+    SKIP_INDEX_0: true
+    MODE: smooth_random
+    STRENGTH: 0.65
+    KERNEL_SIZE: 20
+
+PLOTTING:
+  SAMPLE_WITH_NN: true
+  NN_CHUNK_SIZE: 512000
+  NN_DEVICE: null
+  NK: true
+
+REALISTIC_TMM:
+  ENABLED: true
+  ANGLES:
+    - 0.0
+  ANGLE_WEIGHTS:
+    - 1.0
+  POLARIZATIONS:
+    - s
+  JITTER_REALIZATIONS: 1
+  THICKNESS_JITTER_NM: 0.0
+
+SPECTRUM_LATENT:
+  ENABLED: false
+  CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+  MODE: token
+  FREEZE_ENCODER: true
+
+TARGET_PHYSICALIZE:
+  ENABLED: false
+  SELECTION_TARGET: original
+  # Applies to repeated target spectra from N_TARGETS/--target-samples.
+  # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.
+  RANDOM:
+    ENABLED: false
+    MODE: gaussian
+    SEED: ${EXPERIMENT.SEED}
+    SKIP_INDEX_0: true
+    SIGMA_ABS: 0.1
+    SIGMA_REL: 0.0
+    PER_CHANNEL:
+      - 1.0
+      - 1.0
+      - 1.0
+    WL_MIN: 300
+    WL_MAX: 1700
+    CLIP_0_1: true
+    RENORMALIZE: true
+  EDGE_SMOOTHING:
+    ENABLED: false
+    SIGMA_NM: 20
+    WIN_NM: 40
+  LEVEL_RELAXATION:
+    ENABLED: false
+    PASS_VALUE: 0.98
+    STOP_VALUE: 0.02
+    ABS_SCALE: 1.0
+  AE_PROJECT:
+    ENABLED: true
+    CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+    DEVICE: null
+    MODE: all
+    BLEND: 1.0
+    ROI_BLEND: 0.0
+    OUTSIDE_ROI_BLEND: 0.8
+    TRANSITION_BLEND: 0.4
+    TRANSITION_WIDTH_NM: 200
+  NN_BLEND:
+    ENABLED: false
+    SOURCE_SPLIT: train
+    SOURCE_PATHS: []
+    CHUNK_SIZE: 512000
+    DEVICE: null
+    METRIC_ROI_MIN: ${EVALUATION.ROI_MIN}
+    METRIC_ROI_MAX: ${EVALUATION.ROI_MAX}
+    METRIC_CHANNELS:
+      - R
+      - T
+      - A
+    MODE: outside_roi
+    ROI_BLEND: 0.0
+    OUTSIDE_ROI_BLEND: 0.8
+    TRANSITION_BLEND: 0.4
+    TRANSITION_WIDTH_NM: 200
+
+REALISTIC_DATASET:
+  OUT_DIR: ${PATHS.DATA_PATH}/realistic_var
+  NUM_SAMPLES: 21000000
+  SHARD_SIZE: 100000
+  BATCH_SIZE: 512
+  SEED: ${EXPERIMENT.SEED}
+  DEVICE: cuda
+  OVERWRITE: true
+  FAMILY_WEIGHTS:
+    random_dielectric: 0.30
+    random: 0.20
+    sparse_metal_random: 0.08
+    dbr: 0.05
+    chirped_dbr: 0.04
+    cavity: 0.04
+    rugate: 0.05
+    apodized_dbr: 0.04
+    multi_cavity: 0.04
+    edge_filter: 0.04
+    multi_band_filter: 0.04
+    metal_dielectric_metal: 0.02
+    dielectric_metal_dielectric: 0.02
+    absorber_backed: 0.01
+    hybrid_dbr_metal: 0.01
+    tco_stack: 0.02
+  LAYERS:
+    MIN: 0
+    MAX: 100
+    OUTPUT_SEQ_LEN: ${SEQUENCE.MAX_SEQ_LEN}
+    FAMILY_MIN_LAYERS:
+      DBR: 2
+      CHIRPED_DBR: 2
+      CAVITY: 5
+      SYMMETRIC_MOTIF: 4
+      RUGATE: 8
+      APODIZED_DBR: 4
+      MULTI_CAVITY: 7
+      EDGE_FILTER: 4
+      MULTI_BAND_FILTER: 6
+      METAL_DIELECTRIC_METAL: 3
+      DIELECTRIC_METAL_DIELECTRIC: 3
+      ABSORBER_BACKED: 2
+      HYBRID_DBR_METAL: 3
+      SPARSE_METAL_RANDOM: 3
+      TCO_STACK: 3
+  THICKNESS:
+    MIN: 10
+    MAX: 500
+    STEP: 5
+    MAX_TOTAL_NM: 10000
+  SPECTRUM:
+    WAVELENGTH_MIN: ${SPECTRAL_GRID.WAVELENGTH_MIN}
+    WAVELENGTH_MAX: ${SPECTRAL_GRID.WAVELENGTH_MAX}
+    WAVELENGTH_STEP: ${SPECTRAL_GRID.WAVELENGTH_STEPS}
+  REALISTIC_AVERAGING:
+    ANGLES:
+      - 0.0
+    ANGLE_WEIGHTS:
+      - 1.0
+    POLARIZATIONS:
+      - s
+    JITTER_REALIZATIONS: 1
+    THICKNESS_JITTER_NM: 0.0
+    SAVE_DTYPE: float16
+  STRUCTURES:
+    CENTER_MIN: 100
+    CENTER_MAX: 2200
+    STRUCTURE_JITTER_FRACTION: 0.10

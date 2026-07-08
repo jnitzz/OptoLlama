@@ -75,8 +75,19 @@ def parse_args() -> argparse.Namespace:
             "multi-head-attention",
             "multi_head_attention",
             "transformer",
+            "optollama_depth",
+            "optollama-depth",
+            "optollama_depth_field",
+            "optollama-depth-field",
+            "opto_depth",
+            "opto-depth",
+            "dit_depth",
+            "dit-depth",
         ],
-        help="Depth-field backbone type. 'conv' uses dilated Conv1d blocks; 'attention' uses global multi-head self-attention.",
+        help=(
+            "Depth-field backbone type. 'conv' uses dilated Conv1d blocks, 'attention' uses global self-attention, "
+            "and 'optollama_depth' uses OptoLlama-style cross/self-attention blocks."
+        ),
     )
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
     parser.add_argument("--n-blocks", type=int, default=None, help="Number of denoising blocks.")
@@ -1428,8 +1439,10 @@ def main() -> None:
 
     if rank == 0:
         model_desc = f"type={model_config.model_type}"
-        if model_config.model_type == "attention":
+        if model_config.model_type in {"attention", "optollama_depth"}:
             model_desc += f", heads={model_config.n_heads}, ffn={model_config.ffn_multiplier:g}"
+            if model_config.model_type == "optollama_depth":
+                model_desc += ", spectrum_cross_attn=true"
         else:
             model_desc += f", conv={model_config.conv_type}, kernel={model_config.kernel_size}"
         print(
