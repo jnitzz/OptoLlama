@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -409,6 +410,194 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
 
+def schedule_enabled(schedule: dict[str, Any] | None) -> bool:
+    if not isinstance(schedule, dict) or not schedule:
+        return False
+    if "ENABLED" in schedule and not bool(schedule.get("ENABLED")):
+        return False
+    schedule_type = str(schedule.get("TYPE", "none")).lower().replace("-", "_")
+    return schedule_type not in {"", "none", "off", "false", "disabled"}
+
+
+def lr_schedule_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    block = depth_field_block(cfg)
+    train_cfg = nested_get(block, "TRAIN", default={}) or {}
+    schedule = train_cfg.get("LR_SCHEDULE") if isinstance(train_cfg, dict) else None
+    return schedule if isinstance(schedule, dict) else {}
+
+
+def timestep_schedule_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    block = depth_field_block(cfg)
+    train_cfg = nested_get(block, "TRAIN", default={}) or {}
+    schedule = train_cfg.get("TIMESTEP_SCHEDULE") if isinstance(train_cfg, dict) else None
+    return schedule if isinstance(schedule, dict) else {}
+
+
+def ema_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    block = depth_field_block(cfg)
+    train_cfg = nested_get(block, "TRAIN", default={}) or {}
+    cfg_value = train_cfg.get("EMA") if isinstance(train_cfg, dict) else None
+    return cfg_value if isinstance(cfg_value, dict) else {}
+
+
+def scheduled_learning_rate(base_lr: float, schedule: dict[str, Any] | None, global_samples_seen: int) -> float:
+    if not schedule_enabled(schedule):
+        return float(base_lr)
+
+    schedule_type = str(schedule.get("TYPE", "cosine")).lower().replace("-", "_")
+    sample = max(0, int(global_samples_seen))
+    max_lr = float(schedule.get("MAX_LR", schedule.get("LR", base_lr)))
+    min_lr = float(schedule.get("MIN_LR", 0.0))
+    start_lr = float(schedule.get("START_LR", min_lr))
+    warmup_samples = max(0, int(schedule.get("WARMUP_SAMPLES", 0)))
+    total_samples = max(warmup_samples + 1, int(schedule.get("TOTAL_SAMPLES", warmup_samples + 1)))
+
+    if warmup_samples > 0 and sample < warmup_samples:
+        progress = float(sample) / float(max(warmup_samples, 1))
+        return start_lr + progress * (max_lr - start_lr)
+
+    progress = float(sample - warmup_samples) / float(max(total_samples - warmup_samples, 1))
+    progress = max(0.0, min(1.0, progress))
+    if schedule_type == "cosine":
+        return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+    if schedule_type == "linear":
+        return max_lr + progress * (min_lr - max_lr)
+    if schedule_type in {"constant", "flat"}:
+        return max_lr
+    raise ValueError(f"Unknown DEPTH_FIELD.TRAIN.LR_SCHEDULE.TYPE={schedule_type!r}.")
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+def timestep_min_fraction(schedule: dict[str, Any] | None, global_samples_seen: int) -> float:
+    if not schedule_enabled(schedule):
+        return 0.0
+    schedule_type = str(schedule.get("TYPE", "high_noise_warmup")).lower().replace("-", "_")
+    if schedule_type not in {"high_noise_warmup", "high_noise", "noise_warmup"}:
+        raise ValueError(f"Unknown DEPTH_FIELD.TRAIN.TIMESTEP_SCHEDULE.TYPE={schedule_type!r}.")
+
+    high_min = float(schedule.get("HIGH_NOISE_MIN_FRACTION", schedule.get("MIN_FRACTION", 0.6)))
+    high_min = max(0.0, min(1.0, high_min))
+    warmup_samples = max(0, int(schedule.get("HIGH_NOISE_SAMPLES", schedule.get("WARMUP_SAMPLES", 0))))
+    if warmup_samples <= 0:
+        return high_min
+    progress = float(max(0, int(global_samples_seen))) / float(max(warmup_samples, 1))
+    progress = max(0.0, min(1.0, progress))
+    return high_min * (1.0 - progress)
+
+
+def sample_depth_timesteps(
+    *,
+    timesteps: int,
+    batch_size: int,
+    device: torch.device,
+    schedule: dict[str, Any] | None = None,
+    global_samples_seen: int = 0,
+) -> torch.Tensor:
+    total = int(timesteps)
+    if total <= 0:
+        raise ValueError(f"timesteps must be positive, got {timesteps}")
+    min_fraction = timestep_min_fraction(schedule, global_samples_seen)
+    min_timestep = int(round(min_fraction * float(max(total - 1, 0))))
+    min_timestep = max(0, min(min_timestep, total - 1))
+    return torch.randint(min_timestep, total, (int(batch_size),), device=device)
+
+
+class ModelEma:
+    """Exponential moving average of model state dict tensors."""
+
+    def __init__(self, model: torch.nn.Module, *, decay: float, device: torch.device | None = None) -> None:
+        self.decay = float(decay)
+        if not 0.0 < self.decay < 1.0:
+            raise ValueError(f"EMA decay must be in (0, 1), got {decay}.")
+        self.device = device
+        self.updates = 0
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.reset(model)
+
+    def _target_device(self, tensor: torch.Tensor) -> torch.device:
+        return self.device if self.device is not None else tensor.device
+
+    @torch.no_grad()
+    def reset(self, model: torch.nn.Module) -> None:
+        self.shadow = {}
+        for name, tensor in unwrap_model(model).state_dict().items():
+            if torch.is_floating_point(tensor):
+                self.shadow[name] = tensor.detach().to(device=self._target_device(tensor), copy=True)
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        decay = float(self.decay)
+        for name, tensor in unwrap_model(model).state_dict().items():
+            if not torch.is_floating_point(tensor):
+                continue
+            value = tensor.detach()
+            if name not in self.shadow:
+                self.shadow[name] = value.to(device=self._target_device(value), copy=True)
+                continue
+            ema_value = self.shadow[name]
+            ema_value.mul_(decay).add_(value.to(device=ema_value.device, dtype=ema_value.dtype), alpha=1.0 - decay)
+        self.updates += 1
+
+    def state_dict(self, *, cpu: bool = False) -> dict[str, Any]:
+        device = torch.device("cpu") if cpu else None
+        return {
+            "decay": float(self.decay),
+            "updates": int(self.updates),
+            "shadow": {
+                name: tensor.detach().to(device=device, copy=True) if device is not None else tensor.detach().clone()
+                for name, tensor in self.shadow.items()
+            },
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state: dict[str, Any], model: torch.nn.Module) -> None:
+        shadow = state.get("shadow") if isinstance(state, dict) else None
+        if not isinstance(shadow, dict):
+            self.reset(model)
+            return
+        self.decay = float(state.get("decay", self.decay))
+        self.updates = int(state.get("updates", 0))
+        self.shadow = {}
+        current = unwrap_model(model).state_dict()
+        for name, tensor in shadow.items():
+            if name in current and torch.is_floating_point(current[name]):
+                self.shadow[name] = tensor.detach().to(device=self._target_device(current[name]), dtype=current[name].dtype, copy=True)
+
+    def model_state_dict(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        current = unwrap_model(model).state_dict()
+        state: dict[str, torch.Tensor] = {}
+        for name, tensor in current.items():
+            if name in self.shadow:
+                state[name] = self.shadow[name].to(device=tensor.device, dtype=tensor.dtype)
+            else:
+                state[name] = tensor
+        return state
+
+    @contextmanager
+    def apply_to(self, model: torch.nn.Module):
+        core = unwrap_model(model)
+        backup = {name: tensor.detach().clone() for name, tensor in core.state_dict().items()}
+        core.load_state_dict(self.model_state_dict(model), strict=True)
+        try:
+            yield
+        finally:
+            core.load_state_dict(backup, strict=True)
+
+
+def make_ema(cfg: dict[str, Any], model: torch.nn.Module) -> ModelEma | None:
+    cfg_value = ema_config(cfg)
+    if not bool(cfg_value.get("ENABLED", False)):
+        return None
+    device_value = str(cfg_value.get("DEVICE", "model")).lower()
+    ema_device = torch.device("cpu") if device_value == "cpu" else None
+    return ModelEma(model, decay=float(cfg_value.get("DECAY", 0.9999)), device=ema_device)
+
+
 def all_reduce_sum(values: torch.Tensor) -> torch.Tensor:
     if ddp_active():
         torch.distributed.all_reduce(values)
@@ -458,10 +647,18 @@ def depth_field_training_loss(
     void_loss_weight: float = 0.25,
     random_replace_prob: float = 0.10,
     loss_on_corrupted_only: bool = False,
+    timestep_schedule: dict[str, Any] | None = None,
+    global_samples_seen: int = 0,
 ) -> dict[str, torch.Tensor]:
     core = unwrap_model(model)
     batch_size = int(clean_fields.size(0))
-    timesteps = torch.randint(0, int(core.timesteps), (batch_size,), device=clean_fields.device)
+    timesteps = sample_depth_timesteps(
+        timesteps=int(core.timesteps),
+        batch_size=batch_size,
+        device=clean_fields.device,
+        schedule=timestep_schedule,
+        global_samples_seen=global_samples_seen,
+    )
     noised_fields, corrupted = core.corrupt(
         clean_fields,
         timesteps,
@@ -1015,6 +1212,11 @@ def run_epoch(
     train: bool,
     validation_callback: Callable[[int, int, dict], None] | None = None,
     validate_every_samples: int = 0,
+    global_sample_offset: int = 0,
+    optimizer_base_lr: float | None = None,
+    lr_schedule: dict[str, Any] | None = None,
+    timestep_schedule: dict[str, Any] | None = None,
+    ema: ModelEma | None = None,
 ) -> dict:
     model.train(train)
     set_loader_epoch(loader, epoch)
@@ -1033,10 +1235,14 @@ def run_epoch(
     pbar = tqdm.tqdm(loader, desc=desc, leave=True, disable=not show_progress)
     validation_interval = int(validate_every_samples or 0)
     next_validation_sample = validation_interval if train and validation_callback is not None and validation_interval > 0 else None
+    base_lr = float(optimizer_base_lr if optimizer_base_lr is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else 0.0))
+    current_lr = base_lr
 
     for batch in pbar:
         raw_spectra_cpu, raw_stacks_cpu = batch[0], batch[1]
         spectra_cpu, stacks_cpu = raw_spectra_cpu, raw_stacks_cpu
+        batch_seen_start = int(seen_samples)
+        global_samples_before = int(global_sample_offset + batch_seen_start * ddp_world_size())
         true_thickness_nm = optollama.data.token_stack_total_thickness_nm(
             stacks_cpu,
             idx_to_token,
@@ -1104,6 +1310,8 @@ def run_epoch(
         if train:
             if optimizer is None:
                 raise RuntimeError("optimizer is required for training")
+            current_lr = scheduled_learning_rate(base_lr, lr_schedule, global_samples_before)
+            set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(bool(scaler.is_enabled())):
                 out = depth_field_training_loss(
@@ -1114,6 +1322,8 @@ def run_epoch(
                     void_loss_weight=args.void_loss_weight,
                     random_replace_prob=args.random_replace_prob,
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
+                    timestep_schedule=timestep_schedule,
+                    global_samples_seen=global_samples_before,
                 )
             loss = out["loss"]
             if not count_batch_metrics:
@@ -1124,6 +1334,8 @@ def run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
         else:
             with torch.no_grad(), autocast_context(bool(scaler.is_enabled())):
                 out = depth_field_training_loss(
@@ -1155,10 +1367,15 @@ def run_epoch(
             skipped_overlimit=skipped_overlimit,
             dz_nm=args.dz_nm,
             device=device,
-        )
+            )
+        metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
+        if train:
+            metrics["lr"] = float(current_lr)
+            metrics["timestep_min_fraction"] = float(timestep_min_fraction(timestep_schedule, global_samples_before))
         if show_progress:
             pbar.set_postfix(
                 loss=f"{metrics['loss']:.4f}",
+                lr=f"{metrics.get('lr', current_lr):.2e}",
                 acc=f"{metrics['acc'] * 100.0:.2f}%",
                 mat=f"{metrics['mat_acc'] * 100.0:.2f}%",
                 void=f"{metrics['void_acc'] * 100.0:.2f}%",
@@ -1186,6 +1403,10 @@ def run_epoch(
         dz_nm=args.dz_nm,
         device=device,
     )
+    metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
+    if train:
+        metrics["lr"] = float(current_lr)
+        metrics["timestep_min_fraction"] = float(timestep_min_fraction(timestep_schedule, int(global_sample_offset + int(metrics["samples_seen"]))))
     if int(metrics["samples_kept"]) == 0:
         raise RuntimeError(
             "No samples remained after over-limit filtering. Increase --max-thickness-nm or use --keep-overlimit-stacks."
@@ -1201,8 +1422,11 @@ def make_checkpoint_extra(
     vocab: optollama.data.DepthFieldVocab,
     model_config: optollama.model.DepthFieldModelConfig,
     history: list[dict],
+    ema: ModelEma | None = None,
+    include_ema_state: bool = False,
+    checkpoint_weights: str = "live",
 ) -> dict:
-    return {
+    extra = {
         "depth_field": {
             "dz_nm": float(args.dz_nm),
             "max_thickness_nm": float(args.max_thickness_nm),
@@ -1226,30 +1450,47 @@ def make_checkpoint_extra(
         },
         "model_config": model_config.to_dict(),
         "config_path": str(args.config),
+        "checkpoint_weights": str(checkpoint_weights),
+        "train_schedules": {
+            "lr": lr_schedule_config(cfg),
+            "timestep": timestep_schedule_config(cfg),
+        },
+        "ema": {
+            "enabled": ema is not None,
+            "decay": float(ema.decay) if ema is not None else None,
+            "updates": int(ema.updates) if ema is not None else 0,
+        },
         "history": history,
     }
+    if ema is not None and include_ema_state:
+        extra["ema_state"] = ema.state_dict(cpu=True)
+    return extra
 
 
 def save_depth_checkpoint(
     *,
     path: Path,
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     epoch: int,
     history: list[dict],
     extra: dict,
+    ema: ModelEma | None = None,
+    use_ema_weights: bool = False,
 ) -> None:
     train_losses = torch.tensor([item["train"]["loss"] for item in history], dtype=torch.float32)
     val_losses = torch.tensor([record_score(item) for item in history], dtype=torch.float32)
-    optollama.utils.save_checkpoint(
-        str(path),
-        model=model,
-        optimizer=optimizer,
-        epoch=epoch,
-        train_losses=train_losses,
-        test_mae=val_losses,
-        extra=extra,
-    )
+    ctx = ema.apply_to(model) if use_ema_weights and ema is not None else nullcontext()
+    with ctx:
+        optollama.utils.save_checkpoint(
+            str(path),
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            train_losses=train_losses,
+            test_mae=val_losses,
+            extra=extra,
+        )
 
 
 def main() -> None:
@@ -1311,6 +1552,10 @@ def main() -> None:
         lr=float(args.learning_rate if args.learning_rate is not None else cfg_required(cfg, "LEARNING_RATE", "--learning-rate")),
         weight_decay=float(args.weight_decay),
     )
+    optimizer_base_lr = float(optimizer.param_groups[0]["lr"])
+    lr_schedule = lr_schedule_config(cfg)
+    timestep_schedule = timestep_schedule_config(cfg)
+    ema = make_ema(cfg, model)
 
     epochs = int(args.epochs if args.epochs is not None else cfg_required(cfg, "EPOCHS", "--epochs"))
     out_dir = Path(args.out_dir)
@@ -1320,6 +1565,8 @@ def main() -> None:
         torch.distributed.barrier()
     best_path = out_dir / "depth-field-best.pt"
     last_path = out_dir / "depth-field-last.pt"
+    ema_best_path = out_dir / "depth-field-best-ema.pt"
+    ema_last_path = out_dir / "depth-field-last-ema.pt"
     history_path = out_dir / "depth-field-history.json"
     eval_samples_dir = Path(args.eval_samples_dir) if args.eval_samples_dir is not None else None
 
@@ -1331,6 +1578,12 @@ def main() -> None:
             start_epoch_loaded, blob = optollama.utils.load_checkpoint(str(resume_path), model, optimizer=optimizer, map_location="cpu")
             start_epoch = int(start_epoch_loaded or 0)
             history = list(((blob.get("extra") or {}).get("history") or []))
+            if ema is not None:
+                ema_state = ((blob.get("extra") or {}).get("ema_state") or {})
+                if ema_state:
+                    ema.load_state_dict(ema_state, model)
+                else:
+                    ema.reset(model)
             if rank == 0:
                 print(f"Resumed depth-field checkpoint {resume_path} at epoch {start_epoch} ({resume_source}).")
         elif resume_required:
@@ -1361,49 +1614,52 @@ def main() -> None:
 
         denoise_metrics = None
         tmm_metrics = None
-        if eval_mode in {"denoise", "both"}:
-            denoise_metrics = run_epoch(
-                model=model,
-                loader=val_loader,
-                optimizer=None,
-                scaler=scaler,
-                device=device,
-                idx_to_token=idx_to_token,
-                vocab=vocab,
-                args=args,
-                eos_idx=eos_idx,
-                pad_idx=pad_idx,
-                msk_idx=msk_idx,
-                epoch=epoch,
-                epochs=epochs,
-                train=False,
-            )
-            denoise_metrics = {"score": float(denoise_metrics["loss"]), "score_name": "denoise_loss", **denoise_metrics}
-        if eval_mode in {"tmm", "both"}:
-            if tmm_ctx is None:
-                raise RuntimeError("TMM validation requested but TMM context was not initialized.")
-            sample_path = (
-                eval_samples_dir / f"epoch_{epoch + 1:04d}_{safe_trigger_name(trigger)}.json"
-                if bool(args.save_eval_samples) and eval_samples_dir is not None
-                else None
-            )
-            tmm_metrics = run_tmm_evaluation(
-                model=model,
-                loader=val_loader,
-                device=device,
-                tmm_ctx=tmm_ctx,
-                cfg=cfg,
-                idx_to_token=idx_to_token,
-                vocab=vocab,
-                args=args,
-                eos_idx=eos_idx,
-                pad_idx=pad_idx,
-                msk_idx=msk_idx,
-                epoch=epoch,
-                epochs=epochs,
-                trigger=trigger,
-                save_samples_path=sample_path,
-            )
+        validate_with_ema = ema is not None and bool(ema_config(cfg).get("VALIDATE", True))
+        validation_ctx = ema.apply_to(model) if validate_with_ema else nullcontext()
+        with validation_ctx:
+            if eval_mode in {"denoise", "both"}:
+                denoise_metrics = run_epoch(
+                    model=model,
+                    loader=val_loader,
+                    optimizer=None,
+                    scaler=scaler,
+                    device=device,
+                    idx_to_token=idx_to_token,
+                    vocab=vocab,
+                    args=args,
+                    eos_idx=eos_idx,
+                    pad_idx=pad_idx,
+                    msk_idx=msk_idx,
+                    epoch=epoch,
+                    epochs=epochs,
+                    train=False,
+                )
+                denoise_metrics = {"score": float(denoise_metrics["loss"]), "score_name": "denoise_loss", **denoise_metrics}
+            if eval_mode in {"tmm", "both"}:
+                if tmm_ctx is None:
+                    raise RuntimeError("TMM validation requested but TMM context was not initialized.")
+                sample_path = (
+                    eval_samples_dir / f"epoch_{epoch + 1:04d}_{safe_trigger_name(trigger)}.json"
+                    if bool(args.save_eval_samples) and eval_samples_dir is not None
+                    else None
+                )
+                tmm_metrics = run_tmm_evaluation(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    tmm_ctx=tmm_ctx,
+                    cfg=cfg,
+                    idx_to_token=idx_to_token,
+                    vocab=vocab,
+                    args=args,
+                    eos_idx=eos_idx,
+                    pad_idx=pad_idx,
+                    msk_idx=msk_idx,
+                    epoch=epoch,
+                    epochs=epochs,
+                    trigger=trigger,
+                    save_samples_path=sample_path,
+                )
 
         if eval_mode == "denoise":
             val_metrics = denoise_metrics
@@ -1423,16 +1679,46 @@ def main() -> None:
             "epoch": int(epoch),
             "trigger": str(trigger),
             "samples_seen_epoch": int(samples_seen_epoch),
+            "validation_weights": "ema" if validate_with_ema else "live",
             "train": train_metrics,
             "val": val_metrics,
         }
         history.append(record)
 
-        extra = make_checkpoint_extra(args=args, cfg=cfg, vocab=vocab, model_config=model_config, history=history)
+        checkpoint_weights = "ema" if validate_with_ema else "live"
+        extra = make_checkpoint_extra(
+            args=args,
+            cfg=cfg,
+            vocab=vocab,
+            model_config=model_config,
+            history=history,
+            ema=ema,
+            checkpoint_weights=checkpoint_weights,
+        )
         score = metric_score(val_metrics)
         if score < best_score:
             best_score = score
-            save_depth_checkpoint(path=best_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
+            save_depth_checkpoint(
+                path=best_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                history=history,
+                extra=extra,
+                ema=ema,
+                use_ema_weights=validate_with_ema,
+            )
+            if validate_with_ema:
+                save_depth_checkpoint(
+                    path=ema_best_path,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    history=history,
+                    extra=extra,
+                    ema=ema,
+                    use_ema_weights=True,
+                )
             print(f"Saved best checkpoint -> {best_path} ({val_metrics.get('score_name', 'score')}={best_score:.6f}, trigger={trigger})")
 
         optollama.utils.save_as_json(str(history_path), history)
@@ -1456,6 +1742,24 @@ def main() -> None:
         if validate_every_samples > 0:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")
         print(f"Epoch-end validation: {validate_at_epoch_end}.")
+        if schedule_enabled(lr_schedule):
+            print(
+                "LR schedule: "
+                f"type={lr_schedule.get('TYPE', 'cosine')}, "
+                f"warmup={int(lr_schedule.get('WARMUP_SAMPLES', 0))}, "
+                f"total={int(lr_schedule.get('TOTAL_SAMPLES', 0))}, "
+                f"max={float(lr_schedule.get('MAX_LR', optimizer_base_lr)):g}, "
+                f"min={float(lr_schedule.get('MIN_LR', 0.0)):g}."
+            )
+        if schedule_enabled(timestep_schedule):
+            print(
+                "Timestep schedule: "
+                f"type={timestep_schedule.get('TYPE', 'high_noise_warmup')}, "
+                f"warmup={int(timestep_schedule.get('WARMUP_SAMPLES', timestep_schedule.get('HIGH_NOISE_SAMPLES', 0)))}, "
+                f"high_min={float(timestep_schedule.get('HIGH_NOISE_MIN_FRACTION', timestep_schedule.get('MIN_FRACTION', 0.6))):g}."
+            )
+        if ema is not None:
+            print(f"EMA enabled: decay={ema.decay:g}, validate={bool(ema_config(cfg).get('VALIDATE', True))}.")
         if val_loader is not None:
             print(f"Validation mode: {eval_mode}.")
             if eval_mode in {"tmm", "both"}:
@@ -1487,6 +1791,11 @@ def main() -> None:
             train=True,
             validation_callback=mid_validation_callback,
             validate_every_samples=validate_every_samples,
+            global_sample_offset=int(epoch) * int(train_subset),
+            optimizer_base_lr=optimizer_base_lr,
+            lr_schedule=lr_schedule,
+            timestep_schedule=timestep_schedule,
+            ema=ema,
         )
 
         if val_loader is not None and validate_at_epoch_end:
@@ -1502,15 +1811,46 @@ def main() -> None:
                     "epoch": int(epoch),
                     "trigger": "epoch_end",
                     "samples_seen_epoch": int(train_metrics["samples_seen"]),
+                    "validation_weights": "none",
                     "train": train_metrics,
                 }
             )
 
         if rank == 0:
-            extra = make_checkpoint_extra(args=args, cfg=cfg, vocab=vocab, model_config=model_config, history=history)
+            extra = make_checkpoint_extra(
+                args=args,
+                cfg=cfg,
+                vocab=vocab,
+                model_config=model_config,
+                history=history,
+                ema=ema,
+                include_ema_state=ema is not None,
+                checkpoint_weights="live",
+            )
             if args.save_every > 0 and ((epoch + 1) % int(args.save_every) == 0 or epoch == epochs - 1):
                 save_depth_checkpoint(path=last_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
                 print(f"Saved last checkpoint -> {last_path}")
+                if ema is not None:
+                    ema_extra = make_checkpoint_extra(
+                        args=args,
+                        cfg=cfg,
+                        vocab=vocab,
+                        model_config=model_config,
+                        history=history,
+                        ema=ema,
+                        checkpoint_weights="ema",
+                    )
+                    save_depth_checkpoint(
+                        path=ema_last_path,
+                        model=model,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        history=history,
+                        extra=ema_extra,
+                        ema=ema,
+                        use_ema_weights=True,
+                    )
+                    print(f"Saved EMA last checkpoint -> {ema_last_path}")
 
             if val_loader is None:
                 score = metric_score(train_metrics)
