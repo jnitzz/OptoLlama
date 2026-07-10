@@ -98,10 +98,14 @@ def _normalize_model_type(model_type: str | None) -> str:
         "opto_depth": "optollama_depth",
         "opto_depth_field": "optollama_depth",
         "dit_depth": "optollama_depth",
+        "eso_depth": "eso_depth",
+        "esolm_depth": "eso_depth",
+        "eso_lm_depth": "eso_depth",
+        "eso_depth_field": "eso_depth",
     }
     if value not in aliases:
         raise ValueError(
-            f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', or 'optollama_depth'."
+            f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', 'optollama_depth', or 'eso_depth'."
         )
     return aliases[value]
 
@@ -241,6 +245,78 @@ class DepthFieldOptoLlamaBlock(nn.Module):
         return residual + self.dropout(h)
 
 
+class DepthFieldEsoBlock(nn.Module):
+    """
+    Eso-LM-inspired hybrid attention block for dense depth fields.
+
+    The block keeps the OptoLlama-style spectral cross-attention and uses two
+    depth self-attention paths: bidirectional masked-diffusion attention and
+    causal autoregressive attention. ``eso_alpha`` controls the fixed blend.
+    """
+
+    def __init__(self, channels: int, *, n_heads: int, dropout: float, ffn_multiplier: float, eso_alpha: float) -> None:
+        super().__init__()
+        channels = int(channels)
+        n_heads = int(n_heads)
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be positive, got {n_heads}")
+        if channels % n_heads != 0:
+            raise ValueError(f"channels={channels} must be divisible by n_heads={n_heads}.")
+        hidden = max(channels, int(round(channels * float(ffn_multiplier))))
+        self.eso_alpha = float(max(0.0, min(1.0, eso_alpha)))
+
+        self.cross_attn = nn.MultiheadAttention(embed_dim=channels, num_heads=n_heads, dropout=float(dropout), batch_first=True)
+        self.mdm_self_attn = nn.MultiheadAttention(embed_dim=channels, num_heads=n_heads, dropout=float(dropout), batch_first=True)
+        self.ar_self_attn = nn.MultiheadAttention(embed_dim=channels, num_heads=n_heads, dropout=float(dropout), batch_first=True)
+        self.ff1 = nn.Linear(channels, hidden)
+        self.ff2 = nn.Linear(hidden, channels)
+
+        self.norm1 = AdaLayerNormGaussian(channels, channels)
+        self.norm2 = AdaLayerNormGaussian(channels, channels)
+        self.norm3 = AdaLayerNormGaussian(channels, channels)
+
+        self.to_alpha1 = nn.Linear(channels, channels)
+        self.to_alpha2 = nn.Linear(channels, channels)
+        nn.init.normal_(self.to_alpha1.weight, 0.0, 8e-4)
+        nn.init.normal_(self.to_alpha2.weight, 0.0, 8e-4)
+        nn.init.zeros_(self.to_alpha1.bias)
+        nn.init.zeros_(self.to_alpha2.bias)
+
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(
+        self,
+        depth_tokens: torch.Tensor,
+        spectrum_tokens: torch.Tensor,
+        cond: torch.Tensor,
+        causal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply spectral conditioning and blended MDM/AR depth attention."""
+        residual = depth_tokens
+        h = self.norm1(depth_tokens, cond)
+        h, _ = self.cross_attn(query=h, key=spectrum_tokens, value=spectrum_tokens, need_weights=False)
+        h = h * (1.0 + self.to_alpha1(cond).unsqueeze(1))
+        depth_tokens = residual + h
+
+        residual = depth_tokens
+        h = self.norm2(depth_tokens, cond)
+        if self.eso_alpha <= 0.0:
+            h, _ = self.mdm_self_attn(query=h, key=h, value=h, need_weights=False)
+        elif self.eso_alpha >= 1.0:
+            h, _ = self.ar_self_attn(query=h, key=h, value=h, attn_mask=causal_mask, need_weights=False)
+        else:
+            mdm_h, _ = self.mdm_self_attn(query=h, key=h, value=h, need_weights=False)
+            ar_h, _ = self.ar_self_attn(query=h, key=h, value=h, attn_mask=causal_mask, need_weights=False)
+            h = (1.0 - self.eso_alpha) * mdm_h + self.eso_alpha * ar_h
+        h = h * (1.0 + self.to_alpha2(cond).unsqueeze(1))
+        depth_tokens = residual + h
+
+        residual = depth_tokens
+        h = self.norm3(depth_tokens, cond)
+        h = self.ff2(functional.silu(self.ff1(h)))
+        return residual + self.dropout(h)
+
+
 @dataclass(frozen=True)
 class DepthFieldModelConfig:
     """Serializable constructor config for depth-field diffusion."""
@@ -254,6 +330,7 @@ class DepthFieldModelConfig:
     kernel_size: int = 7
     n_heads: int = 8
     ffn_multiplier: float = 4.0
+    eso_alpha: float = 0.25
     timesteps: int = 100
     dropout: float = 0.0
     conv_type: str = "full"
@@ -263,11 +340,12 @@ class DepthFieldModelConfig:
         object.__setattr__(self, "conv_type", _normalize_conv_type(self.conv_type))
         object.__setattr__(self, "n_heads", int(self.n_heads))
         object.__setattr__(self, "ffn_multiplier", float(self.ffn_multiplier))
+        object.__setattr__(self, "eso_alpha", float(max(0.0, min(1.0, self.eso_alpha))))
         if int(self.n_heads) <= 0:
             raise ValueError(f"n_heads must be positive, got {self.n_heads}.")
         if float(self.ffn_multiplier) <= 0.0:
             raise ValueError(f"ffn_multiplier must be positive, got {self.ffn_multiplier}.")
-        if self.model_type in {"attention", "optollama_depth"} and int(self.d_model) % int(self.n_heads) != 0:
+        if self.model_type in {"attention", "optollama_depth", "eso_depth"} and int(self.d_model) % int(self.n_heads) != 0:
             raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
 
     def to_dict(self) -> dict:
@@ -282,6 +360,7 @@ class DepthFieldModelConfig:
             "kernel_size": int(self.kernel_size),
             "n_heads": int(self.n_heads),
             "ffn_multiplier": float(self.ffn_multiplier),
+            "eso_alpha": float(self.eso_alpha),
             "timesteps": int(self.timesteps),
             "dropout": float(self.dropout),
             "conv_type": _normalize_conv_type(self.conv_type),
@@ -300,6 +379,7 @@ class DepthFieldModelConfig:
             kernel_size=int(data.get("kernel_size", 7)),
             n_heads=int(data.get("n_heads", 8)),
             ffn_multiplier=float(data.get("ffn_multiplier", 4.0)),
+            eso_alpha=float(data.get("eso_alpha", 0.25)),
             timesteps=int(data.get("timesteps", 100)),
             dropout=float(data.get("dropout", 0.0)),
             conv_type=_normalize_conv_type(data.get("conv_type", "full")),
@@ -717,9 +797,92 @@ class DepthFieldOptoLlamaDiffusion(DepthFieldDiffusion):
         return self.output(depth_tokens)
 
 
+class DepthFieldEsoDiffusion(DepthFieldDiffusion):
+    """
+    Eso-LM-inspired depth-field diffusion backbone.
+
+    This keeps the dense depth-field objective and sampler, while each block
+    blends bidirectional MDM-style self-attention with causal AR-style
+    self-attention after spectral cross-attention.
+    """
+
+    def __init__(self, config: DepthFieldModelConfig) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.spectrum_shape = tuple(int(v) for v in config.spectrum_shape)
+        self.num_materials = int(config.num_materials)
+        self.depth_bins = int(config.depth_bins)
+        self.d_model = int(config.d_model)
+        self.timesteps = int(config.timesteps)
+        self.mask_id = self.num_materials
+        self.conv_type = _normalize_conv_type(config.conv_type)
+        self.eso_alpha = float(config.eso_alpha)
+
+        if len(self.spectrum_shape) < 1:
+            raise ValueError(f"spectrum_shape must include a wavelength dimension, got {self.spectrum_shape}")
+        spectrum_width = int(self.spectrum_shape[-1])
+        spectral_tokens = int(math.prod(self.spectrum_shape[:-1])) if len(self.spectrum_shape) > 1 else 1
+        max_position_len = max(self.depth_bins, spectral_tokens, 1)
+
+        self.spectrum_embedding = OptoLlamaSpectrumEmbedding(spectrum_width, self.d_model)
+        self.input_embedding = nn.Embedding(self.num_materials + 1, self.d_model)
+        self.time_embedding = OptoLlamaTimestepEmbedding(self.d_model)
+        self.positional_encoding = OptoLlamaPositionalEncoding(max_position_len, self.d_model)
+        self.blocks = nn.ModuleList(
+            [
+                DepthFieldEsoBlock(
+                    self.d_model,
+                    n_heads=int(config.n_heads),
+                    dropout=float(config.dropout),
+                    ffn_multiplier=float(config.ffn_multiplier),
+                    eso_alpha=self.eso_alpha,
+                )
+                for _ in range(int(config.n_blocks))
+            ]
+        )
+        self.output = nn.Linear(self.d_model, self.num_materials)
+        causal_mask = torch.triu(torch.ones(self.depth_bins, self.depth_bins, dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+
+    def reset_parameters(self) -> None:
+        """Keep API compatibility with the other depth-field backbones."""
+        return None
+
+    def _spectrum_tokens(self, spectra: torch.Tensor) -> torch.Tensor:
+        embedded = self.spectrum_embedding(spectra.float())
+        if embedded.dim() == 2:
+            embedded = embedded.unsqueeze(1)
+        elif embedded.dim() > 3:
+            embedded = embedded.reshape(embedded.size(0), -1, embedded.size(-1))
+        return embedded + self.positional_encoding(embedded).to(dtype=embedded.dtype)
+
+    def forward(self, spectra: torch.Tensor, noised_fields: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Predict clean material logits with Eso-style hybrid depth attention."""
+        if spectra.shape[1:] != self.spectrum_shape:
+            raise ValueError(f"Expected spectra shape [B,{self.spectrum_shape}], got {tuple(spectra.shape)}")
+        if noised_fields.shape != (spectra.size(0), self.depth_bins):
+            raise ValueError(
+                f"Expected noised_fields shape [{spectra.size(0)},{self.depth_bins}], got {tuple(noised_fields.shape)}"
+            )
+
+        spectrum_tokens = self._spectrum_tokens(spectra)
+        depth_tokens = self.input_embedding(noised_fields.long().clamp(0, self.mask_id))
+        depth_tokens = depth_tokens + self.positional_encoding(depth_tokens).to(dtype=depth_tokens.dtype)
+        time_token = self.time_embedding(timesteps)
+        depth_tokens = depth_tokens + time_token.to(dtype=depth_tokens.dtype)
+        cond = time_token.squeeze(1).to(dtype=depth_tokens.dtype)
+        causal_mask = self.causal_mask[: self.depth_bins, : self.depth_bins]
+
+        for block in self.blocks:
+            depth_tokens = block(depth_tokens, spectrum_tokens, cond, causal_mask)
+        return self.output(depth_tokens)
+
+
 def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
     """Build the configured depth-field diffusion model."""
     model_type = _normalize_model_type(config.model_type)
+    if model_type == "eso_depth":
+        return DepthFieldEsoDiffusion(config)
     if model_type == "optollama_depth":
         return DepthFieldOptoLlamaDiffusion(config)
     if model_type == "attention":

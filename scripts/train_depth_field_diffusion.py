@@ -84,10 +84,19 @@ def parse_args() -> argparse.Namespace:
             "opto-depth",
             "dit_depth",
             "dit-depth",
+            "eso_depth",
+            "eso-depth",
+            "esolm_depth",
+            "esolm-depth",
+            "eso_lm_depth",
+            "eso-lm-depth",
+            "eso_depth_field",
+            "eso-depth-field",
         ],
         help=(
             "Depth-field backbone type. 'conv' uses dilated Conv1d blocks, 'attention' uses global self-attention, "
-            "and 'optollama_depth' uses OptoLlama-style cross/self-attention blocks."
+            "'optollama_depth' uses OptoLlama-style cross/self-attention blocks, and 'eso_depth' blends "
+            "bidirectional diffusion attention with causal AR attention."
         ),
     )
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
@@ -102,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-heads", type=int, default=None, help="Attention heads when --model-type=attention.")
     parser.add_argument("--ffn-multiplier", type=float, default=None, help="Attention feed-forward width multiplier.")
+    parser.add_argument("--eso-alpha", type=float, default=None, help="Eso-depth AR/MDM attention blend. 0=MDM, 1=causal AR.")
     parser.add_argument("--dropout", type=float, default=None, help="Dropout inside residual blocks.")
     parser.add_argument("--diffusion-steps", type=int, default=None, help="Discrete depth-field diffusion timesteps.")
 
@@ -345,6 +355,8 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         args.n_heads = nested_get(block, "MODEL", "N_HEADS", default=8)
     if args.ffn_multiplier is None:
         args.ffn_multiplier = nested_get(block, "MODEL", "FFN_MULTIPLIER", default=4.0)
+    if args.eso_alpha is None:
+        args.eso_alpha = nested_get(block, "MODEL", "ESO_ALPHA", default=0.25)
     set_arg_config_required(args, "dropout", nested_required(block, "MODEL", "DROPOUT"), "DEPTH_FIELD.MODEL.DROPOUT")
     set_arg_config_required(args, "diffusion_steps", nested_required(block, "MODEL", "DIFFUSION_STEPS"), "DEPTH_FIELD.MODEL.DIFFUSION_STEPS")
 
@@ -1536,6 +1548,7 @@ def main() -> None:
         kernel_size=int(args.kernel_size),
         n_heads=int(args.n_heads),
         ffn_multiplier=float(args.ffn_multiplier),
+        eso_alpha=float(args.eso_alpha),
         conv_type=str(args.conv_type),
         timesteps=int(args.diffusion_steps),
         dropout=float(args.dropout),
@@ -1725,10 +1738,12 @@ def main() -> None:
 
     if rank == 0:
         model_desc = f"type={model_config.model_type}"
-        if model_config.model_type in {"attention", "optollama_depth"}:
+        if model_config.model_type in {"attention", "optollama_depth", "eso_depth"}:
             model_desc += f", heads={model_config.n_heads}, ffn={model_config.ffn_multiplier:g}"
             if model_config.model_type == "optollama_depth":
                 model_desc += ", spectrum_cross_attn=true"
+            if model_config.model_type == "eso_depth":
+                model_desc += f", spectrum_cross_attn=true, eso_alpha={model_config.eso_alpha:g}"
         else:
             model_desc += f", conv={model_config.conv_type}, kernel={model_config.kernel_size}"
         print(
