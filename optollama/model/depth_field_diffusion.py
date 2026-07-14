@@ -98,10 +98,16 @@ def _normalize_model_type(model_type: str | None) -> str:
         "opto_depth": "optollama_depth",
         "opto_depth_field": "optollama_depth",
         "dit_depth": "optollama_depth",
+        "optollama_depth_windowed": "optollama_depth_windowed",
+        "optollama_windowed_depth": "optollama_depth_windowed",
+        "optollama_depth_patched": "optollama_depth_windowed",
+        "windowed_optollama_depth": "optollama_depth_windowed",
+        "windowed_depth": "optollama_depth_windowed",
     }
     if value not in aliases:
         raise ValueError(
-            f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', or 'optollama_depth'."
+            f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', "
+            "'optollama_depth', or 'optollama_depth_windowed'."
         )
     return aliases[value]
 
@@ -241,6 +247,100 @@ class DepthFieldOptoLlamaBlock(nn.Module):
         return residual + self.dropout(h)
 
 
+class WindowedSpectrumEmbedding(nn.Module):
+    """Project overlapping multi-channel wavelength windows into spectrum tokens."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        input_width: int,
+        d_model: int,
+        *,
+        patch_size: int,
+        patch_stride: int,
+    ) -> None:
+        super().__init__()
+        self.input_channels = int(input_channels)
+        self.input_width = int(input_width)
+        self.patch_size = int(patch_size)
+        self.patch_stride = int(patch_stride)
+
+        if self.input_channels <= 0:
+            raise ValueError(f"input_channels must be positive, got {input_channels}.")
+        if self.input_width <= 0:
+            raise ValueError(f"input_width must be positive, got {input_width}.")
+        if self.patch_size <= 0 or self.patch_size > self.input_width:
+            raise ValueError(
+                f"spectrum_patch_size must be in [1,{self.input_width}], got {self.patch_size}."
+            )
+        if self.patch_stride <= 0:
+            raise ValueError(f"spectrum_patch_stride must be positive, got {self.patch_stride}.")
+
+        remainder = (self.input_width - self.patch_size) % self.patch_stride
+        self.right_padding = (self.patch_stride - remainder) % self.patch_stride
+        padded_width = self.input_width + self.right_padding
+        self.num_patches = 1 + (padded_width - self.patch_size) // self.patch_stride
+
+        self.projection = nn.Conv1d(
+            self.input_channels,
+            int(d_model),
+            kernel_size=self.patch_size,
+            stride=self.patch_stride,
+        )
+        self.pre_norm = nn.LayerNorm(int(d_model))
+        self.mlp = nn.Sequential(
+            nn.Linear(int(d_model), int(d_model)),
+            nn.SiLU(),
+            nn.Linear(int(d_model), int(d_model)),
+        )
+        self.output_norm = nn.LayerNorm(int(d_model))
+
+    def forward(self, spectra: torch.Tensor) -> torch.Tensor:
+        """Return wavelength-window tokens with shape ``[B,num_patches,d_model]``."""
+        if spectra.dim() < 2:
+            raise ValueError(f"spectra must include batch and wavelength dimensions, got {tuple(spectra.shape)}")
+        spectra = spectra.reshape(spectra.size(0), -1, spectra.size(-1)).float()
+        if spectra.shape[1:] != (self.input_channels, self.input_width):
+            raise ValueError(
+                f"Expected flattened spectra shape [B,{self.input_channels},{self.input_width}], "
+                f"got {tuple(spectra.shape)}"
+            )
+        if self.right_padding:
+            spectra = functional.pad(spectra, (0, self.right_padding), mode="replicate")
+        tokens = self.projection(spectra).transpose(1, 2).contiguous()
+        tokens = tokens + self.mlp(self.pre_norm(tokens))
+        return self.output_norm(tokens)
+
+
+class SpectrumEncoderBlock(nn.Module):
+    """Mix wavelength-window tokens before they condition the depth sequence."""
+
+    def __init__(self, d_model: int, *, n_heads: int, dropout: float, ffn_multiplier: float) -> None:
+        super().__init__()
+        hidden = max(int(d_model), int(round(int(d_model) * float(ffn_multiplier))))
+        self.norm1 = nn.LayerNorm(int(d_model))
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=int(d_model),
+            num_heads=int(n_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(int(d_model))
+        self.ff = nn.Sequential(
+            nn.Linear(int(d_model), hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(d_model)),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Apply spectrum self-attention and a position-wise feed-forward layer."""
+        h = self.norm1(tokens)
+        attended, _ = self.self_attn(h, h, h, need_weights=False)
+        tokens = tokens + self.dropout(attended)
+        return tokens + self.dropout(self.ff(self.norm2(tokens)))
+
+
 @dataclass(frozen=True)
 class DepthFieldModelConfig:
     """Serializable constructor config for depth-field diffusion."""
@@ -257,18 +357,43 @@ class DepthFieldModelConfig:
     timesteps: int = 100
     dropout: float = 0.0
     conv_type: str = "full"
+    spectrum_patch_size: int = 8
+    spectrum_patch_stride: int = 4
+    spectrum_encoder_blocks: int = 2
+    spectrum_encoder_heads: int = 8
+    spectrum_ffn_multiplier: float = 2.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_type", _normalize_model_type(self.model_type))
         object.__setattr__(self, "conv_type", _normalize_conv_type(self.conv_type))
         object.__setattr__(self, "n_heads", int(self.n_heads))
         object.__setattr__(self, "ffn_multiplier", float(self.ffn_multiplier))
+        object.__setattr__(self, "spectrum_patch_size", int(self.spectrum_patch_size))
+        object.__setattr__(self, "spectrum_patch_stride", int(self.spectrum_patch_stride))
+        object.__setattr__(self, "spectrum_encoder_blocks", int(self.spectrum_encoder_blocks))
+        object.__setattr__(self, "spectrum_encoder_heads", int(self.spectrum_encoder_heads))
+        object.__setattr__(self, "spectrum_ffn_multiplier", float(self.spectrum_ffn_multiplier))
         if int(self.n_heads) <= 0:
             raise ValueError(f"n_heads must be positive, got {self.n_heads}.")
         if float(self.ffn_multiplier) <= 0.0:
             raise ValueError(f"ffn_multiplier must be positive, got {self.ffn_multiplier}.")
-        if self.model_type in {"attention", "optollama_depth"} and int(self.d_model) % int(self.n_heads) != 0:
+        attention_models = {"attention", "optollama_depth", "optollama_depth_windowed"}
+        if self.model_type in attention_models and int(self.d_model) % int(self.n_heads) != 0:
             raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
+        if int(self.spectrum_patch_size) <= 0:
+            raise ValueError(f"spectrum_patch_size must be positive, got {self.spectrum_patch_size}.")
+        if int(self.spectrum_patch_stride) <= 0:
+            raise ValueError(f"spectrum_patch_stride must be positive, got {self.spectrum_patch_stride}.")
+        if int(self.spectrum_encoder_blocks) < 0:
+            raise ValueError(f"spectrum_encoder_blocks must be non-negative, got {self.spectrum_encoder_blocks}.")
+        if int(self.spectrum_encoder_heads) <= 0:
+            raise ValueError(f"spectrum_encoder_heads must be positive, got {self.spectrum_encoder_heads}.")
+        if float(self.spectrum_ffn_multiplier) <= 0.0:
+            raise ValueError(f"spectrum_ffn_multiplier must be positive, got {self.spectrum_ffn_multiplier}.")
+        if self.model_type == "optollama_depth_windowed" and int(self.d_model) % int(self.spectrum_encoder_heads) != 0:
+            raise ValueError(
+                f"d_model={self.d_model} must be divisible by spectrum_encoder_heads={self.spectrum_encoder_heads}."
+            )
 
     def to_dict(self) -> dict:
         """Return a JSON/checkpoint friendly constructor mapping."""
@@ -285,6 +410,11 @@ class DepthFieldModelConfig:
             "timesteps": int(self.timesteps),
             "dropout": float(self.dropout),
             "conv_type": _normalize_conv_type(self.conv_type),
+            "spectrum_patch_size": int(self.spectrum_patch_size),
+            "spectrum_patch_stride": int(self.spectrum_patch_stride),
+            "spectrum_encoder_blocks": int(self.spectrum_encoder_blocks),
+            "spectrum_encoder_heads": int(self.spectrum_encoder_heads),
+            "spectrum_ffn_multiplier": float(self.spectrum_ffn_multiplier),
         }
 
     @staticmethod
@@ -303,6 +433,11 @@ class DepthFieldModelConfig:
             timesteps=int(data.get("timesteps", 100)),
             dropout=float(data.get("dropout", 0.0)),
             conv_type=_normalize_conv_type(data.get("conv_type", "full")),
+            spectrum_patch_size=int(data.get("spectrum_patch_size", 8)),
+            spectrum_patch_stride=int(data.get("spectrum_patch_stride", 4)),
+            spectrum_encoder_blocks=int(data.get("spectrum_encoder_blocks", 2)),
+            spectrum_encoder_heads=int(data.get("spectrum_encoder_heads", data.get("n_heads", 8))),
+            spectrum_ffn_multiplier=float(data.get("spectrum_ffn_multiplier", 2.0)),
         )
 
 
@@ -717,9 +852,50 @@ class DepthFieldOptoLlamaDiffusion(DepthFieldDiffusion):
         return self.output(depth_tokens)
 
 
+class DepthFieldWindowedOptoLlamaDiffusion(DepthFieldOptoLlamaDiffusion):
+    """OptoLlama depth-field model conditioned by overlapping wavelength windows."""
+
+    def __init__(self, config: DepthFieldModelConfig) -> None:
+        super().__init__(config)
+        spectrum_width = int(self.spectrum_shape[-1])
+        spectrum_channels = int(math.prod(self.spectrum_shape[:-1])) if len(self.spectrum_shape) > 1 else 1
+        self.spectrum_embedding = WindowedSpectrumEmbedding(
+            spectrum_channels,
+            spectrum_width,
+            self.d_model,
+            patch_size=int(config.spectrum_patch_size),
+            patch_stride=int(config.spectrum_patch_stride),
+        )
+        self.spectrum_positional_encoding = OptoLlamaPositionalEncoding(
+            self.spectrum_embedding.num_patches,
+            self.d_model,
+        )
+        self.spectrum_blocks = nn.ModuleList(
+            [
+                SpectrumEncoderBlock(
+                    self.d_model,
+                    n_heads=int(config.spectrum_encoder_heads),
+                    dropout=float(config.dropout),
+                    ffn_multiplier=float(config.spectrum_ffn_multiplier),
+                )
+                for _ in range(int(config.spectrum_encoder_blocks))
+            ]
+        )
+        self.spectrum_output_norm = nn.LayerNorm(self.d_model)
+
+    def _spectrum_tokens(self, spectra: torch.Tensor) -> torch.Tensor:
+        tokens = self.spectrum_embedding(spectra.float())
+        tokens = tokens + self.spectrum_positional_encoding(tokens).to(dtype=tokens.dtype)
+        for block in self.spectrum_blocks:
+            tokens = block(tokens)
+        return self.spectrum_output_norm(tokens)
+
+
 def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
     """Build the configured depth-field diffusion model."""
     model_type = _normalize_model_type(config.model_type)
+    if model_type == "optollama_depth_windowed":
+        return DepthFieldWindowedOptoLlamaDiffusion(config)
     if model_type == "optollama_depth":
         return DepthFieldOptoLlamaDiffusion(config)
     if model_type == "attention":

@@ -84,10 +84,19 @@ def parse_args() -> argparse.Namespace:
             "opto-depth",
             "dit_depth",
             "dit-depth",
+            "optollama_depth_windowed",
+            "optollama-depth-windowed",
+            "optollama_windowed_depth",
+            "optollama-windowed-depth",
+            "optollama_depth_patched",
+            "optollama-depth-patched",
+            "windowed_depth",
+            "windowed-depth",
         ],
         help=(
             "Depth-field backbone type. 'conv' uses dilated Conv1d blocks, 'attention' uses global self-attention, "
-            "and 'optollama_depth' uses OptoLlama-style cross/self-attention blocks."
+            "'optollama_depth' uses OptoLlama-style cross/self-attention blocks, and "
+            "'optollama_depth_windowed' adds wavelength-window spectrum conditioning."
         ),
     )
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
@@ -102,6 +111,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-heads", type=int, default=None, help="Attention heads when --model-type=attention.")
     parser.add_argument("--ffn-multiplier", type=float, default=None, help="Attention feed-forward width multiplier.")
+    parser.add_argument("--spectrum-patch-size", type=int, default=None, help="Wavelength samples per spectrum window.")
+    parser.add_argument("--spectrum-patch-stride", type=int, default=None, help="Stride between spectrum windows.")
+    parser.add_argument("--spectrum-encoder-blocks", type=int, default=None, help="Self-attention blocks over spectrum windows.")
+    parser.add_argument("--spectrum-encoder-heads", type=int, default=None, help="Attention heads in the spectrum encoder.")
+    parser.add_argument(
+        "--spectrum-ffn-multiplier",
+        type=float,
+        default=None,
+        help="Feed-forward width multiplier in spectrum encoder blocks.",
+    )
     parser.add_argument("--dropout", type=float, default=None, help="Dropout inside residual blocks.")
     parser.add_argument("--diffusion-steps", type=int, default=None, help="Discrete depth-field diffusion timesteps.")
 
@@ -345,6 +364,16 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         args.n_heads = nested_get(block, "MODEL", "N_HEADS", default=8)
     if args.ffn_multiplier is None:
         args.ffn_multiplier = nested_get(block, "MODEL", "FFN_MULTIPLIER", default=4.0)
+    if args.spectrum_patch_size is None:
+        args.spectrum_patch_size = nested_get(block, "MODEL", "SPECTRUM_PATCH_SIZE", default=8)
+    if args.spectrum_patch_stride is None:
+        args.spectrum_patch_stride = nested_get(block, "MODEL", "SPECTRUM_PATCH_STRIDE", default=4)
+    if args.spectrum_encoder_blocks is None:
+        args.spectrum_encoder_blocks = nested_get(block, "MODEL", "SPECTRUM_ENCODER_BLOCKS", default=2)
+    if args.spectrum_encoder_heads is None:
+        args.spectrum_encoder_heads = nested_get(block, "MODEL", "SPECTRUM_ENCODER_HEADS", default=args.n_heads)
+    if args.spectrum_ffn_multiplier is None:
+        args.spectrum_ffn_multiplier = nested_get(block, "MODEL", "SPECTRUM_FFN_MULTIPLIER", default=2.0)
     set_arg_config_required(args, "dropout", nested_required(block, "MODEL", "DROPOUT"), "DEPTH_FIELD.MODEL.DROPOUT")
     set_arg_config_required(args, "diffusion_steps", nested_required(block, "MODEL", "DIFFUSION_STEPS"), "DEPTH_FIELD.MODEL.DIFFUSION_STEPS")
 
@@ -1539,6 +1568,11 @@ def main() -> None:
         conv_type=str(args.conv_type),
         timesteps=int(args.diffusion_steps),
         dropout=float(args.dropout),
+        spectrum_patch_size=int(args.spectrum_patch_size),
+        spectrum_patch_stride=int(args.spectrum_patch_stride),
+        spectrum_encoder_blocks=int(args.spectrum_encoder_blocks),
+        spectrum_encoder_heads=int(args.spectrum_encoder_heads),
+        spectrum_ffn_multiplier=float(args.spectrum_ffn_multiplier),
     )
     model = optollama.model.build_depth_field_model(model_config).to(device)
     if ddp:
@@ -1725,10 +1759,16 @@ def main() -> None:
 
     if rank == 0:
         model_desc = f"type={model_config.model_type}"
-        if model_config.model_type in {"attention", "optollama_depth"}:
+        if model_config.model_type in {"attention", "optollama_depth", "optollama_depth_windowed"}:
             model_desc += f", heads={model_config.n_heads}, ffn={model_config.ffn_multiplier:g}"
-            if model_config.model_type == "optollama_depth":
+            if model_config.model_type in {"optollama_depth", "optollama_depth_windowed"}:
                 model_desc += ", spectrum_cross_attn=true"
+            if model_config.model_type == "optollama_depth_windowed":
+                model_desc += (
+                    f", spectrum_patch={model_config.spectrum_patch_size}"
+                    f"/{model_config.spectrum_patch_stride}, spectrum_blocks={model_config.spectrum_encoder_blocks}, "
+                    f"spectrum_heads={model_config.spectrum_encoder_heads}"
+                )
         else:
             model_desc += f", conv={model_config.conv_type}, kernel={model_config.kernel_size}"
         print(
