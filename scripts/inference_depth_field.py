@@ -54,8 +54,35 @@ def parse_args() -> argparse.Namespace:
         "--remask-strategy",
         type=str,
         default=None,
-        choices=["confidence", "random"],
-        help="Denoising remask strategy: confidence reopens least-confident bins, random uses Bernoulli remasking.",
+        choices=[
+            "confidence",
+            "random",
+            "monotonic",
+            "monotonic_confidence",
+            "monotonic-random",
+            "monotonic_random",
+            "monotonic-cached",
+            "monotonic_cached",
+            "slot-cached",
+            "slot_cached",
+            "slotwise_cached",
+            "block-cached",
+            "block_cached",
+            "blockwise_cached",
+            "variable-block-cached",
+            "variable_block_cached",
+        ],
+        help=(
+            "Denoising remask strategy: confidence reopens least-confident bins, random uses Bernoulli remasking, "
+            "monotonic finalizes bins without remasking them, slot_cached denoises one depth bin at a time, "
+            "and block_cached finalizes scheduled contiguous blocks with a cached causal prefix."
+        ),
+    )
+    parser.add_argument(
+        "--block-schedule",
+        type=str,
+        default=None,
+        help="Block sizes for block_cached sampling, e.g. '512,256,128,64,32'. Defaults to DEPTH_FIELD.EVAL.BLOCK_SCHEDULE.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed. Required unless config SEED is set.")
 
@@ -174,6 +201,8 @@ def apply_depth_field_eval_defaults(cfg: dict[str, Any], args: argparse.Namespac
     set_arg_config_required(args, "top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
     set_arg_config_required(args, "deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
     set_arg_config_required(args, "remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
+    if args.block_schedule is None:
+        args.block_schedule = nested_get(block, "EVAL", "BLOCK_SCHEDULE")
     set_arg_config_required(args, "tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
     set_arg_config_required(args, "tmm_batch_size", nested_required(block, "EVAL", "TMM_BATCH_SIZE"), "DEPTH_FIELD.EVAL.TMM_BATCH_SIZE")
     set_arg_config_required(args, "score_mode", nested_required(block, "EVAL", "SCORE_MODE"), "DEPTH_FIELD.EVAL.SCORE_MODE")
@@ -589,7 +618,7 @@ def run_depth_field_inference(
         f"{'target=' + target if target is not None else 'split=' + args.split}, "
         f"mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
         f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
-        f"remask={args.remask_strategy}, mc_batch={mc_batch_size}, "
+        f"remask={args.remask_strategy}, block_schedule={args.block_schedule}, mc_batch={mc_batch_size}, "
         f"model_device={device}, tmm_device={tmm_device}"
     )
 
@@ -626,6 +655,7 @@ def run_depth_field_inference(
                 top_k=int(args.top_k),
                 deterministic=bool(args.deterministic or args.temperature <= 0.0),
                 remask_strategy=str(args.remask_strategy),
+                block_schedule=args.block_schedule,
             )
             fields_cpu_chunk = fields.detach().cpu()
             token_ids_cpu_chunk = optollama.data.decode_depth_field_to_tokens(
@@ -779,6 +809,7 @@ def run_depth_field_inference(
         "score_mode": score_mode,
         "rank_by": rank_by,
         "remask_strategy": str(args.remask_strategy),
+        "block_schedule": args.block_schedule,
         "mae_mean": float(torch.tensor(mae_all).mean().item()) if mae_all else None,
         "mae_median": float(torch.tensor(mae_all).median().item()) if mae_all else None,
         "mae_min": float(min(mae_all)) if mae_all else None,

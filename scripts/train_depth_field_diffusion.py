@@ -151,8 +151,35 @@ def parse_args() -> argparse.Namespace:
         "--eval-remask-strategy",
         type=str,
         default=None,
-        choices=["confidence", "random"],
-        help="TMM validation remasking strategy: confidence reopens least-confident bins, random uses Bernoulli remasking.",
+        choices=[
+            "confidence",
+            "random",
+            "monotonic",
+            "monotonic_confidence",
+            "monotonic-random",
+            "monotonic_random",
+            "monotonic-cached",
+            "monotonic_cached",
+            "slot-cached",
+            "slot_cached",
+            "slotwise_cached",
+            "block-cached",
+            "block_cached",
+            "blockwise_cached",
+            "variable-block-cached",
+            "variable_block_cached",
+        ],
+        help=(
+            "TMM validation remasking strategy: confidence reopens least-confident bins, random uses Bernoulli remasking, "
+            "monotonic finalizes bins without remasking them, slot_cached denoises one depth bin at a time, "
+            "and block_cached finalizes scheduled contiguous blocks with a cached causal prefix."
+        ),
+    )
+    parser.add_argument(
+        "--eval-block-schedule",
+        type=str,
+        default=None,
+        help="Block sizes for block_cached validation sampling, e.g. '512,256,128,64,32'.",
     )
     parser.add_argument("--eval-tmm-device", type=str, default=None, help='TMM validation device. "auto" uses model device.')
     parser.add_argument("--eval-tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM validation chunk.")
@@ -390,6 +417,7 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_config_required(args, "eval_top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
     set_arg_config_required(args, "eval_deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
     set_arg_config_required(args, "eval_remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
+    set_arg_default(args, "eval_block_schedule", nested_get(block, "EVAL", "BLOCK_SCHEDULE"))
     set_arg_config_required(args, "eval_tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
     set_arg_config_required(args, "eval_tmm_batch_size", nested_required(block, "EVAL", "TMM_BATCH_SIZE"), "DEPTH_FIELD.EVAL.TMM_BATCH_SIZE")
     set_arg_config_required(args, "save_eval_samples", nested_required(block, "EVAL", "SAVE_SAMPLES"), "DEPTH_FIELD.EVAL.SAVE_SAMPLES")
@@ -1039,6 +1067,7 @@ def run_tmm_evaluation(
             top_k=int(args.eval_top_k),
             deterministic=bool(args.eval_deterministic or args.eval_temperature <= 0.0),
             remask_strategy=str(args.eval_remask_strategy),
+            block_schedule=args.eval_block_schedule,
         )
         fields_cpu = fields.detach().cpu()
         pred_spectra = simulate_field_runs(
@@ -1170,6 +1199,7 @@ def run_tmm_evaluation(
         "mc_samples": int(mc_samples),
         "sampling_steps": int(args.eval_sampling_steps or sample_model.timesteps),
         "remask_strategy": str(args.eval_remask_strategy),
+        "block_schedule": args.eval_block_schedule,
         "tmm_batch_size": int(args.eval_tmm_batch_size),
     }
     if save_samples:
@@ -1188,6 +1218,7 @@ def run_tmm_evaluation(
                     "score_mode": "field",
                     "rank_by": "field",
                     "remask_strategy": str(args.eval_remask_strategy),
+                    "block_schedule": args.eval_block_schedule,
                     "record_spectra": bool(args.eval_record_spectra),
                     "record_all_mc": bool(args.eval_record_all_mc),
                     "depth_field": {
@@ -1454,6 +1485,7 @@ def make_checkpoint_extra(
             "eval_top_k": int(args.eval_top_k),
             "eval_deterministic": bool(args.eval_deterministic),
             "eval_remask_strategy": str(args.eval_remask_strategy),
+            "eval_block_schedule": args.eval_block_schedule,
             "eval_tmm_batch_size": int(args.eval_tmm_batch_size),
             "save_eval_samples": bool(args.save_eval_samples),
             "eval_samples_dir": args.eval_samples_dir,
@@ -1752,7 +1784,8 @@ def main() -> None:
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
             f"ddp={ddp}, world={world_size}, {model_desc}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
-            f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
+            f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, "
+            f"eval_remask={args.eval_remask_strategy}, eval_block_schedule={args.eval_block_schedule}"
         )
         if validate_every_samples > 0:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")

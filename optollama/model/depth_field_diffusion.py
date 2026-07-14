@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 
 import torch
@@ -316,6 +317,75 @@ class DepthFieldEsoBlock(nn.Module):
         h = self.ff2(functional.silu(self.ff1(h)))
         return residual + self.dropout(h)
 
+    def _cached_ar_self_attention(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Run causal self-attention for new tokens against cached prefix K/V."""
+        batch_size, seq_len, channels = x.shape
+        heads = int(self.ar_self_attn.num_heads)
+        head_dim = channels // heads
+        weight = self.ar_self_attn.in_proj_weight
+        bias = self.ar_self_attn.in_proj_bias
+        q = functional.linear(x, weight[:channels], bias[:channels] if bias is not None else None)
+        k = functional.linear(x, weight[channels : 2 * channels], bias[channels : 2 * channels] if bias is not None else None)
+        v = functional.linear(x, weight[2 * channels :], bias[2 * channels :] if bias is not None else None)
+
+        def shape(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.view(batch_size, seq_len, heads, head_dim).transpose(1, 2).contiguous()
+
+        q = shape(q)
+        k = shape(k)
+        v = shape(v)
+        if past_kv is None:
+            all_k, all_v = k, v
+        else:
+            past_k, past_v = past_kv
+            all_k = torch.cat([past_k.to(device=k.device, dtype=k.dtype), k], dim=2)
+            all_v = torch.cat([past_v.to(device=v.device, dtype=v.dtype), v], dim=2)
+
+        total_len = int(all_k.size(2))
+        if seq_len > 1:
+            mask = torch.zeros((seq_len, total_len), device=x.device, dtype=x.dtype)
+            mask[:, -seq_len:] = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=x.device, dtype=x.dtype),
+                diagonal=1,
+            )
+            mask = mask.view(1, 1, seq_len, total_len)
+        else:
+            mask = None
+        dropout_p = float(self.ar_self_attn.dropout) if self.training else 0.0
+        attended = functional.scaled_dot_product_attention(q, all_k, all_v, attn_mask=mask, dropout_p=dropout_p)
+        attended = attended.transpose(1, 2).contiguous().view(batch_size, seq_len, channels)
+        output = self.ar_self_attn.out_proj(attended)
+        return output, (all_k.detach(), all_v.detach())
+
+    def forward_causal_cached(
+        self,
+        depth_tokens: torch.Tensor,
+        spectrum_tokens: torch.Tensor,
+        cond: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Apply the cacheable causal branch for a new depth-token chunk."""
+        residual = depth_tokens
+        h = self.norm1(depth_tokens, cond)
+        h, _ = self.cross_attn(query=h, key=spectrum_tokens, value=spectrum_tokens, need_weights=False)
+        h = h * (1.0 + self.to_alpha1(cond).unsqueeze(1))
+        depth_tokens = residual + h
+
+        residual = depth_tokens
+        h = self.norm2(depth_tokens, cond)
+        h, present_kv = self._cached_ar_self_attention(h, past_kv)
+        h = h * (1.0 + self.to_alpha2(cond).unsqueeze(1))
+        depth_tokens = residual + h
+
+        residual = depth_tokens
+        h = self.norm3(depth_tokens, cond)
+        h = self.ff2(functional.silu(self.ff1(h)))
+        return residual + self.dropout(h), present_kv
+
 
 @dataclass(frozen=True)
 class DepthFieldModelConfig:
@@ -584,10 +654,87 @@ class DepthFieldDiffusion(nn.Module):
             "uncertain": "confidence",
             "random": "random",
             "bernoulli": "random",
+            "monotonic": "monotonic",
+            "monotonic_confidence": "monotonic",
+            "monotonic-confidence": "monotonic",
+            "monotonic_random": "monotonic_random",
+            "monotonic-random": "monotonic_random",
+            "monotonic_cached": "monotonic_cached",
+            "monotonic-cached": "monotonic_cached",
+            "cached_monotonic": "monotonic_cached",
+            "cached-monotonic": "monotonic_cached",
+            "slot_cached": "slot_cached",
+            "slotwise_cached": "slot_cached",
+            "monotonic_slot_cached": "slot_cached",
+            "block_cached": "block_cached",
+            "blockwise_cached": "block_cached",
+            "variable_block_cached": "block_cached",
+            "monotonic_blockwise_cached": "block_cached",
         }
         if strategy not in aliases:
-            raise ValueError(f"Unknown remask_strategy={remask_strategy!r}; expected 'confidence' or 'random'.")
+            raise ValueError(
+                f"Unknown remask_strategy={remask_strategy!r}; expected 'confidence', 'random', "
+                "'monotonic', 'monotonic_random', 'monotonic_cached', or 'slot_cached'."
+            )
         return aliases[strategy]
+
+    def _sample_monotonic(
+        self,
+        spectra: torch.Tensor,
+        *,
+        step_values: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        deterministic: bool,
+        random_order: bool,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """
+        Sample by monotonically finalizing bins.
+
+        Finalized bins are never remasked or changed again. Unfinalized bins
+        remain as mask tokens until selected for finalization.
+        """
+        batch_size = int(spectra.size(0))
+        device = spectra.device
+        fields = torch.full((batch_size, self.depth_bins), int(self.mask_id), dtype=torch.long, device=device)
+        finalized = torch.zeros((batch_size, self.depth_bins), dtype=torch.bool, device=device)
+
+        for step_idx, timestep in enumerate(step_values):
+            timesteps = torch.full((batch_size,), int(timestep.item()), dtype=torch.long, device=device)
+            logits = self(spectra, fields, timesteps)
+            pred, confidence = self._sample_logits(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                deterministic=deterministic,
+                generator=generator,
+            )
+
+            remaining = ~finalized
+            if step_idx == len(step_values) - 1:
+                fields = torch.where(remaining, pred, fields)
+                break
+
+            next_timestep = step_values[step_idx + 1].view(1)
+            target_remaining = int(round(float(self.noise_probability(next_timestep).item()) * float(self.depth_bins)))
+            target_remaining = max(0, min(target_remaining, self.depth_bins))
+
+            for batch_idx in range(batch_size):
+                candidates = remaining[batch_idx].nonzero(as_tuple=False).flatten()
+                finalize_count = max(0, int(candidates.numel()) - target_remaining)
+                if finalize_count <= 0:
+                    continue
+                if random_order:
+                    scores = torch.rand(candidates.numel(), device=device, generator=generator)
+                    chosen_local = torch.topk(scores, k=finalize_count, largest=True).indices
+                else:
+                    chosen_local = torch.topk(confidence[batch_idx, candidates], k=finalize_count, largest=True).indices
+                chosen = candidates[chosen_local]
+                fields[batch_idx, chosen] = pred[batch_idx, chosen]
+                finalized[batch_idx, chosen] = True
+
+        return fields
 
     @torch.no_grad()
     def sample(
@@ -599,6 +746,7 @@ class DepthFieldDiffusion(nn.Module):
         top_k: int = 0,
         deterministic: bool = False,
         remask_strategy: str = "confidence",
+        block_schedule: object | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """
@@ -621,6 +769,19 @@ class DepthFieldDiffusion(nn.Module):
         step_values = torch.linspace(self.timesteps - 1, 0, total_steps, device=device).round().long()
         if step_values[-1].item() != 0:
             step_values = torch.cat([step_values, torch.zeros(1, device=device, dtype=torch.long)])
+
+        if remask_strategy in {"monotonic", "monotonic_random"}:
+            return self._sample_monotonic(
+                spectra,
+                step_values=step_values,
+                temperature=temperature,
+                top_k=top_k,
+                deterministic=deterministic,
+                random_order=remask_strategy == "monotonic_random",
+                generator=generator,
+            )
+        if remask_strategy in {"monotonic_cached", "slot_cached", "block_cached"}:
+            raise ValueError(f"remask_strategy={remask_strategy!r} is only supported by the eso_depth model.")
 
         for step_idx, timestep in enumerate(step_values):
             timesteps = torch.full((batch_size,), int(timestep.item()), dtype=torch.long, device=device)
@@ -856,6 +1017,10 @@ class DepthFieldEsoDiffusion(DepthFieldDiffusion):
             embedded = embedded.reshape(embedded.size(0), -1, embedded.size(-1))
         return embedded + self.positional_encoding(embedded).to(dtype=embedded.dtype)
 
+    def _depth_position_slice(self, start: int, length: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        pe = self.positional_encoding.pe[int(start) : int(start) + int(length)]
+        return pe.to(device=device, dtype=dtype).unsqueeze(0)
+
     def forward(self, spectra: torch.Tensor, noised_fields: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Predict clean material logits with Eso-style hybrid depth attention."""
         if spectra.shape[1:] != self.spectrum_shape:
@@ -876,6 +1041,359 @@ class DepthFieldEsoDiffusion(DepthFieldDiffusion):
         for block in self.blocks:
             depth_tokens = block(depth_tokens, spectrum_tokens, cond, causal_mask)
         return self.output(depth_tokens)
+
+    def _forward_causal_cached(
+        self,
+        spectra: torch.Tensor,
+        depth_chunk: torch.Tensor,
+        timesteps: torch.Tensor,
+        *,
+        start_pos: int,
+        cache: list[tuple[torch.Tensor, torch.Tensor]] | None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Run the cacheable causal branch for a contiguous depth chunk."""
+        if depth_chunk.dim() != 2:
+            raise ValueError(f"depth_chunk must have shape [B,S], got {tuple(depth_chunk.shape)}")
+        if spectra.shape[1:] != self.spectrum_shape:
+            raise ValueError(f"Expected spectra shape [B,{self.spectrum_shape}], got {tuple(spectra.shape)}")
+        if int(start_pos) < 0 or int(start_pos) + int(depth_chunk.size(1)) > self.depth_bins:
+            raise ValueError(f"Invalid cached chunk range start={start_pos}, length={depth_chunk.size(1)}, bins={self.depth_bins}")
+
+        spectrum_tokens = self._spectrum_tokens(spectra)
+        depth_tokens = self.input_embedding(depth_chunk.long().clamp(0, self.mask_id))
+        depth_tokens = depth_tokens + self._depth_position_slice(
+            int(start_pos),
+            int(depth_chunk.size(1)),
+            device=depth_tokens.device,
+            dtype=depth_tokens.dtype,
+        )
+        time_token = self.time_embedding(timesteps)
+        depth_tokens = depth_tokens + time_token.to(dtype=depth_tokens.dtype)
+        cond = time_token.squeeze(1).to(dtype=depth_tokens.dtype)
+
+        next_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for block_idx, block in enumerate(self.blocks):
+            past = None if cache is None else cache[block_idx]
+            depth_tokens, present = block.forward_causal_cached(depth_tokens, spectrum_tokens, cond, past)
+            next_cache.append(present)
+        return self.output(depth_tokens), next_cache
+
+    @torch.no_grad()
+    def _sample_monotonic_cached(
+        self,
+        spectra: torch.Tensor,
+        *,
+        step_values: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        deterministic: bool,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """
+        Monotonic left-to-right sampler with causal K/V caching.
+
+        This uses the Eso causal branch only. The timestep is fixed at 0 so
+        cached prefix states remain valid as the prefix grows.
+        """
+        self.eval()
+        batch_size = int(spectra.size(0))
+        device = spectra.device
+        fields = torch.full((batch_size, self.depth_bins), int(self.mask_id), dtype=torch.long, device=device)
+        cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        prefix_len = 0
+        cache_timesteps = torch.zeros((batch_size,), dtype=torch.long, device=device)
+
+        for step_idx, timestep in enumerate(step_values):
+            if prefix_len >= self.depth_bins:
+                break
+            if step_idx == len(step_values) - 1:
+                finalize_count = self.depth_bins - prefix_len
+            else:
+                next_timestep = step_values[step_idx + 1].view(1)
+                target_remaining = int(round(float(self.noise_probability(next_timestep).item()) * float(self.depth_bins)))
+                target_remaining = max(0, min(target_remaining, self.depth_bins))
+                finalize_count = max(0, (self.depth_bins - prefix_len) - target_remaining)
+            if finalize_count <= 0:
+                continue
+
+            masked_chunk = torch.full((batch_size, finalize_count), int(self.mask_id), dtype=torch.long, device=device)
+            logits, _ = self._forward_causal_cached(
+                spectra,
+                masked_chunk,
+                cache_timesteps,
+                start_pos=prefix_len,
+                cache=cache,
+            )
+            pred, _ = self._sample_logits(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                deterministic=deterministic,
+                generator=generator,
+            )
+            fields[:, prefix_len : prefix_len + finalize_count] = pred
+            _, cache = self._forward_causal_cached(
+                spectra,
+                pred,
+                cache_timesteps,
+                start_pos=prefix_len,
+                cache=cache,
+            )
+            prefix_len += finalize_count
+
+        if prefix_len < self.depth_bins:
+            masked_chunk = torch.full((batch_size, self.depth_bins - prefix_len), int(self.mask_id), dtype=torch.long, device=device)
+            logits, _ = self._forward_causal_cached(
+                spectra,
+                masked_chunk,
+                cache_timesteps,
+                start_pos=prefix_len,
+                cache=cache,
+            )
+            pred, _ = self._sample_logits(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                deterministic=deterministic,
+                generator=generator,
+            )
+            fields[:, prefix_len:] = pred
+        return fields
+
+    @torch.no_grad()
+    def _sample_slot_cached(
+        self,
+        spectra: torch.Tensor,
+        *,
+        step_values: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        deterministic: bool,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """
+        Denoise one depth-token slot at a time with a cached causal prefix.
+
+        Each slot is treated as a one-token block. The active slot is denoised
+        through the requested timestep schedule without extending the cache;
+        only the final token is committed to the prefix cache.
+        """
+        self.eval()
+        batch_size = int(spectra.size(0))
+        device = spectra.device
+        fields = torch.full((batch_size, self.depth_bins), int(self.mask_id), dtype=torch.long, device=device)
+        cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        cache_timesteps = torch.zeros((batch_size,), dtype=torch.long, device=device)
+
+        for position in range(self.depth_bins):
+            current = torch.full((batch_size, 1), int(self.mask_id), dtype=torch.long, device=device)
+            for timestep in step_values:
+                timesteps = torch.full((batch_size,), int(timestep.item()), dtype=torch.long, device=device)
+                logits, _ = self._forward_causal_cached(
+                    spectra,
+                    current,
+                    timesteps,
+                    start_pos=position,
+                    cache=cache,
+                )
+                current, _ = self._sample_logits(
+                    logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    deterministic=deterministic,
+                    generator=generator,
+                )
+
+            fields[:, position : position + 1] = current
+            _, cache = self._forward_causal_cached(
+                spectra,
+                current,
+                cache_timesteps,
+                start_pos=position,
+                cache=cache,
+            )
+
+        return fields
+
+    @staticmethod
+    def _normalize_block_schedule(block_schedule: object | None, depth_bins: int) -> list[int]:
+        if block_schedule is None or block_schedule == "":
+            values = [512, 256, 128, 64, 32]
+        elif isinstance(block_schedule, int):
+            values = [int(block_schedule)]
+        elif isinstance(block_schedule, str):
+            text = block_schedule.strip().replace("->", ",")
+            parts = [part for part in re.split(r"[\s,;:]+", text) if part]
+            values = [int(part) for part in parts]
+        else:
+            values = [int(value) for value in block_schedule]  # type: ignore[arg-type]
+
+        if not values:
+            raise ValueError("block_schedule must contain at least one positive block size.")
+        depth_bins = int(depth_bins)
+        normalized = [max(1, min(int(value), depth_bins)) for value in values]
+        if any(int(value) <= 0 for value in values):
+            raise ValueError(f"block_schedule values must be positive, got {values!r}.")
+        return normalized
+
+    @torch.no_grad()
+    def _sample_block_cached(
+        self,
+        spectra: torch.Tensor,
+        *,
+        step_values: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        deterministic: bool,
+        block_schedule: object | None,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """
+        Monotonically finalize scheduled contiguous blocks with a cached prefix.
+
+        The block schedule is traversed over the denoising step axis: high-noise
+        steps use early schedule entries, low-noise steps use later entries.
+        """
+        self.eval()
+        batch_size = int(spectra.size(0))
+        device = spectra.device
+        schedule = self._normalize_block_schedule(block_schedule, self.depth_bins)
+        fields = torch.full((batch_size, self.depth_bins), int(self.mask_id), dtype=torch.long, device=device)
+        cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        cache_timesteps = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        prefix_len = 0
+
+        for step_idx, timestep in enumerate(step_values):
+            if prefix_len >= self.depth_bins:
+                break
+            phase = min(len(schedule) - 1, int(step_idx * len(schedule) / max(int(len(step_values)), 1)))
+            block_size = int(schedule[phase])
+            if step_idx == len(step_values) - 1:
+                target_prefix_len = self.depth_bins
+            else:
+                next_timestep = step_values[step_idx + 1].view(1)
+                target_remaining = int(round(float(self.noise_probability(next_timestep).item()) * float(self.depth_bins)))
+                target_remaining = max(0, min(target_remaining, self.depth_bins))
+                target_prefix_len = self.depth_bins - target_remaining
+
+            to_finalize = max(0, min(target_prefix_len, self.depth_bins) - prefix_len)
+            while to_finalize > 0:
+                chunk_len = min(block_size, to_finalize, self.depth_bins - prefix_len)
+                current = torch.full((batch_size, chunk_len), int(self.mask_id), dtype=torch.long, device=device)
+                timesteps = torch.full((batch_size,), int(timestep.item()), dtype=torch.long, device=device)
+                logits, _ = self._forward_causal_cached(
+                    spectra,
+                    current,
+                    timesteps,
+                    start_pos=prefix_len,
+                    cache=cache,
+                )
+                current, _ = self._sample_logits(
+                    logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    deterministic=deterministic,
+                    generator=generator,
+                )
+
+                fields[:, prefix_len : prefix_len + chunk_len] = current
+                _, cache = self._forward_causal_cached(
+                    spectra,
+                    current,
+                    cache_timesteps,
+                    start_pos=prefix_len,
+                    cache=cache,
+                )
+                prefix_len += chunk_len
+                to_finalize -= chunk_len
+
+        while prefix_len < self.depth_bins:
+            chunk_len = min(int(schedule[-1]), self.depth_bins - prefix_len)
+            current = torch.full((batch_size, chunk_len), int(self.mask_id), dtype=torch.long, device=device)
+            logits, _ = self._forward_causal_cached(
+                spectra,
+                current,
+                cache_timesteps,
+                start_pos=prefix_len,
+                cache=cache,
+            )
+            current, _ = self._sample_logits(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                deterministic=deterministic,
+                generator=generator,
+            )
+            fields[:, prefix_len : prefix_len + chunk_len] = current
+            _, cache = self._forward_causal_cached(
+                spectra,
+                current,
+                cache_timesteps,
+                start_pos=prefix_len,
+                cache=cache,
+            )
+            prefix_len += chunk_len
+
+        return fields
+
+    @torch.no_grad()
+    def sample(
+        self,
+        spectra: torch.Tensor,
+        *,
+        steps: int | None = None,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        deterministic: bool = False,
+        remask_strategy: str = "confidence",
+        block_schedule: object | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        remask_strategy = self._normalize_remask_strategy(remask_strategy)
+        if remask_strategy in {"monotonic_cached", "slot_cached", "block_cached"}:
+            total_steps = int(steps or self.timesteps)
+            if total_steps <= 0:
+                raise ValueError(f"steps must be positive, got {steps}")
+            step_values = torch.linspace(self.timesteps - 1, 0, total_steps, device=spectra.device).round().long()
+            if step_values[-1].item() != 0:
+                step_values = torch.cat([step_values, torch.zeros(1, device=spectra.device, dtype=torch.long)])
+            if remask_strategy == "slot_cached":
+                return self._sample_slot_cached(
+                    spectra,
+                    step_values=step_values,
+                    temperature=temperature,
+                    top_k=top_k,
+                    deterministic=deterministic,
+                    generator=generator,
+                )
+            if remask_strategy == "block_cached":
+                return self._sample_block_cached(
+                    spectra,
+                    step_values=step_values,
+                    temperature=temperature,
+                    top_k=top_k,
+                    deterministic=deterministic,
+                    block_schedule=block_schedule,
+                    generator=generator,
+                )
+            return self._sample_monotonic_cached(
+                spectra,
+                step_values=step_values,
+                temperature=temperature,
+                top_k=top_k,
+                deterministic=deterministic,
+                generator=generator,
+            )
+        return super().sample(
+            spectra,
+            steps=steps,
+            temperature=temperature,
+            top_k=top_k,
+            deterministic=deterministic,
+            remask_strategy=remask_strategy,
+            block_schedule=block_schedule,
+            generator=generator,
+        )
 
 
 def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
