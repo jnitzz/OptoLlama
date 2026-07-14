@@ -103,11 +103,15 @@ def _normalize_model_type(model_type: str | None) -> str:
         "optollama_depth_patched": "optollama_depth_windowed",
         "windowed_optollama_depth": "optollama_depth_windowed",
         "windowed_depth": "optollama_depth_windowed",
+        "optollama_depth_windowed_v2": "optollama_depth_windowed_v2",
+        "optollama_windowed_depth_v2": "optollama_depth_windowed_v2",
+        "windowed_optollama_depth_v2": "optollama_depth_windowed_v2",
+        "windowed_depth_v2": "optollama_depth_windowed_v2",
     }
     if value not in aliases:
         raise ValueError(
             f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', "
-            "'optollama_depth', or 'optollama_depth_windowed'."
+            "'optollama_depth', 'optollama_depth_windowed', or 'optollama_depth_windowed_v2'."
         )
     return aliases[value]
 
@@ -377,7 +381,7 @@ class DepthFieldModelConfig:
             raise ValueError(f"n_heads must be positive, got {self.n_heads}.")
         if float(self.ffn_multiplier) <= 0.0:
             raise ValueError(f"ffn_multiplier must be positive, got {self.ffn_multiplier}.")
-        attention_models = {"attention", "optollama_depth", "optollama_depth_windowed"}
+        attention_models = {"attention", "optollama_depth", "optollama_depth_windowed", "optollama_depth_windowed_v2"}
         if self.model_type in attention_models and int(self.d_model) % int(self.n_heads) != 0:
             raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
         if int(self.spectrum_patch_size) <= 0:
@@ -390,7 +394,8 @@ class DepthFieldModelConfig:
             raise ValueError(f"spectrum_encoder_heads must be positive, got {self.spectrum_encoder_heads}.")
         if float(self.spectrum_ffn_multiplier) <= 0.0:
             raise ValueError(f"spectrum_ffn_multiplier must be positive, got {self.spectrum_ffn_multiplier}.")
-        if self.model_type == "optollama_depth_windowed" and int(self.d_model) % int(self.spectrum_encoder_heads) != 0:
+        windowed_models = {"optollama_depth_windowed", "optollama_depth_windowed_v2"}
+        if self.model_type in windowed_models and int(self.d_model) % int(self.spectrum_encoder_heads) != 0:
             raise ValueError(
                 f"d_model={self.d_model} must be divisible by spectrum_encoder_heads={self.spectrum_encoder_heads}."
             )
@@ -831,6 +836,15 @@ class DepthFieldOptoLlamaDiffusion(DepthFieldDiffusion):
             embedded = embedded.reshape(embedded.size(0), -1, embedded.size(-1))
         return embedded + self.positional_encoding(embedded).to(dtype=embedded.dtype)
 
+    def _block_condition(self, spectrum_tokens: torch.Tensor, time_token: torch.Tensor) -> torch.Tensor:
+        """Return the AdaLN and residual-gate condition used by every depth block."""
+        del spectrum_tokens
+        return time_token.squeeze(1)
+
+    def _output_logits(self, depth_tokens: torch.Tensor) -> torch.Tensor:
+        """Project final depth states using the legacy OptoLlama output head."""
+        return self.output(depth_tokens)
+
     def forward(self, spectra: torch.Tensor, noised_fields: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Predict clean material logits with OptoLlama-style conditioning."""
         if spectra.shape[1:] != self.spectrum_shape:
@@ -845,11 +859,11 @@ class DepthFieldOptoLlamaDiffusion(DepthFieldDiffusion):
         depth_tokens = depth_tokens + self.positional_encoding(depth_tokens).to(dtype=depth_tokens.dtype)
         time_token = self.time_embedding(timesteps)
         depth_tokens = depth_tokens + time_token.to(dtype=depth_tokens.dtype)
-        cond = time_token.squeeze(1).to(dtype=depth_tokens.dtype)
+        cond = self._block_condition(spectrum_tokens, time_token).to(dtype=depth_tokens.dtype)
 
         for block in self.blocks:
             depth_tokens = block(depth_tokens, spectrum_tokens, cond)
-        return self.output(depth_tokens)
+        return self._output_logits(depth_tokens)
 
 
 class DepthFieldWindowedOptoLlamaDiffusion(DepthFieldOptoLlamaDiffusion):
@@ -891,9 +905,33 @@ class DepthFieldWindowedOptoLlamaDiffusion(DepthFieldOptoLlamaDiffusion):
         return self.spectrum_output_norm(tokens)
 
 
+class DepthFieldWindowedOptoLlamaV2Diffusion(DepthFieldWindowedOptoLlamaDiffusion):
+    """Deeper-ready windowed model with global spectral modulation and a normalized output head."""
+
+    def __init__(self, config: DepthFieldModelConfig) -> None:
+        super().__init__(config)
+        self.global_spectrum_condition = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.final_depth_norm = nn.LayerNorm(self.d_model)
+
+    def _block_condition(self, spectrum_tokens: torch.Tensor, time_token: torch.Tensor) -> torch.Tensor:
+        pooled_spectrum = spectrum_tokens.mean(dim=1)
+        spectrum_condition = self.global_spectrum_condition(pooled_spectrum)
+        return time_token.squeeze(1) + spectrum_condition
+
+    def _output_logits(self, depth_tokens: torch.Tensor) -> torch.Tensor:
+        return self.output(self.final_depth_norm(depth_tokens))
+
+
 def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
     """Build the configured depth-field diffusion model."""
     model_type = _normalize_model_type(config.model_type)
+    if model_type == "optollama_depth_windowed_v2":
+        return DepthFieldWindowedOptoLlamaV2Diffusion(config)
     if model_type == "optollama_depth_windowed":
         return DepthFieldWindowedOptoLlamaDiffusion(config)
     if model_type == "optollama_depth":
