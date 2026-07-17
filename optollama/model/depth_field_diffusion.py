@@ -3,16 +3,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-from .optollama import (
-    AdaLayerNormGaussian,
-    PositionalEncoding as OptoLlamaPositionalEncoding,
-    SpectrumEmbedding as OptoLlamaSpectrumEmbedding,
-    TimestepEmbedding as OptoLlamaTimestepEmbedding,
-)
+from .optollama import AdaLayerNormGaussian
+from .optollama import PositionalEncoding as OptoLlamaPositionalEncoding
+from .optollama import SpectrumEmbedding as OptoLlamaSpectrumEmbedding
+from .optollama import TimestepEmbedding as OptoLlamaTimestepEmbedding
 
 
 def _group_count(channels: int, max_groups: int = 8) -> int:
@@ -114,6 +113,194 @@ def _normalize_model_type(model_type: str | None) -> str:
             "'optollama_depth', 'optollama_depth_windowed', or 'optollama_depth_windowed_v2'."
         )
     return aliases[value]
+
+
+def _normalize_corruption_mode(mode: str | None) -> str:
+    value = str(mode or "iid").lower().replace("-", "_")
+    aliases = {
+        "iid": "iid",
+        "independent": "iid",
+        "bernoulli": "iid",
+        "hybrid": "hybrid",
+        "mixed": "hybrid",
+        "span": "hybrid",
+        "spans": "hybrid",
+    }
+    if value not in aliases:
+        raise ValueError(f"Unknown depth-field corruption mode={mode!r}; expected 'iid' or 'hybrid'.")
+    return aliases[value]
+
+
+@dataclass(frozen=True)
+class DepthFieldCorruptionConfig:
+    """Training corruption and random-remasking policy for depth fields."""
+
+    mode: str = "iid"
+    iid_fraction: float = 1.0
+    span_fraction: float = 0.0
+    layer_fraction: float = 0.0
+    span_min_bins: int = 4
+    span_max_bins: int = 64
+    span_scale_with_noise: bool = True
+
+    def __post_init__(self) -> None:
+        """Normalize and validate corruption policy values."""
+        object.__setattr__(self, "mode", _normalize_corruption_mode(self.mode))
+        for name in ("iid_fraction", "span_fraction", "layer_fraction"):
+            value = float(getattr(self, name))
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value}.")
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "span_min_bins", int(self.span_min_bins))
+        object.__setattr__(self, "span_max_bins", int(self.span_max_bins))
+        object.__setattr__(self, "span_scale_with_noise", bool(self.span_scale_with_noise))
+        if int(self.span_min_bins) <= 0:
+            raise ValueError(f"span_min_bins must be positive, got {self.span_min_bins}.")
+        if int(self.span_max_bins) < int(self.span_min_bins):
+            raise ValueError(
+                f"span_max_bins={self.span_max_bins} must be at least span_min_bins={self.span_min_bins}."
+            )
+        if self.mode == "hybrid" and self.fraction_sum <= 0.0:
+            raise ValueError("Hybrid corruption requires at least one positive corruption fraction.")
+
+    @property
+    def fraction_sum(self) -> float:
+        """Return the unnormalized sum of hybrid allocation fractions."""
+        return float(self.iid_fraction + self.span_fraction + self.layer_fraction)
+
+    def normalized_fractions(self) -> tuple[float, float, float]:
+        """Return i.i.d., span, and whole-layer allocation fractions."""
+        if self.mode == "iid":
+            return 1.0, 0.0, 0.0
+        total = self.fraction_sum
+        return self.iid_fraction / total, self.span_fraction / total, self.layer_fraction / total
+
+    def to_dict(self) -> dict:
+        """Return a checkpoint and JSON-friendly mapping."""
+        return {
+            "mode": self.mode,
+            "iid_fraction": float(self.iid_fraction),
+            "span_fraction": float(self.span_fraction),
+            "layer_fraction": float(self.layer_fraction),
+            "span_min_bins": int(self.span_min_bins),
+            "span_max_bins": int(self.span_max_bins),
+            "span_scale_with_noise": bool(self.span_scale_with_noise),
+        }
+
+    @staticmethod
+    def from_dict(data: dict | None) -> "DepthFieldCorruptionConfig":
+        """Build a policy from lowercase checkpoint or uppercase YAML keys."""
+        values = data if isinstance(data, dict) else {}
+
+        def get(name: str, default):
+            return values.get(name, values.get(name.upper(), default))
+
+        return DepthFieldCorruptionConfig(
+            mode=str(get("mode", "iid")),
+            iid_fraction=float(get("iid_fraction", 1.0)),
+            span_fraction=float(get("span_fraction", 0.0)),
+            layer_fraction=float(get("layer_fraction", 0.0)),
+            span_min_bins=int(get("span_min_bins", 4)),
+            span_max_bins=int(get("span_max_bins", 64)),
+            span_scale_with_noise=bool(get("span_scale_with_noise", True)),
+        )
+
+
+def depth_field_corruption_mask(
+    reference_fields: torch.Tensor,
+    noise_probability: torch.Tensor,
+    *,
+    config: DepthFieldCorruptionConfig | dict | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Select depth bins for training corruption or inference remasking."""
+    if reference_fields.dim() != 2:
+        raise ValueError(f"reference_fields must have shape [B,D], got {tuple(reference_fields.shape)}")
+    policy = config if isinstance(config, DepthFieldCorruptionConfig) else DepthFieldCorruptionConfig.from_dict(config)
+    probabilities = noise_probability.to(device=reference_fields.device, dtype=torch.float32).reshape(-1)
+    if probabilities.numel() == 1 and reference_fields.size(0) != 1:
+        probabilities = probabilities.expand(reference_fields.size(0))
+    if probabilities.numel() != reference_fields.size(0):
+        raise ValueError(
+            f"noise_probability must have one value per batch row, got {probabilities.numel()} for {reference_fields.size(0)} rows"
+        )
+    probabilities = probabilities.clamp(0.0, 1.0)
+    if policy.mode == "iid":
+        return torch.rand(reference_fields.shape, device=reference_fields.device, generator=generator) < probabilities.unsqueeze(1)
+
+    batch_size, depth_bins = reference_fields.shape
+    _, span_fraction, layer_fraction = policy.normalized_fractions()
+    seed = int(
+        torch.randint(
+            0,
+            torch.iinfo(torch.int64).max,
+            (1,),
+            device=reference_fields.device,
+            generator=generator,
+            dtype=torch.int64,
+        ).item()
+    )
+    rng = np.random.default_rng(seed)
+    reference_cpu = reference_fields.detach().to(device="cpu").numpy()
+    probabilities_cpu = probabilities.detach().to(device="cpu").numpy()
+    selected = np.zeros((batch_size, depth_bins), dtype=np.bool_)
+
+    for batch_idx in range(batch_size):
+        probability = float(probabilities_cpu[batch_idx])
+        budget = max(0, min(depth_bins, int(round(probability * depth_bins))))
+        if budget <= 0:
+            continue
+        row_mask = selected[batch_idx]
+        row = reference_cpu[batch_idx]
+        layer_target = min(budget, int(round(budget * layer_fraction)))
+        span_target = min(budget - layer_target, int(round(budget * span_fraction)))
+
+        layer_added = 0
+        if layer_target > 0:
+            boundaries = np.flatnonzero(row[1:] != row[:-1]) + 1
+            starts = np.concatenate(([0], boundaries))
+            ends = np.concatenate((boundaries, [depth_bins]))
+            order = rng.permutation(starts.size)
+            for run_idx in order:
+                start = int(starts[run_idx])
+                end = int(ends[run_idx])
+                indices = np.arange(start, end)
+                available = indices[~row_mask[indices]]
+                remaining = layer_target - layer_added
+                if available.size == 0 or available.size > remaining:
+                    continue
+                row_mask[available] = True
+                layer_added += int(available.size)
+                if layer_added >= layer_target:
+                    break
+
+        span_target += layer_target - layer_added
+        span_added = 0
+        if span_target > 0:
+            span_min = min(int(policy.span_min_bins), depth_bins)
+            span_max = min(int(policy.span_max_bins), depth_bins)
+            if policy.span_scale_with_noise:
+                span_max = span_min + int(round((span_max - span_min) * math.sqrt(probability)))
+            span_max = max(span_min, span_max)
+            attempts = 0
+            while span_added < span_target and attempts < depth_bins * 4:
+                attempts += 1
+                span_length = int(rng.integers(span_min, span_max + 1))
+                start = int(rng.integers(0, depth_bins - span_length + 1))
+                indices = np.arange(start, start + span_length)
+                available = indices[~row_mask[indices]]
+                if available.size == 0:
+                    continue
+                take = min(int(available.size), span_target - span_added)
+                row_mask[available[:take]] = True
+                span_added += take
+
+        remaining = budget - int(row_mask.sum())
+        if remaining > 0:
+            available = np.flatnonzero(~row_mask)
+            row_mask[rng.choice(available, size=remaining, replace=False)] = True
+
+    return torch.from_numpy(selected).to(device=reference_fields.device)
 
 
 def _make_depth_conv(channels: int, *, kernel_size: int, padding: int, dilation: int, conv_type: str) -> nn.Module:
@@ -516,6 +703,7 @@ class DepthFieldDiffusion(nn.Module):
         timesteps: torch.Tensor,
         *,
         random_replace_prob: float = 0.10,
+        corruption_config: DepthFieldCorruptionConfig | dict | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Corrupt clean material fields with mask and random replacement noise."""
@@ -525,12 +713,17 @@ class DepthFieldDiffusion(nn.Module):
             raise ValueError(f"Expected {self.depth_bins} depth bins, got {clean_fields.size(1)}")
 
         clean_fields = clean_fields.long().clamp(0, self.num_materials - 1)
-        noise_prob = self.noise_probability(timesteps).to(device=clean_fields.device).unsqueeze(1)
+        noise_prob = self.noise_probability(timesteps).to(device=clean_fields.device)
         replace_fraction = float(max(0.0, min(1.0, random_replace_prob)))
-        replace_prob = noise_prob * replace_fraction
-        uniform = torch.rand(clean_fields.shape, device=clean_fields.device, generator=generator)
-        replace_mask = uniform < replace_prob
-        mask_mask = (uniform >= replace_prob) & (uniform < noise_prob)
+        corrupted = depth_field_corruption_mask(
+            clean_fields,
+            noise_prob,
+            config=corruption_config,
+            generator=generator,
+        )
+        replace_draw = torch.rand(clean_fields.shape, device=clean_fields.device, generator=generator)
+        replace_mask = corrupted & (replace_draw < replace_fraction)
+        mask_mask = corrupted & ~replace_mask
 
         random_labels = torch.randint(
             low=0,
@@ -542,7 +735,7 @@ class DepthFieldDiffusion(nn.Module):
         noised = clean_fields.clone()
         noised[replace_mask] = random_labels[replace_mask]
         noised[mask_mask] = int(self.mask_id)
-        return noised, replace_mask | mask_mask
+        return noised, corrupted
 
     def forward(self, spectra: torch.Tensor, noised_fields: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Predict clean material logits for every depth bin."""
@@ -570,6 +763,7 @@ class DepthFieldDiffusion(nn.Module):
         void_id: int,
         void_loss_weight: float = 0.25,
         random_replace_prob: float = 0.10,
+        corruption_config: DepthFieldCorruptionConfig | dict | None = None,
         loss_on_corrupted_only: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Return a denoising CE loss dictionary."""
@@ -579,6 +773,7 @@ class DepthFieldDiffusion(nn.Module):
             clean_fields,
             timesteps,
             random_replace_prob=random_replace_prob,
+            corruption_config=corruption_config,
         )
         logits = self(spectra, noised_fields, timesteps)
 
@@ -659,6 +854,7 @@ class DepthFieldDiffusion(nn.Module):
         top_k: int = 0,
         deterministic: bool = False,
         remask_strategy: str = "confidence",
+        corruption_config: DepthFieldCorruptionConfig | dict | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """
@@ -703,7 +899,12 @@ class DepthFieldDiffusion(nn.Module):
             fields = pred
             if mask_count > 0:
                 if remask_strategy == "random":
-                    remask = torch.rand(pred.shape, device=device, generator=generator) < mask_fraction
+                    remask = depth_field_corruption_mask(
+                        pred,
+                        torch.full((batch_size,), mask_fraction, device=device),
+                        config=corruption_config,
+                        generator=generator,
+                    )
                     fields = torch.where(remask, torch.full_like(fields, int(self.mask_id)), fields)
                 else:
                     mask_count = min(mask_count, self.depth_bins)

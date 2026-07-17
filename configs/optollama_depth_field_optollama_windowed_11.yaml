@@ -46,6 +46,14 @@ DEPTH_FIELD:
   DZ_NM: 5
   MAX_THICKNESS_NM: 10000
   OUTPUT_SEQ_LEN: 2000
+  CORRUPTION:
+    MODE: hybrid
+    IID_FRACTION: 0.20
+    SPAN_FRACTION: 0.60
+    LAYER_FRACTION: 0.20
+    SPAN_MIN_BINS: 4 # 20 nm at DZ_NM=5
+    SPAN_MAX_BINS: 64 # 320 nm at DZ_NM=5
+    SPAN_SCALE_WITH_NOISE: true
   MODEL:
     TYPE: optollama_depth_windowed_v2
     D_MODEL: 896

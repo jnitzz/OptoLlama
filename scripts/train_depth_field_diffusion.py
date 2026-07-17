@@ -143,6 +143,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Fraction of corrupted bins that are random material replacements rather than masks.",
     )
+    parser.add_argument("--corruption-mode", choices=["iid", "hybrid"], default=None, help="Depth-bin corruption layout.")
+    parser.add_argument("--corruption-iid-fraction", type=float, default=None, help="Hybrid budget fraction for independent bins.")
+    parser.add_argument("--corruption-span-fraction", type=float, default=None, help="Hybrid budget fraction for contiguous spans.")
+    parser.add_argument("--corruption-layer-fraction", type=float, default=None, help="Hybrid budget fraction for complete material runs.")
+    parser.add_argument("--corruption-span-min-bins", type=int, default=None, help="Minimum contiguous corruption span in depth bins.")
+    parser.add_argument("--corruption-span-max-bins", type=int, default=None, help="Maximum contiguous corruption span in depth bins.")
+    parser.add_argument(
+        "--corruption-span-scale-with-noise",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Increase the allowed corruption span length with the timestep noise level.",
+    )
     parser.add_argument(
         "--loss-on-corrupted-only",
         action=argparse.BooleanOptionalAction,
@@ -400,6 +412,18 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         nested_required(block, "TRAIN", "RANDOM_REPLACE_PROB"),
         "DEPTH_FIELD.TRAIN.RANDOM_REPLACE_PROB",
     )
+    corruption = nested_get(block, "CORRUPTION", default={}) or {}
+    set_arg_default(args, "corruption_mode", nested_get(corruption, "MODE", default="iid"))
+    set_arg_default(args, "corruption_iid_fraction", nested_get(corruption, "IID_FRACTION", default=1.0))
+    set_arg_default(args, "corruption_span_fraction", nested_get(corruption, "SPAN_FRACTION", default=0.0))
+    set_arg_default(args, "corruption_layer_fraction", nested_get(corruption, "LAYER_FRACTION", default=0.0))
+    set_arg_default(args, "corruption_span_min_bins", nested_get(corruption, "SPAN_MIN_BINS", default=4))
+    set_arg_default(args, "corruption_span_max_bins", nested_get(corruption, "SPAN_MAX_BINS", default=64))
+    set_arg_default(
+        args,
+        "corruption_span_scale_with_noise",
+        nested_get(corruption, "SPAN_SCALE_WITH_NOISE", default=True),
+    )
     set_arg_config_required(
         args,
         "loss_on_corrupted_only",
@@ -467,6 +491,19 @@ def timestep_schedule_config(cfg: dict[str, Any]) -> dict[str, Any]:
     train_cfg = nested_get(block, "TRAIN", default={}) or {}
     schedule = train_cfg.get("TIMESTEP_SCHEDULE") if isinstance(train_cfg, dict) else None
     return schedule if isinstance(schedule, dict) else {}
+
+
+def corruption_config_from_args(args: argparse.Namespace) -> optollama.model.DepthFieldCorruptionConfig:
+    """Build the shared training and random-remasking policy."""
+    return optollama.model.DepthFieldCorruptionConfig(
+        mode=str(args.corruption_mode),
+        iid_fraction=float(args.corruption_iid_fraction),
+        span_fraction=float(args.corruption_span_fraction),
+        layer_fraction=float(args.corruption_layer_fraction),
+        span_min_bins=int(args.corruption_span_min_bins),
+        span_max_bins=int(args.corruption_span_max_bins),
+        span_scale_with_noise=bool(args.corruption_span_scale_with_noise),
+    )
 
 
 def ema_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -682,6 +719,7 @@ def depth_field_training_loss(
     void_id: int,
     void_loss_weight: float = 0.25,
     random_replace_prob: float = 0.10,
+    corruption_config: optollama.model.DepthFieldCorruptionConfig | dict | None = None,
     loss_on_corrupted_only: bool = False,
     timestep_schedule: dict[str, Any] | None = None,
     global_samples_seen: int = 0,
@@ -699,6 +737,7 @@ def depth_field_training_loss(
         clean_fields,
         timesteps,
         random_replace_prob=random_replace_prob,
+        corruption_config=corruption_config,
     )
     logits = model(spectra, noised_fields, timesteps)
 
@@ -1063,6 +1102,7 @@ def run_tmm_evaluation(
             top_k=int(args.eval_top_k),
             deterministic=bool(args.eval_deterministic or args.eval_temperature <= 0.0),
             remask_strategy=str(args.eval_remask_strategy),
+            corruption_config=args.corruption_config,
         )
         fields_cpu = fields.detach().cpu()
         pred_spectra = simulate_field_runs(
@@ -1194,6 +1234,7 @@ def run_tmm_evaluation(
         "mc_samples": int(mc_samples),
         "sampling_steps": int(args.eval_sampling_steps or sample_model.timesteps),
         "remask_strategy": str(args.eval_remask_strategy),
+        "corruption": args.corruption_config.to_dict(),
         "tmm_batch_size": int(args.eval_tmm_batch_size),
     }
     if save_samples:
@@ -1212,6 +1253,7 @@ def run_tmm_evaluation(
                     "score_mode": "field",
                     "rank_by": "field",
                     "remask_strategy": str(args.eval_remask_strategy),
+                    "corruption": args.corruption_config.to_dict(),
                     "record_spectra": bool(args.eval_record_spectra),
                     "record_all_mc": bool(args.eval_record_all_mc),
                     "depth_field": {
@@ -1357,6 +1399,7 @@ def run_epoch(
                     void_id=vocab.void_id,
                     void_loss_weight=args.void_loss_weight,
                     random_replace_prob=args.random_replace_prob,
+                    corruption_config=args.corruption_config,
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
                     timestep_schedule=timestep_schedule,
                     global_samples_seen=global_samples_before,
@@ -1381,6 +1424,7 @@ def run_epoch(
                     void_id=vocab.void_id,
                     void_loss_weight=args.void_loss_weight,
                     random_replace_prob=args.random_replace_prob,
+                    corruption_config=args.corruption_config,
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
                 )
             loss = out["loss"]
@@ -1478,6 +1522,7 @@ def make_checkpoint_extra(
             "eval_top_k": int(args.eval_top_k),
             "eval_deterministic": bool(args.eval_deterministic),
             "eval_remask_strategy": str(args.eval_remask_strategy),
+            "corruption": args.corruption_config.to_dict(),
             "eval_tmm_batch_size": int(args.eval_tmm_batch_size),
             "save_eval_samples": bool(args.save_eval_samples),
             "eval_samples_dir": args.eval_samples_dir,
@@ -1534,6 +1579,7 @@ def main() -> None:
     cfg = optollama.utils.load_config(args)
     apply_depth_field_defaults(cfg, args)
     apply_loader_overrides(cfg, args)
+    args.corruption_config = corruption_config_from_args(args)
 
     if args.seed is not None:
         cfg["SEED"] = int(args.seed)
@@ -1791,6 +1837,7 @@ def main() -> None:
             f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
             f"ddp={ddp}, world={world_size}, {model_desc}, "
+            f"corruption={args.corruption_config.mode}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
             f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
         )

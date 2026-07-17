@@ -57,6 +57,18 @@ def parse_args() -> argparse.Namespace:
         choices=["confidence", "random"],
         help="Denoising remask strategy: confidence reopens least-confident bins, random uses Bernoulli remasking.",
     )
+    parser.add_argument("--corruption-mode", choices=["iid", "hybrid"], default=None, help="Random-remasking layout.")
+    parser.add_argument("--corruption-iid-fraction", type=float, default=None, help="Hybrid budget fraction for independent bins.")
+    parser.add_argument("--corruption-span-fraction", type=float, default=None, help="Hybrid budget fraction for contiguous spans.")
+    parser.add_argument("--corruption-layer-fraction", type=float, default=None, help="Hybrid budget fraction for complete predicted runs.")
+    parser.add_argument("--corruption-span-min-bins", type=int, default=None, help="Minimum contiguous remasking span in depth bins.")
+    parser.add_argument("--corruption-span-max-bins", type=int, default=None, help="Maximum contiguous remasking span in depth bins.")
+    parser.add_argument(
+        "--corruption-span-scale-with-noise",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Increase the allowed remasking span length with the timestep noise level.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed. Required unless config SEED is set.")
 
     parser.add_argument("--tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM chunk.")
@@ -174,12 +186,38 @@ def apply_depth_field_eval_defaults(cfg: dict[str, Any], args: argparse.Namespac
     set_arg_config_required(args, "top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
     set_arg_config_required(args, "deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
     set_arg_config_required(args, "remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
+    corruption = nested_get(block, "CORRUPTION", default={}) or {}
+    corruption_defaults = {
+        "corruption_mode": nested_get(corruption, "MODE", default="iid"),
+        "corruption_iid_fraction": nested_get(corruption, "IID_FRACTION", default=1.0),
+        "corruption_span_fraction": nested_get(corruption, "SPAN_FRACTION", default=0.0),
+        "corruption_layer_fraction": nested_get(corruption, "LAYER_FRACTION", default=0.0),
+        "corruption_span_min_bins": nested_get(corruption, "SPAN_MIN_BINS", default=4),
+        "corruption_span_max_bins": nested_get(corruption, "SPAN_MAX_BINS", default=64),
+        "corruption_span_scale_with_noise": nested_get(corruption, "SPAN_SCALE_WITH_NOISE", default=True),
+    }
+    for name, value in corruption_defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
     set_arg_config_required(args, "tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
     set_arg_config_required(args, "tmm_batch_size", nested_required(block, "EVAL", "TMM_BATCH_SIZE"), "DEPTH_FIELD.EVAL.TMM_BATCH_SIZE")
     set_arg_config_required(args, "score_mode", nested_required(block, "EVAL", "SCORE_MODE"), "DEPTH_FIELD.EVAL.SCORE_MODE")
     set_arg_config_required(args, "rank_by", nested_required(block, "EVAL", "RANK_BY"), "DEPTH_FIELD.EVAL.RANK_BY")
     set_arg_config_required(args, "record_spectra", nested_required(block, "EVAL", "RECORD_SPECTRA"), "DEPTH_FIELD.EVAL.RECORD_SPECTRA")
     set_arg_config_required(args, "record_all_mc", nested_required(block, "EVAL", "RECORD_ALL_MC"), "DEPTH_FIELD.EVAL.RECORD_ALL_MC")
+
+
+def corruption_config_from_args(args: argparse.Namespace) -> optollama.model.DepthFieldCorruptionConfig:
+    """Build the random-remasking policy shared with training."""
+    return optollama.model.DepthFieldCorruptionConfig(
+        mode=str(args.corruption_mode),
+        iid_fraction=float(args.corruption_iid_fraction),
+        span_fraction=float(args.corruption_span_fraction),
+        layer_fraction=float(args.corruption_layer_fraction),
+        span_min_bins=int(args.corruption_span_min_bins),
+        span_max_bins=int(args.corruption_span_max_bins),
+        span_scale_with_noise=bool(args.corruption_span_scale_with_noise),
+    )
 
 
 def resolve_plot_bundle_path(cfg: dict[str, Any], args: argparse.Namespace) -> str | None:
@@ -589,7 +627,7 @@ def run_depth_field_inference(
         f"{'target=' + target if target is not None else 'split=' + args.split}, "
         f"mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
         f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
-        f"remask={args.remask_strategy}, mc_batch={mc_batch_size}, "
+        f"remask={args.remask_strategy}, corruption={args.corruption_config.mode}, mc_batch={mc_batch_size}, "
         f"model_device={device}, tmm_device={tmm_device}"
     )
 
@@ -626,6 +664,7 @@ def run_depth_field_inference(
                 top_k=int(args.top_k),
                 deterministic=bool(args.deterministic or args.temperature <= 0.0),
                 remask_strategy=str(args.remask_strategy),
+                corruption_config=args.corruption_config,
             )
             fields_cpu_chunk = fields.detach().cpu()
             token_ids_cpu_chunk = optollama.data.decode_depth_field_to_tokens(
@@ -779,6 +818,7 @@ def run_depth_field_inference(
         "score_mode": score_mode,
         "rank_by": rank_by,
         "remask_strategy": str(args.remask_strategy),
+        "corruption": args.corruption_config.to_dict(),
         "mae_mean": float(torch.tensor(mae_all).mean().item()) if mae_all else None,
         "mae_median": float(torch.tensor(mae_all).median().item()) if mae_all else None,
         "mae_min": float(min(mae_all)) if mae_all else None,
@@ -833,6 +873,7 @@ def main() -> None:
     args = parse_args()
     cfg = optollama.utils.load_config(args)
     apply_depth_field_eval_defaults(cfg, args)
+    args.corruption_config = corruption_config_from_args(args)
     sample_stamp = optollama.utils.make_run_stamp()
     seed = int(args.seed if args.seed is not None else cfg_required(cfg, "SEED", "--seed"))
     torch.manual_seed(seed)
