@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -817,17 +818,38 @@ class DepthFieldDiffusion(nn.Module):
         top_k: int,
         deterministic: bool,
         generator: torch.Generator | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if deterministic or temperature <= 0.0:
-            probs = torch.softmax(logits, dim=-1)
-            return logits.argmax(dim=-1), probs.max(dim=-1).values
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        temperature_value = float(temperature)
+        if not math.isfinite(temperature_value):
+            raise ValueError(f"temperature must be finite, got {temperature}.")
 
-        scaled = logits / max(float(temperature), 1.0e-6)
+        sampling_logits = logits.float()
+        invalid_rows = ~torch.isfinite(sampling_logits).all(dim=-1)
+        sampling_logits = torch.nan_to_num(
+            sampling_logits,
+            nan=0.0,
+            posinf=1.0e4,
+            neginf=-1.0e4,
+        )
+
+        if deterministic or temperature <= 0.0:
+            probs = torch.softmax(sampling_logits, dim=-1)
+            return sampling_logits.argmax(dim=-1), probs.max(dim=-1).values, invalid_rows.sum()
+
+        scaled = sampling_logits / max(temperature_value, 1.0e-6)
         scaled = self._filter_top_k(scaled, top_k)
         probs = torch.softmax(scaled, dim=-1)
+        invalid_rows |= ~torch.isfinite(probs).all(dim=-1) | (probs < 0.0).any(dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        totals = probs.sum(dim=-1, keepdim=True)
+        valid_totals = torch.isfinite(totals) & (totals > 0.0)
+        invalid_rows |= ~valid_totals.squeeze(-1)
+        normalized = probs / totals.clamp_min(torch.finfo(probs.dtype).tiny)
+        uniform = torch.full_like(probs, 1.0 / float(probs.size(-1)))
+        probs = torch.where(valid_totals, normalized, uniform)
         flat = probs.view(-1, probs.size(-1))
         sampled = torch.multinomial(flat, num_samples=1, generator=generator).view(logits.shape[:2])
-        return sampled, probs.max(dim=-1).values
+        return sampled, probs.max(dim=-1).values, invalid_rows.sum()
 
     @staticmethod
     def _normalize_remask_strategy(remask_strategy: str) -> str:
@@ -878,15 +900,26 @@ class DepthFieldDiffusion(nn.Module):
         if step_values[-1].item() != 0:
             step_values = torch.cat([step_values, torch.zeros(1, device=device, dtype=torch.long)])
 
+        repaired_rows = torch.zeros((), dtype=torch.long, device=device)
+        first_repaired_step = torch.full((), len(step_values), dtype=torch.long, device=device)
         for step_idx, timestep in enumerate(step_values):
             timesteps = torch.full((batch_size,), int(timestep.item()), dtype=torch.long, device=device)
             logits = self(spectra, fields, timesteps)
-            pred, confidence = self._sample_logits(
+            pred, confidence, repaired = self._sample_logits(
                 logits,
                 temperature=temperature,
                 top_k=top_k,
                 deterministic=deterministic,
                 generator=generator,
+            )
+            repaired_rows += repaired
+            first_repaired_step = torch.minimum(
+                first_repaired_step,
+                torch.where(
+                    repaired > 0,
+                    torch.as_tensor(step_idx, device=device),
+                    torch.as_tensor(len(step_values), device=device),
+                ),
             )
 
             if step_idx == len(step_values) - 1:
@@ -910,6 +943,20 @@ class DepthFieldDiffusion(nn.Module):
                     mask_count = min(mask_count, self.depth_bins)
                     low_confidence = torch.topk(confidence, k=mask_count, dim=1, largest=False).indices
                     fields.scatter_(1, low_confidence, int(self.mask_id))
+
+        repaired_count = int(repaired_rows.item())
+        if repaired_count > 0 and not getattr(self, "_sampling_nonfinite_warning_emitted", False):
+            first_step = int(first_repaired_step.item())
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            warnings.warn(
+                f"Rank {rank} repaired {repaired_count} depth positions with non-finite sampling logits "
+                f"(first denoising step {first_step}). Non-finite values were sanitized, and rows without "
+                "valid probability mass used a uniform fallback. "
+                "Inspect the checkpoint, input spectra, and training stability if this warning recurs.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._sampling_nonfinite_warning_emitted = True
 
         return fields
 
