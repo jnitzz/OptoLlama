@@ -4,7 +4,7 @@ EXPERIMENT:
   SEED: 3
 
 PATHS:
-  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data
+  DATA_PATH: E:/repos/OptoLlama/data # /scratch/htc/jschaibl/repos/OptoLlama/data
   MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
   TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
   OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
@@ -25,7 +25,7 @@ DATA_LOADING:
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
   NUM_SAMPLES_TEST: 512
-  TRAIN_BATCH_SIZE: 32
+  TRAIN_BATCH_SIZE: 64
   TEST_BATCH_SIZE: 8
 
 SPECTRAL_GRID:
@@ -47,7 +47,7 @@ DEPTH_FIELD:
   MAX_THICKNESS_NM: 10000
   OUTPUT_SEQ_LEN: 2000
   CORRUPTION:
-    MODE: hybrid
+    MODE: iid #hybrid
     IID_FRACTION: 0.20
     SPAN_FRACTION: 0.60
     LAYER_FRACTION: 0.20
@@ -83,7 +83,7 @@ DEPTH_FIELD:
       TYPE: cosine
       WARMUP_SAMPLES: 500000
       TOTAL_SAMPLES: 2000000000
-      START_LR: 0.00001
+      START_LR: 0.0002
       MAX_LR: ${OPTIMIZATION.LEARNING_RATE}
       MIN_LR: 0.00001
     TIMESTEP_SCHEDULE:
@@ -92,7 +92,7 @@ DEPTH_FIELD:
       WARMUP_SAMPLES: 2000000
       HIGH_NOISE_MIN_FRACTION: 0.6
     EMA:
-      ENABLED: true
+      ENABLED: false
       DECAY: 0.9999
       DEVICE: model
       VALIDATE: true
@@ -111,7 +111,7 @@ DEPTH_FIELD:
     SAVE_SAMPLES: true
     SAMPLES_DIR: ${DEPTH_FIELD.OUT_DIR}/validation_samples
     RECORD_SPECTRA: true
-    RECORD_ALL_MC: false
+    RECORD_ALL_MC: true
 
 OPTIMIZATION:
   LEARNING_RATE: 0.0001
@@ -134,9 +134,9 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  TARGET: null
+  # TARGET: null
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
-  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
   TARGETS: []
   TARGET_GLOB: null # ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
   N_TARGETS: 1
@@ -185,17 +185,17 @@ REALISTIC_TMM:
 
 SPECTRUM_LATENT:
   ENABLED: false
-  CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+  CHECKPOINT: ${PATHS.DATA_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
   MODE: token
   FREEZE_ENCODER: true
 
 TARGET_PHYSICALIZE:
-  ENABLED: false
+  ENABLED: true
   SELECTION_TARGET: original
   # Applies to repeated target spectra from N_TARGETS/--target-samples.
   # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.
   RANDOM:
-    ENABLED: false
+    ENABLED: true
     MODE: gaussian
     SEED: ${EXPERIMENT.SEED}
     SKIP_INDEX_0: true
@@ -220,7 +220,7 @@ TARGET_PHYSICALIZE:
     ABS_SCALE: 1.0
   AE_PROJECT:
     ENABLED: true
-    CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+    CHECKPOINT: ${PATHS.DATA_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
     DEVICE: null
     MODE: all
     BLEND: 1.0
