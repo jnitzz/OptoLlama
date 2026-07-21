@@ -8,6 +8,7 @@ from optollama.model.depth_field_diffusion import (
     DepthFieldDiffusion,
     DepthFieldModelConfig,
     depth_field_corruption_mask,
+    scheduled_random_replace_probability,
 )
 
 
@@ -33,6 +34,8 @@ class DepthFieldCorruptionTests(unittest.TestCase):
                 "SPAN_MIN_BINS": 4,
                 "SPAN_MAX_BINS": 8,
                 "SPAN_SCALE_WITH_NOISE": True,
+                "RANDOM_REPLACE_SCHEDULE": "noise-complement",
+                "RANDOM_REPLACE_POWER": 2.0,
             }
         )
         fields = torch.arange(40).repeat(2, 1)
@@ -43,6 +46,50 @@ class DepthFieldCorruptionTests(unittest.TestCase):
             generator=torch.Generator().manual_seed(11),
         )
         self.assertEqual(mask.sum(dim=1).tolist(), [10, 20])
+        self.assertEqual(policy.random_replace_schedule, "noise_complement")
+        self.assertEqual(policy.random_replace_power, 2.0)
+
+    def test_noise_complement_replacement_probability(self) -> None:
+        policy = DepthFieldCorruptionConfig(
+            random_replace_schedule="noise_complement",
+            random_replace_power=1.0,
+        )
+        probability = scheduled_random_replace_probability(
+            torch.tensor([0.0, 0.25, 0.5, 1.0]),
+            0.2,
+            config=policy,
+        )
+        torch.testing.assert_close(probability, torch.tensor([0.2, 0.15, 0.1, 0.0]))
+
+    def test_noise_complement_is_all_mask_at_maximum_noise(self) -> None:
+        model = DepthFieldDiffusion(
+            DepthFieldModelConfig(
+                spectrum_shape=(3, 8),
+                num_materials=4,
+                depth_bins=40,
+                d_model=8,
+                n_blocks=1,
+                timesteps=10,
+                kernel_size=3,
+            )
+        )
+        clean = torch.arange(40).remainder(4).view(1, -1)
+        policy = DepthFieldCorruptionConfig(
+            mode="hybrid",
+            iid_fraction=0.2,
+            span_fraction=0.6,
+            layer_fraction=0.2,
+            random_replace_schedule="noise_complement",
+        )
+        noised, corrupted = model.corrupt(
+            clean,
+            torch.tensor([model.timesteps - 1]),
+            random_replace_prob=1.0,
+            corruption_config=policy,
+            generator=torch.Generator().manual_seed(17),
+        )
+        self.assertTrue(torch.all(corrupted))
+        self.assertTrue(torch.all(noised == model.mask_id))
 
     def test_hybrid_mask_is_reproducible(self) -> None:
         fields = torch.arange(40).repeat(2, 1)

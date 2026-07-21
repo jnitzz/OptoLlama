@@ -56,6 +56,10 @@ DEPTH_FIELD:
     SPAN_MIN_BINS: 4 # 20 nm at DZ_NM=5
     SPAN_MAX_BINS: 64 # 320 nm at DZ_NM=5
     SPAN_SCALE_WITH_NOISE: true
+    # q(t) = RANDOM_REPLACE_PROB * (1 - noise_probability(t))^POWER.
+    # This gives an all-MASK input at maximum noise and peaks replacements at intermediate noise.
+    RANDOM_REPLACE_SCHEDULE: noise_complement
+    RANDOM_REPLACE_POWER: 1.0
   MODEL:
     TYPE: optollama_depth_windowed_v3
     D_MODEL: 896

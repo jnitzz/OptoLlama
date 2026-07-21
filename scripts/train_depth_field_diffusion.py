@@ -161,7 +161,19 @@ def parse_args() -> argparse.Namespace:
         "--random-replace-prob",
         type=float,
         default=None,
-        help="Fraction of corrupted bins that are random material replacements rather than masks.",
+        help="Maximum fraction of corrupted bins that are random material replacements rather than masks.",
+    )
+    parser.add_argument(
+        "--random-replace-schedule",
+        choices=["constant", "noise_complement", "noise-complement"],
+        default=None,
+        help="Schedule the replacement fraction by diffusion noise probability.",
+    )
+    parser.add_argument(
+        "--random-replace-power",
+        type=float,
+        default=None,
+        help="Exponent applied by the noise-complement replacement schedule.",
     )
     parser.add_argument("--corruption-mode", choices=["iid", "hybrid"], default=None, help="Depth-bin corruption layout.")
     parser.add_argument("--corruption-iid-fraction", type=float, default=None, help="Hybrid budget fraction for independent bins.")
@@ -471,6 +483,16 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         "corruption_span_scale_with_noise",
         nested_get(corruption, "SPAN_SCALE_WITH_NOISE", default=True),
     )
+    set_arg_default(
+        args,
+        "random_replace_schedule",
+        nested_get(corruption, "RANDOM_REPLACE_SCHEDULE", default="constant"),
+    )
+    set_arg_default(
+        args,
+        "random_replace_power",
+        nested_get(corruption, "RANDOM_REPLACE_POWER", default=1.0),
+    )
     set_arg_config_required(
         args,
         "loss_on_corrupted_only",
@@ -576,6 +598,8 @@ def corruption_config_from_args(args: argparse.Namespace) -> optollama.model.Dep
         span_min_bins=int(args.corruption_span_min_bins),
         span_max_bins=int(args.corruption_span_max_bins),
         span_scale_with_noise=bool(args.corruption_span_scale_with_noise),
+        random_replace_schedule=str(args.random_replace_schedule),
+        random_replace_power=float(args.random_replace_power),
     )
 
 
@@ -2194,6 +2218,7 @@ def main() -> None:
             f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, amp_dtype={amp_dtype}, "
             f"ddp={ddp}, world={world_size}, {model_desc}, "
             f"corruption={args.corruption_config.mode}, "
+            f"random_replace={args.random_replace_prob:g}/{args.corruption_config.random_replace_schedule}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
             f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
         )

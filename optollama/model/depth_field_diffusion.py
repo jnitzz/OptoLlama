@@ -137,6 +137,23 @@ def _normalize_corruption_mode(mode: str | None) -> str:
     return aliases[value]
 
 
+def _normalize_random_replace_schedule(schedule: str | None) -> str:
+    value = str(schedule or "constant").lower().replace("-", "_")
+    aliases = {
+        "constant": "constant",
+        "flat": "constant",
+        "none": "constant",
+        "noise_complement": "noise_complement",
+        "complement": "noise_complement",
+        "inverse_noise": "noise_complement",
+    }
+    if value not in aliases:
+        raise ValueError(
+            f"Unknown random replacement schedule={schedule!r}; expected 'constant' or 'noise_complement'."
+        )
+    return aliases[value]
+
+
 @dataclass(frozen=True)
 class DepthFieldCorruptionConfig:
     """Training corruption and random-remasking policy for depth fields."""
@@ -148,6 +165,8 @@ class DepthFieldCorruptionConfig:
     span_min_bins: int = 4
     span_max_bins: int = 64
     span_scale_with_noise: bool = True
+    random_replace_schedule: str = "constant"
+    random_replace_power: float = 1.0
 
     def __post_init__(self) -> None:
         """Normalize and validate corruption policy values."""
@@ -160,12 +179,20 @@ class DepthFieldCorruptionConfig:
         object.__setattr__(self, "span_min_bins", int(self.span_min_bins))
         object.__setattr__(self, "span_max_bins", int(self.span_max_bins))
         object.__setattr__(self, "span_scale_with_noise", bool(self.span_scale_with_noise))
+        object.__setattr__(
+            self,
+            "random_replace_schedule",
+            _normalize_random_replace_schedule(self.random_replace_schedule),
+        )
+        object.__setattr__(self, "random_replace_power", float(self.random_replace_power))
         if int(self.span_min_bins) <= 0:
             raise ValueError(f"span_min_bins must be positive, got {self.span_min_bins}.")
         if int(self.span_max_bins) < int(self.span_min_bins):
             raise ValueError(
                 f"span_max_bins={self.span_max_bins} must be at least span_min_bins={self.span_min_bins}."
             )
+        if float(self.random_replace_power) <= 0.0:
+            raise ValueError(f"random_replace_power must be positive, got {self.random_replace_power}.")
         if self.mode == "hybrid" and self.fraction_sum <= 0.0:
             raise ValueError("Hybrid corruption requires at least one positive corruption fraction.")
 
@@ -191,6 +218,8 @@ class DepthFieldCorruptionConfig:
             "span_min_bins": int(self.span_min_bins),
             "span_max_bins": int(self.span_max_bins),
             "span_scale_with_noise": bool(self.span_scale_with_noise),
+            "random_replace_schedule": self.random_replace_schedule,
+            "random_replace_power": float(self.random_replace_power),
         }
 
     @staticmethod
@@ -209,7 +238,24 @@ class DepthFieldCorruptionConfig:
             span_min_bins=int(get("span_min_bins", 4)),
             span_max_bins=int(get("span_max_bins", 64)),
             span_scale_with_noise=bool(get("span_scale_with_noise", True)),
+            random_replace_schedule=str(get("random_replace_schedule", "constant")),
+            random_replace_power=float(get("random_replace_power", 1.0)),
         )
+
+
+def scheduled_random_replace_probability(
+    noise_probability: torch.Tensor,
+    base_probability: float,
+    *,
+    config: DepthFieldCorruptionConfig | dict | None = None,
+) -> torch.Tensor:
+    """Return the per-row replacement fraction among selected corruption bins."""
+    policy = config if isinstance(config, DepthFieldCorruptionConfig) else DepthFieldCorruptionConfig.from_dict(config)
+    probability = noise_probability.to(dtype=torch.float32).clamp(0.0, 1.0)
+    base = max(0.0, min(1.0, float(base_probability)))
+    if policy.random_replace_schedule == "constant":
+        return torch.full_like(probability, base)
+    return base * (1.0 - probability).pow(float(policy.random_replace_power))
 
 
 def depth_field_corruption_mask(
@@ -730,15 +776,24 @@ class DepthFieldDiffusion(nn.Module):
 
         clean_fields = clean_fields.long().clamp(0, self.num_materials - 1)
         noise_prob = self.noise_probability(timesteps).to(device=clean_fields.device)
-        replace_fraction = float(max(0.0, min(1.0, random_replace_prob)))
+        policy = (
+            corruption_config
+            if isinstance(corruption_config, DepthFieldCorruptionConfig)
+            else DepthFieldCorruptionConfig.from_dict(corruption_config)
+        )
         corrupted = depth_field_corruption_mask(
             clean_fields,
             noise_prob,
-            config=corruption_config,
+            config=policy,
             generator=generator,
         )
+        replace_probability = scheduled_random_replace_probability(
+            noise_prob,
+            random_replace_prob,
+            config=policy,
+        )
         replace_draw = torch.rand(clean_fields.shape, device=clean_fields.device, generator=generator)
-        replace_mask = corrupted & (replace_draw < replace_fraction)
+        replace_mask = corrupted & (replace_draw < replace_probability.unsqueeze(1))
         mask_mask = corrupted & ~replace_mask
 
         random_labels = torch.randint(
