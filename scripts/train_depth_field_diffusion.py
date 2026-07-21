@@ -135,6 +135,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=None, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=None, help="Gradient norm clip. <=0 disables clipping.")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None, help="Use CUDA autocast/GradScaler.")
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["auto", "float16", "fp16", "bfloat16", "bf16"],
+        default=None,
+        help="CUDA autocast dtype. 'auto' uses BF16 only when every DDP rank supports it.",
+    )
+    parser.add_argument(
+        "--max-consecutive-nonfinite-steps",
+        type=int,
+        default=None,
+        help="Abort after this many consecutive non-finite forward/gradient steps. 0 aborts immediately.",
+    )
 
     parser.add_argument("--void-loss-weight", type=float, default=None, help="CE class weight for the void depth class.")
     parser.add_argument(
@@ -162,6 +175,18 @@ def parse_args() -> argparse.Namespace:
         help="Compute CE only on bins that were masked/replaced. Default supervises every bin.",
     )
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint to resume.")
+    parser.add_argument(
+        "--reset-optimizer-on-resume",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Restore model/epoch/history but start with fresh optimizer and AMP scaler state.",
+    )
+    parser.add_argument(
+        "--save-validation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Rotate a recovery checkpoint after every finite mid-training validation.",
+    )
     parser.add_argument("--save-every", type=int, default=1, help="Save the last checkpoint every N epochs.")
     parser.add_argument(
         "--eval-mode",
@@ -184,6 +209,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-tmm-device", type=str, default=None, help='TMM validation device. "auto" uses model device.')
     parser.add_argument("--eval-tmm-batch-size", type=int, default=None, help="Decoded stacks per TMM validation chunk.")
+    parser.add_argument(
+        "--eval-fail-on-nonfinite",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Fail validation if sampling has to repair any non-finite model logits.",
+    )
     parser.add_argument(
         "--save-eval-samples",
         action=argparse.BooleanOptionalAction,
@@ -399,6 +430,15 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_config_required(args, "weight_decay", nested_required(block, "TRAIN", "WEIGHT_DECAY"), "DEPTH_FIELD.TRAIN.WEIGHT_DECAY")
     set_arg_config_required(args, "grad_clip", nested_required(block, "TRAIN", "GRAD_CLIP"), "DEPTH_FIELD.TRAIN.GRAD_CLIP")
     set_arg_config_required(args, "amp", nested_required(block, "TRAIN", "AMP"), "DEPTH_FIELD.TRAIN.AMP")
+    set_arg_default(args, "amp_dtype", nested_get(block, "TRAIN", "AMP_DTYPE", default="float16"))
+    set_arg_default(
+        args,
+        "max_consecutive_nonfinite_steps",
+        nested_get(block, "TRAIN", "MAX_CONSECUTIVE_NONFINITE_STEPS", default=3),
+    )
+    checkpoint_cfg = cfg.get("CHECKPOINT") if isinstance(cfg.get("CHECKPOINT"), dict) else {}
+    set_arg_default(args, "reset_optimizer_on_resume", checkpoint_cfg.get("RESET_OPTIMIZER", False))
+    set_arg_default(args, "save_validation_checkpoint", checkpoint_cfg.get("SAVE_VALIDATION_CHECKPOINT", False))
     set_arg_config_required(
         args,
         "keep_overlimit_stacks",
@@ -440,6 +480,7 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_config_required(args, "eval_remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
     set_arg_config_required(args, "eval_tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
     set_arg_config_required(args, "eval_tmm_batch_size", nested_required(block, "EVAL", "TMM_BATCH_SIZE"), "DEPTH_FIELD.EVAL.TMM_BATCH_SIZE")
+    set_arg_default(args, "eval_fail_on_nonfinite", nested_get(block, "EVAL", "FAIL_ON_NONFINITE", default=False))
     set_arg_config_required(args, "save_eval_samples", nested_required(block, "EVAL", "SAVE_SAMPLES"), "DEPTH_FIELD.EVAL.SAVE_SAMPLES")
     set_arg_default(args, "eval_samples_dir", nested_get(block, "EVAL", "SAMPLES_DIR"))
     if bool(args.save_eval_samples) and args.eval_samples_dir is None:
@@ -448,10 +489,35 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
     set_arg_config_required(args, "eval_record_all_mc", nested_required(block, "EVAL", "RECORD_ALL_MC"), "DEPTH_FIELD.EVAL.RECORD_ALL_MC")
 
 
-def autocast_context(enabled: bool):
-    if enabled:
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
+def autocast_context(device: torch.device, dtype: torch.dtype | None):
+    if dtype is not None and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=dtype)
     return nullcontext()
+
+
+def normalize_amp_dtype(value: str | None) -> str:
+    normalized = str(value or "float16").strip().lower()
+    aliases = {"fp16": "float16", "float16": "float16", "bf16": "bfloat16", "bfloat16": "bfloat16", "auto": "auto"}
+    if normalized not in aliases:
+        raise ValueError(f"Unknown AMP dtype {value!r}; expected auto, float16, or bfloat16.")
+    return aliases[normalized]
+
+
+def resolve_amp_dtype(*, enabled: bool, device: torch.device, requested: str | None) -> torch.dtype | None:
+    if not enabled or device.type != "cuda":
+        return None
+    normalized = normalize_amp_dtype(requested)
+    if normalized == "float16":
+        return torch.float16
+    local_bf16 = bool(torch.cuda.is_bf16_supported())
+    if normalized == "bfloat16" and not local_bf16:
+        raise RuntimeError(f"CUDA device {device} does not support BF16 autocast.")
+    if normalized == "auto":
+        support = torch.tensor([int(local_bf16)], dtype=torch.int32, device=ddp_collective_device() if ddp_active() else device)
+        if ddp_active():
+            torch.distributed.all_reduce(support, op=torch.distributed.ReduceOp.MIN)
+        return torch.bfloat16 if bool(support.item()) else torch.float16
+    return torch.bfloat16
 
 
 def ddp_active() -> bool:
@@ -685,6 +751,106 @@ def ddp_collective_device() -> torch.device:
     return torch.device("cpu")
 
 
+def synchronized_finite_flags(*values: torch.Tensor) -> tuple[list[bool], list[bool]]:
+    """Return local and all-rank finite flags for tensors in a fixed collective order."""
+    device = ddp_collective_device() if ddp_active() else values[0].device
+    local = torch.stack(
+        [torch.isfinite(value.detach()).all().to(device=device, dtype=torch.int32) for value in values]
+    )
+    global_flags = local.clone()
+    if ddp_active():
+        torch.distributed.all_reduce(global_flags, op=torch.distributed.ReduceOp.MIN)
+    return [bool(value) for value in local.cpu().tolist()], [bool(value) for value in global_flags.cpu().tolist()]
+
+
+def global_int_sum(value: int, *, device: torch.device) -> int:
+    total = torch.tensor([int(value)], dtype=torch.long, device=ddp_collective_device() if ddp_active() else device)
+    if ddp_active():
+        torch.distributed.all_reduce(total)
+    return int(total.item())
+
+
+def finite_tensor_stats(value: torch.Tensor | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    tensor = value.detach()
+    finite = torch.isfinite(tensor)
+    finite_count = int(finite.sum().item())
+    result: dict[str, Any] = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "numel": int(tensor.numel()),
+        "nonfinite": int(tensor.numel() - finite_count),
+    }
+    if finite_count:
+        finite_values = tensor[finite].float()
+        result.update(
+            minimum=float(finite_values.min().item()),
+            maximum=float(finite_values.max().item()),
+            abs_maximum=float(finite_values.abs().max().item()),
+        )
+    return result
+
+
+def first_nonfinite_model_tensor(model: torch.nn.Module) -> str | None:
+    for name, tensor in unwrap_model(model).state_dict().items():
+        if torch.is_floating_point(tensor) and not bool(torch.isfinite(tensor).all().item()):
+            return name
+    return None
+
+
+def first_nonfinite_optimizer_tensor(optimizer: torch.optim.Optimizer) -> str | None:
+    for parameter_index, state in enumerate(optimizer.state.values()):
+        for name, value in state.items():
+            if torch.is_tensor(value) and torch.is_floating_point(value) and not bool(torch.isfinite(value).all().item()):
+                return f"parameter_{parameter_index}.{name}"
+    return None
+
+
+def save_nonfinite_diagnostic(
+    *,
+    out_dir: str | Path,
+    epoch: int,
+    batch_index: int,
+    global_samples_before: int,
+    reason: str,
+    spectra: torch.Tensor,
+    fields: torch.Tensor,
+    out: dict[str, torch.Tensor] | None,
+    loss: torch.Tensor | None,
+    grad_norm: torch.Tensor | None,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    batch_indices: torch.Tensor | None,
+    inspect_state: bool = True,
+) -> Path:
+    rank = ddp_rank()
+    diagnostic_dir = Path(out_dir) / "nonfinite_diagnostics"
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    path = diagnostic_dir / f"epoch_{epoch + 1:04d}_batch_{batch_index:06d}_rank_{rank:04d}.json"
+    payload = {
+        "reason": str(reason),
+        "rank": int(rank),
+        "epoch": int(epoch),
+        "epoch_1based": int(epoch + 1),
+        "batch_index": int(batch_index),
+        "global_samples_before": int(global_samples_before),
+        "amp_scale": float(scaler.get_scale()) if scaler.is_enabled() else None,
+        "spectra": finite_tensor_stats(spectra),
+        "fields": finite_tensor_stats(fields),
+        "timesteps": finite_tensor_stats(out.get("timesteps") if out is not None else None),
+        "logits": finite_tensor_stats(out.get("logits") if out is not None else None),
+        "loss": finite_tensor_stats(loss),
+        "grad_norm": finite_tensor_stats(grad_norm),
+        "first_nonfinite_model_tensor": first_nonfinite_model_tensor(model) if inspect_state else None,
+        "first_nonfinite_optimizer_tensor": first_nonfinite_optimizer_tensor(optimizer) if inspect_state else None,
+        "dataset_indices": batch_indices.detach().cpu().reshape(-1).tolist() if batch_indices is not None else None,
+    }
+    optollama.utils.save_as_json(str(path), payload)
+    return path
+
+
 def gather_1d_tensor(values: torch.Tensor) -> torch.Tensor:
     values = values.detach().cpu().reshape(-1)
     if not ddp_active():
@@ -779,6 +945,7 @@ def reduced_epoch_metrics(
     skipped_overlimit: int,
     dz_nm: float,
     device: torch.device,
+    stability_counts: torch.Tensor | None = None,
 ) -> dict:
     reduced_counts = counts.detach().clone()
     totals = torch.tensor(
@@ -797,7 +964,7 @@ def reduced_epoch_metrics(
     )
     all_reduce_sum(reduced_counts)
     all_reduce_sum(totals)
-    return counts_to_metrics(
+    metrics = counts_to_metrics(
         reduced_counts,
         loss_sum=float(totals[0].item()),
         batches=int(totals[1].item()),
@@ -809,6 +976,18 @@ def reduced_epoch_metrics(
         skipped_overlimit=int(totals[7].item()),
         dz_nm=dz_nm,
     )
+    if stability_counts is not None:
+        reduced_stability = stability_counts.detach().clone().to(device=device, dtype=torch.float64)
+        all_reduce_sum(reduced_stability)
+        divisor = float(ddp_world_size())
+        averaged = reduced_stability / divisor
+        metrics.update(
+            nonfinite_forward_steps=int(round(float(averaged[0].item()))),
+            nonfinite_gradient_steps=int(round(float(averaged[1].item()))),
+            amp_skipped_steps=int(round(float(averaged[2].item()))),
+            optimizer_steps=int(round(float(averaged[3].item()))),
+        )
+    return metrics
 
 
 @torch.no_grad()
@@ -1068,6 +1247,7 @@ def run_tmm_evaluation(
     best_thickness: list[torch.Tensor] = []
     target_overlimit = 0
     samples_seen = 0
+    local_nonfinite_sampling_positions = 0
     validation_records: list[dict] = []
     material_to_token_id = optollama.data.depth_field_material_token_ids(vocab)
     show_progress = ddp_rank() == 0
@@ -1104,6 +1284,15 @@ def run_tmm_evaluation(
             remask_strategy=str(args.eval_remask_strategy),
             corruption_config=args.corruption_config,
         )
+        repaired_positions = int(getattr(sample_model, "_last_sampling_nonfinite_positions", 0))
+        local_nonfinite_sampling_positions += repaired_positions
+        if bool(args.eval_fail_on_nonfinite):
+            repaired_global = global_int_sum(repaired_positions, device=device)
+            if repaired_global > 0:
+                raise FloatingPointError(
+                    f"Validation aborted after repairing {repaired_global} non-finite sampling positions "
+                    f"at epoch {epoch + 1}, trigger={trigger}."
+                )
         fields_cpu = fields.detach().cpu()
         pred_spectra = simulate_field_runs(
             fields_cpu,
@@ -1215,6 +1404,7 @@ def run_tmm_evaluation(
     all_thickness = gather_1d_tensor(local_thickness)
     target_totals = torch.tensor([float(target_overlimit), float(samples_seen)], dtype=torch.float64, device=device)
     all_reduce_sum(target_totals)
+    nonfinite_sampling_positions = global_int_sum(local_nonfinite_sampling_positions, device=device)
 
     if all_mae.numel() == 0:
         raise RuntimeError("TMM validation produced no samples.")
@@ -1236,6 +1426,7 @@ def run_tmm_evaluation(
         "remask_strategy": str(args.eval_remask_strategy),
         "corruption": args.corruption_config.to_dict(),
         "tmm_batch_size": int(args.eval_tmm_batch_size),
+        "nonfinite_sampling_positions": int(nonfinite_sampling_positions),
     }
     if save_samples:
         all_records = gather_validation_records(validation_records)
@@ -1278,6 +1469,7 @@ def run_epoch(
     loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.amp.GradScaler,
+    amp_dtype: torch.dtype | None,
     device: torch.device,
     idx_to_token: dict[int, str],
     vocab: optollama.data.DepthFieldVocab,
@@ -1308,6 +1500,8 @@ def run_epoch(
     full_count = 0
     active_nm_sum = 0.0
     counts = torch.zeros(6, dtype=torch.float64, device=device)
+    stability_counts = torch.zeros(4, dtype=torch.float64, device=device)
+    consecutive_nonfinite_steps = 0
     desc = f"Epoch {epoch + 1}/{epochs} {'train' if train else 'val'}"
     show_progress = ddp_rank() == 0
     pbar = tqdm.tqdm(loader, desc=desc, leave=True, disable=not show_progress)
@@ -1316,8 +1510,9 @@ def run_epoch(
     base_lr = float(optimizer_base_lr if optimizer_base_lr is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else 0.0))
     current_lr = base_lr
 
-    for batch in pbar:
+    for batch_index, batch in enumerate(pbar):
         raw_spectra_cpu, raw_stacks_cpu = batch[0], batch[1]
+        batch_indices_cpu = batch[2] if len(batch) > 2 and torch.is_tensor(batch[2]) else None
         spectra_cpu, stacks_cpu = raw_spectra_cpu, raw_stacks_cpu
         batch_seen_start = int(seen_samples)
         global_samples_before = int(global_sample_offset + batch_seen_start * ddp_world_size())
@@ -1354,6 +1549,7 @@ def run_epoch(
                         skipped_overlimit=skipped_overlimit,
                         dz_nm=args.dz_nm,
                         device=device,
+                        stability_counts=stability_counts,
                     )
                     if show_progress:
                         pbar.set_postfix(skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%")
@@ -1365,6 +1561,8 @@ def run_epoch(
                     continue
             spectra_cpu = spectra_cpu[keep]
             stacks_cpu = stacks_cpu[keep]
+            if batch_indices_cpu is not None:
+                batch_indices_cpu = batch_indices_cpu[keep]
 
         fields_cpu = optollama.data.rasterize_stack_to_depth_field(
             stacks_cpu,
@@ -1391,7 +1589,7 @@ def run_epoch(
             current_lr = scheduled_learning_rate(base_lr, lr_schedule, global_samples_before)
             set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
-            with autocast_context(bool(scaler.is_enabled())):
+            with autocast_context(device, amp_dtype):
                 out = depth_field_training_loss(
                     model,
                     spectra,
@@ -1407,16 +1605,101 @@ def run_epoch(
             loss = out["loss"]
             if not count_batch_metrics:
                 loss = loss * 0.0
+            local_finite, global_finite = synchronized_finite_flags(spectra, out["logits"], loss)
+            if not all(global_finite):
+                stability_counts[0] += 1
+                consecutive_nonfinite_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                if not all(local_finite) or ddp_rank() == 0:
+                    reason_names = ["spectra", "logits", "loss"]
+                    local_reasons = [name for name, is_finite in zip(reason_names, local_finite) if not is_finite]
+                    reason = "nonfinite_" + "_".join(local_reasons or ["remote_rank"])
+                    diagnostic_path = save_nonfinite_diagnostic(
+                        out_dir=args.out_dir,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                        global_samples_before=global_samples_before,
+                        reason=reason,
+                        spectra=spectra,
+                        fields=fields,
+                        out=out,
+                        loss=loss,
+                        grad_norm=None,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        batch_indices=batch_indices_cpu,
+                        inspect_state=ddp_rank() == 0,
+                    )
+                    if show_progress:
+                        tqdm.tqdm.write(f"Skipped non-finite forward step; diagnostic -> {diagnostic_path}")
+                limit = int(args.max_consecutive_nonfinite_steps)
+                if limit <= 0 or consecutive_nonfinite_steps >= limit:
+                    raise FloatingPointError(
+                        f"Aborting after {consecutive_nonfinite_steps} consecutive non-finite forward steps "
+                        f"at epoch {epoch + 1}, batch {batch_index}."
+                    )
+                continue
             scaler.scale(loss).backward()
             if args.grad_clip and args.grad_clip > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    float(args.grad_clip),
+                    error_if_nonfinite=False,
+                )
+            else:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), error_if_nonfinite=False)
+            local_grad_finite, global_grad_finite = synchronized_finite_flags(grad_norm)
+            if not all(global_grad_finite):
+                stability_counts[1] += 1
+                consecutive_nonfinite_steps += 1
+                if not all(local_grad_finite) or ddp_rank() == 0:
+                    diagnostic_path = save_nonfinite_diagnostic(
+                        out_dir=args.out_dir,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                        global_samples_before=global_samples_before,
+                        reason="nonfinite_gradient_norm",
+                        spectra=spectra,
+                        fields=fields,
+                        out=out,
+                        loss=loss,
+                        grad_norm=grad_norm,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        batch_indices=batch_indices_cpu,
+                        inspect_state=ddp_rank() == 0,
+                    )
+                    if show_progress:
+                        tqdm.tqdm.write(f"Skipped non-finite gradient step; diagnostic -> {diagnostic_path}")
+                scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
+                if scaler.is_enabled():
+                    scaler.update(new_scale=max(float(scale_before or 1.0) * 0.5, 1.0))
+                    stability_counts[2] += 1
+                optimizer.zero_grad(set_to_none=True)
+                limit = int(args.max_consecutive_nonfinite_steps)
+                if limit <= 0 or consecutive_nonfinite_steps >= limit:
+                    raise FloatingPointError(
+                        f"Aborting after {consecutive_nonfinite_steps} consecutive non-finite gradient steps "
+                        f"at epoch {epoch + 1}, batch {batch_index}."
+                    )
+                continue
+            scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
             scaler.step(optimizer)
             scaler.update()
-            if ema is not None:
+            amp_skipped = bool(scale_before is not None and float(scaler.get_scale()) < scale_before)
+            if amp_skipped:
+                stability_counts[2] += 1
+            else:
+                stability_counts[3] += 1
+                consecutive_nonfinite_steps = 0
+            if ema is not None and not amp_skipped:
                 ema.update(model)
         else:
-            with torch.no_grad(), autocast_context(bool(scaler.is_enabled())):
+            with torch.no_grad(), autocast_context(device, amp_dtype):
                 out = depth_field_training_loss(
                     model,
                     spectra,
@@ -1447,7 +1730,8 @@ def run_epoch(
             skipped_overlimit=skipped_overlimit,
             dz_nm=args.dz_nm,
             device=device,
-            )
+            stability_counts=stability_counts,
+        )
         metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
         if train:
             metrics["lr"] = float(current_lr)
@@ -1462,6 +1746,8 @@ def run_epoch(
                 th=f"{metrics['mean_active_thickness_nm']:.0f}nm",
                 skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%",
                 full=f"{metrics['full_depth_fraction'] * 100.0:.1f}%",
+                nf=f"{metrics.get('nonfinite_forward_steps', 0) + metrics.get('nonfinite_gradient_steps', 0)}",
+                amp_skip=f"{metrics.get('amp_skipped_steps', 0)}",
             )
 
         if next_validation_sample is not None and int(metrics["samples_seen"]) >= next_validation_sample:
@@ -1482,6 +1768,7 @@ def run_epoch(
         skipped_overlimit=skipped_overlimit,
         dz_nm=args.dz_nm,
         device=device,
+        stability_counts=stability_counts,
     )
     metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
     if train:
@@ -1553,6 +1840,7 @@ def save_depth_checkpoint(
     path: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
+    scaler: torch.amp.GradScaler | None,
     epoch: int,
     history: list[dict],
     extra: dict,
@@ -1567,6 +1855,7 @@ def save_depth_checkpoint(
             str(path),
             model=model,
             optimizer=optimizer,
+            scaler=scaler,
             epoch=epoch,
             train_losses=train_losses,
             test_mae=val_losses,
@@ -1590,7 +1879,8 @@ def main() -> None:
             torch.cuda.set_device(device)
     ddp = optollama.utils.is_ddp()
     amp_enabled = bool(args.amp and device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    amp_dtype = resolve_amp_dtype(enabled=amp_enabled, device=device, requested=args.amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
 
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
     vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
@@ -1652,19 +1942,46 @@ def main() -> None:
         torch.distributed.barrier()
     best_path = out_dir / "depth-field-best.pt"
     last_path = out_dir / "depth-field-last.pt"
+    recovery_path = out_dir / "depth-field-recovery.pt"
     ema_best_path = out_dir / "depth-field-best-ema.pt"
     ema_last_path = out_dir / "depth-field-last-ema.pt"
     history_path = out_dir / "depth-field-history.json"
     eval_samples_dir = Path(args.eval_samples_dir) if args.eval_samples_dir is not None else None
 
     start_epoch = 0
+    global_sample_offset_adjustment = 0
     history: list[dict] = []
     resume_path, resume_source, resume_required = resolve_resume_checkpoint(cfg, args, last_path)
     if resume_path is not None:
         if resume_path.exists():
-            start_epoch_loaded, blob = optollama.utils.load_checkpoint(str(resume_path), model, optimizer=optimizer, map_location="cpu")
+            reset_optimizer = bool(args.reset_optimizer_on_resume)
+            start_epoch_loaded, blob = optollama.utils.load_checkpoint(
+                str(resume_path),
+                model,
+                optimizer=None if reset_optimizer else optimizer,
+                scaler=None if reset_optimizer else scaler,
+                map_location="cpu",
+            )
             start_epoch = int(start_epoch_loaded or 0)
             history = list(((blob.get("extra") or {}).get("history") or []))
+            if history:
+                resume_global_samples = (history[-1].get("train") or {}).get("global_samples_seen")
+                if isinstance(resume_global_samples, (int, float)) and math.isfinite(float(resume_global_samples)):
+                    global_sample_offset_adjustment = int(resume_global_samples) - start_epoch * int(train_subset)
+            nonfinite_model_tensor = first_nonfinite_model_tensor(model)
+            nonfinite_optimizer_tensor = None if reset_optimizer else first_nonfinite_optimizer_tensor(optimizer)
+            checkpoint_finite = torch.tensor(
+                [int(nonfinite_model_tensor is None and nonfinite_optimizer_tensor is None)],
+                dtype=torch.int32,
+                device=ddp_collective_device() if ddp_active() else device,
+            )
+            if ddp_active():
+                torch.distributed.all_reduce(checkpoint_finite, op=torch.distributed.ReduceOp.MIN)
+            if not bool(checkpoint_finite.item()):
+                raise FloatingPointError(
+                    f"Refusing to resume non-finite checkpoint {resume_path}; "
+                    f"model_tensor={nonfinite_model_tensor}, optimizer_tensor={nonfinite_optimizer_tensor}."
+                )
             if ema is not None:
                 ema_state = ((blob.get("extra") or {}).get("ema_state") or {})
                 if ema_state:
@@ -1673,6 +1990,13 @@ def main() -> None:
                     ema.reset(model)
             if rank == 0:
                 print(f"Resumed depth-field checkpoint {resume_path} at epoch {start_epoch} ({resume_source}).")
+                if reset_optimizer:
+                    print("Reset optimizer and AMP scaler state while preserving checkpoint weights/history/epoch.")
+                elif scaler.is_enabled() and not isinstance(blob.get("scaler_state"), dict):
+                    print("Checkpoint has no AMP scaler state; using a fresh GradScaler state.")
+                if global_sample_offset_adjustment:
+                    resumed_at = start_epoch * int(train_subset) + global_sample_offset_adjustment
+                    print(f"Continuing schedules from checkpoint sample position {resumed_at}.")
         elif resume_required:
             raise FileNotFoundError(f"{resume_source} checkpoint does not exist: {resume_path}")
         elif rank == 0:
@@ -1710,6 +2034,7 @@ def main() -> None:
                     loader=val_loader,
                     optimizer=None,
                     scaler=scaler,
+                    amp_dtype=amp_dtype,
                     device=device,
                     idx_to_token=idx_to_token,
                     vocab=vocab,
@@ -1789,6 +2114,7 @@ def main() -> None:
                 path=best_path,
                 model=model,
                 optimizer=optimizer,
+                scaler=scaler,
                 epoch=epoch,
                 history=history,
                 extra=extra,
@@ -1800,6 +2126,7 @@ def main() -> None:
                     path=ema_best_path,
                     model=model,
                     optimizer=optimizer,
+                    scaler=scaler,
                     epoch=epoch,
                     history=history,
                     extra=extra,
@@ -1807,6 +2134,21 @@ def main() -> None:
                     use_ema_weights=True,
                 )
             print(f"Saved best checkpoint -> {best_path} ({val_metrics.get('score_name', 'score')}={best_score:.6f}, trigger={trigger})")
+
+        repaired_positions = int(val_metrics.get("nonfinite_sampling_positions", 0))
+        if bool(args.save_validation_checkpoint) and math.isfinite(score) and repaired_positions == 0:
+            save_depth_checkpoint(
+                path=recovery_path,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                history=history,
+                extra=extra,
+                ema=ema,
+                use_ema_weights=False,
+            )
+            print(f"Saved rolling recovery checkpoint -> {recovery_path} (trigger={trigger})")
 
         optollama.utils.save_as_json(str(history_path), history)
 
@@ -1835,7 +2177,7 @@ def main() -> None:
         print(
             "Depth-field diffusion: "
             f"materials={vocab.num_clean_classes - 1}+void, bins={depth_bins}, dz={args.dz_nm:g}nm, "
-            f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, "
+            f"max={args.max_thickness_nm:g}nm, device={device}, amp={amp_enabled}, amp_dtype={amp_dtype}, "
             f"ddp={ddp}, world={world_size}, {model_desc}, "
             f"corruption={args.corruption_config.mode}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
@@ -1881,6 +2223,7 @@ def main() -> None:
             loader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
+            amp_dtype=amp_dtype,
             device=device,
             idx_to_token=idx_to_token,
             vocab=vocab,
@@ -1893,7 +2236,7 @@ def main() -> None:
             train=True,
             validation_callback=mid_validation_callback,
             validate_every_samples=validate_every_samples,
-            global_sample_offset=int(epoch) * int(train_subset),
+            global_sample_offset=global_sample_offset_adjustment + int(epoch) * int(train_subset),
             optimizer_base_lr=optimizer_base_lr,
             lr_schedule=lr_schedule,
             timestep_schedule=timestep_schedule,
@@ -1930,7 +2273,15 @@ def main() -> None:
                 checkpoint_weights="live",
             )
             if args.save_every > 0 and ((epoch + 1) % int(args.save_every) == 0 or epoch == epochs - 1):
-                save_depth_checkpoint(path=last_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
+                save_depth_checkpoint(
+                    path=last_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    history=history,
+                    extra=extra,
+                )
                 print(f"Saved last checkpoint -> {last_path}")
                 if ema is not None:
                     ema_extra = make_checkpoint_extra(
@@ -1946,6 +2297,7 @@ def main() -> None:
                         path=ema_last_path,
                         model=model,
                         optimizer=optimizer,
+                        scaler=scaler,
                         epoch=epoch,
                         history=history,
                         extra=ema_extra,
@@ -1958,7 +2310,15 @@ def main() -> None:
                 score = metric_score(train_metrics)
                 if score < best_score:
                     best_score = score
-                    save_depth_checkpoint(path=best_path, model=model, optimizer=optimizer, epoch=epoch, history=history, extra=extra)
+                    save_depth_checkpoint(
+                        path=best_path,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        history=history,
+                        extra=extra,
+                    )
                     print(f"Saved best checkpoint -> {best_path} (train_loss={best_score:.6f})")
 
             optollama.utils.save_as_json(str(history_path), history)

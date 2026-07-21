@@ -669,13 +669,17 @@ class AdaLayerNormGaussian(torch.nn.Module):
         torch.nn.init.zeros_(self.to_scale_shift.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        mu = x.mean(-1, keepdim=True)
-        sig = x.var(-1, unbiased=False, keepdim=True).add(self.eps).sqrt()
-        x_hat = (x - mu) / sig  # weight-free LN
+        output_dtype = x.dtype
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x_float = x.float()
+            cond_float = cond.float()
+            mu = x_float.mean(-1, keepdim=True)
+            variance = x_float.var(-1, unbiased=False, keepdim=True)
+            x_hat = (x_float - mu) * torch.rsqrt(variance + self.eps)
 
-        delta_g, beta = self.to_scale_shift(cond).chunk(2, dim=-1)  # [B, H] each
-        y = x_hat * (1 + delta_g).unsqueeze(1) + beta.unsqueeze(1)
-        return y
+            delta_g, beta = self.to_scale_shift(cond_float).chunk(2, dim=-1)  # [B, H] each
+            y = x_hat * (1 + delta_g).unsqueeze(1) + beta.unsqueeze(1)
+        return y.to(dtype=output_dtype)
 
 
 class Block(torch.nn.Module):

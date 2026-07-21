@@ -65,6 +65,8 @@ class DepthFieldSamplingTests(unittest.TestCase):
 
         self.assertEqual(tuple(sampled.shape), (1, 4))
         self.assertTrue(torch.all((sampled >= 0) & (sampled < 4)))
+        self.assertEqual(self.model._last_sampling_nonfinite_positions, 8)
+        self.assertEqual(self.model._last_sampling_first_nonfinite_step, 0)
 
 
 if __name__ == "__main__":

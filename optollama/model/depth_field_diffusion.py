@@ -945,6 +945,10 @@ class DepthFieldDiffusion(nn.Module):
                     fields.scatter_(1, low_confidence, int(self.mask_id))
 
         repaired_count = int(repaired_rows.item())
+        self._last_sampling_nonfinite_positions = repaired_count
+        self._last_sampling_first_nonfinite_step = (
+            int(first_repaired_step.item()) if repaired_count > 0 else None
+        )
         if repaired_count > 0 and not getattr(self, "_sampling_nonfinite_warning_emitted", False):
             first_step = int(first_repaired_step.item())
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
