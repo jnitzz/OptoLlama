@@ -107,11 +107,16 @@ def _normalize_model_type(model_type: str | None) -> str:
         "optollama_windowed_depth_v2": "optollama_depth_windowed_v2",
         "windowed_optollama_depth_v2": "optollama_depth_windowed_v2",
         "windowed_depth_v2": "optollama_depth_windowed_v2",
+        "optollama_depth_windowed_v3": "optollama_depth_windowed_v3",
+        "optollama_windowed_depth_v3": "optollama_depth_windowed_v3",
+        "windowed_optollama_depth_v3": "optollama_depth_windowed_v3",
+        "windowed_depth_v3": "optollama_depth_windowed_v3",
     }
     if value not in aliases:
         raise ValueError(
             f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', "
-            "'optollama_depth', 'optollama_depth_windowed', or 'optollama_depth_windowed_v2'."
+            "'optollama_depth', 'optollama_depth_windowed', 'optollama_depth_windowed_v2', "
+            "or 'optollama_depth_windowed_v3'."
         )
     return aliases[value]
 
@@ -569,7 +574,13 @@ class DepthFieldModelConfig:
             raise ValueError(f"n_heads must be positive, got {self.n_heads}.")
         if float(self.ffn_multiplier) <= 0.0:
             raise ValueError(f"ffn_multiplier must be positive, got {self.ffn_multiplier}.")
-        attention_models = {"attention", "optollama_depth", "optollama_depth_windowed", "optollama_depth_windowed_v2"}
+        attention_models = {
+            "attention",
+            "optollama_depth",
+            "optollama_depth_windowed",
+            "optollama_depth_windowed_v2",
+            "optollama_depth_windowed_v3",
+        }
         if self.model_type in attention_models and int(self.d_model) % int(self.n_heads) != 0:
             raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
         if int(self.spectrum_patch_size) <= 0:
@@ -582,7 +593,11 @@ class DepthFieldModelConfig:
             raise ValueError(f"spectrum_encoder_heads must be positive, got {self.spectrum_encoder_heads}.")
         if float(self.spectrum_ffn_multiplier) <= 0.0:
             raise ValueError(f"spectrum_ffn_multiplier must be positive, got {self.spectrum_ffn_multiplier}.")
-        windowed_models = {"optollama_depth_windowed", "optollama_depth_windowed_v2"}
+        windowed_models = {
+            "optollama_depth_windowed",
+            "optollama_depth_windowed_v2",
+            "optollama_depth_windowed_v3",
+        }
         if self.model_type in windowed_models and int(self.d_model) % int(self.spectrum_encoder_heads) != 0:
             raise ValueError(
                 f"d_model={self.d_model} must be divisible by spectrum_encoder_heads={self.spectrum_encoder_heads}."
@@ -1179,9 +1194,24 @@ class DepthFieldWindowedOptoLlamaV2Diffusion(DepthFieldWindowedOptoLlamaDiffusio
         return self.output(self.final_depth_norm(depth_tokens))
 
 
+class DepthFieldWindowedOptoLlamaV3Diffusion(DepthFieldWindowedOptoLlamaV2Diffusion):
+    """Windowed model with role-separated time and spectrum conditioning."""
+
+    def _spectrum_tokens(self, spectra: torch.Tensor) -> torch.Tensor:
+        window_tokens = super()._spectrum_tokens(spectra)
+        global_token = self.global_spectrum_condition(window_tokens.mean(dim=1)).unsqueeze(1)
+        return torch.cat((window_tokens, global_token), dim=1)
+
+    def _block_condition(self, spectrum_tokens: torch.Tensor, time_token: torch.Tensor) -> torch.Tensor:
+        del spectrum_tokens
+        return time_token.squeeze(1)
+
+
 def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
     """Build the configured depth-field diffusion model."""
     model_type = _normalize_model_type(config.model_type)
+    if model_type == "optollama_depth_windowed_v3":
+        return DepthFieldWindowedOptoLlamaV3Diffusion(config)
     if model_type == "optollama_depth_windowed_v2":
         return DepthFieldWindowedOptoLlamaV2Diffusion(config)
     if model_type == "optollama_depth_windowed":

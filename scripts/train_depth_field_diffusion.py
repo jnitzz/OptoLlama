@@ -98,12 +98,19 @@ def parse_args() -> argparse.Namespace:
             "optollama-windowed-depth-v2",
             "windowed_depth_v2",
             "windowed-depth-v2",
+            "optollama_depth_windowed_v3",
+            "optollama-depth-windowed-v3",
+            "optollama_windowed_depth_v3",
+            "optollama-windowed-depth-v3",
+            "windowed_depth_v3",
+            "windowed-depth-v3",
         ],
         help=(
             "Depth-field backbone type. 'conv' uses dilated Conv1d blocks, 'attention' uses global self-attention, "
             "'optollama_depth' uses OptoLlama-style cross/self-attention blocks, and "
             "'optollama_depth_windowed' adds wavelength-window spectrum conditioning, and its V2 variant adds "
-            "pooled-spectrum AdaLN conditioning plus final LayerNorm."
+            "pooled-spectrum AdaLN conditioning plus final LayerNorm. V3 instead appends the pooled spectrum as "
+            "a global cross-attention token and keeps AdaLN timestep-only."
         ),
     )
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
@@ -2159,12 +2166,17 @@ def main() -> None:
             "optollama_depth",
             "optollama_depth_windowed",
             "optollama_depth_windowed_v2",
+            "optollama_depth_windowed_v3",
         }
         if model_config.model_type in transformer_models:
             model_desc += f", heads={model_config.n_heads}, ffn={model_config.ffn_multiplier:g}"
             if model_config.model_type != "attention":
                 model_desc += ", spectrum_cross_attn=true"
-            if model_config.model_type in {"optollama_depth_windowed", "optollama_depth_windowed_v2"}:
+            if model_config.model_type in {
+                "optollama_depth_windowed",
+                "optollama_depth_windowed_v2",
+                "optollama_depth_windowed_v3",
+            }:
                 model_desc += (
                     f", spectrum_patch={model_config.spectrum_patch_size}"
                     f"/{model_config.spectrum_patch_stride}, spectrum_blocks={model_config.spectrum_encoder_blocks}, "
@@ -2172,6 +2184,8 @@ def main() -> None:
                 )
             if model_config.model_type == "optollama_depth_windowed_v2":
                 model_desc += ", pooled_spectrum_adaln=true, final_norm=true"
+            elif model_config.model_type == "optollama_depth_windowed_v3":
+                model_desc += ", pooled_spectrum_token=true, adaln_condition=time_only, final_norm=true"
         else:
             model_desc += f", conv={model_config.conv_type}, kernel={model_config.kernel_size}"
         print(
