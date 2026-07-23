@@ -1,0 +1,326 @@
+EXPERIMENT:
+  MODEL: optollama
+  RUN: OPTOLLAMA_DEPTH_FIELD_WINDOWED_V3_10UM_15
+  SEED: 3
+
+PATHS:
+  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data
+  MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
+  TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
+  OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
+  SAMPLES_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-samples.json
+  GRID_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-grid.json
+  IDS_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-ids.json
+  PLOT_BUNDLE_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-plot-bundle.npz
+  TRAIN:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/00
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/01
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/02
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/03
+  TEST:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_test
+
+DATA_LOADING:
+  NUM_WORKERS: 8
+  SHARDED_LOADING: true
+  NUM_SAMPLES_TRAIN: 20000000
+  NUM_SAMPLES_TEST: 512
+  TRAIN_BATCH_SIZE: 128
+  TEST_BATCH_SIZE: 32
+
+SPECTRAL_GRID:
+  WAVELENGTH_MIN: 300
+  WAVELENGTH_MAX: 1700
+  WAVELENGTH_STEPS: 5
+
+CHECKPOINT:
+  RESUME: null # null | false: fresh start; true: depth-field-last.pt; or an explicit checkpoint path
+  RESET_OPTIMIZER: false
+  SAVE_VALIDATION_CHECKPOINT: true
+
+SEQUENCE:
+  MAX_SEQ_LEN: 101
+  MAX_EMIT_LEN: ${SEQUENCE.MAX_SEQ_LEN}
+
+DEPTH_FIELD:
+  ENABLED: true
+  OUT_DIR: ${PATHS.OUTPUT_PATH}
+  DZ_NM: 5
+  MAX_THICKNESS_NM: 10000
+  OUTPUT_SEQ_LEN: 2000
+  CORRUPTION:
+    MODE: hybrid # iid | hybrid
+    IID_FRACTION: 0.10
+    SPAN_FRACTION: 0.50
+    LAYER_FRACTION: 0.40
+    SPAN_MIN_BINS: 4 # 20 nm at DZ_NM=5
+    SPAN_MAX_BINS: 128 # 640 nm at DZ_NM=5
+    SPAN_SCALE_WITH_NOISE: true
+    # q(t) = RANDOM_REPLACE_PROB * (1 - noise_probability(t))^POWER.
+    # This gives an all-MASK input at maximum noise and peaks replacements at intermediate noise.
+    RANDOM_REPLACE_SCHEDULE: noise_complement # constant | noise_complement
+    RANDOM_REPLACE_POWER: 1.0
+  MODEL:
+    TYPE: optollama_depth_windowed_v3 # conv | attention | optollama_depth | optollama_depth_windowed | optollama_depth_windowed_v2 | optollama_depth_windowed_v3
+    D_MODEL: 896
+    N_BLOCKS: 8
+    N_HEADS: 8
+    FFN_MULTIPLIER: 4.0
+    SPECTRUM_PATCH_SIZE: 8 # 40 nm windows on the 5 nm grid
+    SPECTRUM_PATCH_STRIDE: 4 # 20 nm overlap stride; produces 70 local spectral tokens
+    SPECTRUM_ENCODER_BLOCKS: 2
+    SPECTRUM_ENCODER_HEADS: 8
+    SPECTRUM_FFN_MULTIPLIER: 2.0
+    # V3 adds one pooled global spectrum token to cross-attention while AdaLN remains timestep-only.
+    # Ignored by transformer backbones; retained for config compatibility.
+    KERNEL_SIZE: 7
+    CONV_TYPE: full # full | separable; used only by TYPE: conv
+    DROPOUT: 0.0
+    DIFFUSION_STEPS: 200
+  TRAIN:
+    AMP: true
+    AMP_DTYPE: auto # auto | float16/fp16 | bfloat16/bf16; auto uses BF16 only when every GPU supports it
+    MAX_CONSECUTIVE_NONFINITE_STEPS: 2
+    WEIGHT_DECAY: 0.01
+    GRAD_CLIP: 1.0
+    KEEP_OVERLIMIT_STACKS: false
+    VOID_LOSS_WEIGHT: 0.10
+    RANDOM_REPLACE_PROB: 0.15
+    LOSS_ON_CORRUPTED_ONLY: true
+    LR_SCHEDULE:
+      ENABLED: true
+      TYPE: cosine # cosine | linear | constant/flat
+      WARMUP_SAMPLES: 500000
+      TOTAL_SAMPLES: 200000000
+      START_LR: 0.00001
+      MAX_LR: ${OPTIMIZATION.LEARNING_RATE}
+      MIN_LR: 0.00001
+    TIMESTEP_SCHEDULE:
+      ENABLED: true
+      TYPE: high_noise_warmup # high_noise_warmup; aliases: high_noise | noise_warmup
+      WARMUP_SAMPLES: 2000000
+      HIGH_NOISE_MIN_FRACTION: 0.6
+    EMA:
+      ENABLED: true
+      DECAY: 0.9999
+      DEVICE: model # model | cpu
+      VALIDATE: true
+  EVAL:
+    MODE: tmm # tmm | denoise | both
+    SCORE_MODE: field # field | decoded | both
+    RANK_BY: auto # auto | field | decoded
+    MC_SAMPLES: 10
+    SAMPLING_STEPS: 200
+    REMASK_STRATEGY: random # random | confidence
+    TEMPERATURE: 1.0 # >0: sampling temperature; <=0: argmax
+    TOP_K: 0 # 0 or >= material classes: disabled; otherwise retain top k classes
+    DETERMINISTIC: false
+    TMM_DEVICE: auto # auto/same | cpu | cuda | cuda:N
+    TMM_BATCH_SIZE: 16
+    FAIL_ON_NONFINITE: true
+    SAVE_SAMPLES: true
+    SAMPLES_DIR: ${DEPTH_FIELD.OUT_DIR}/validation_samples
+    RECORD_SPECTRA: true
+    RECORD_ALL_MC: true
+
+OPTIMIZATION:
+  LEARNING_RATE: 0.00005
+  EPOCHS: 20
+
+VALIDATION:
+  EVERY_N_TRAIN_SAMPLES: 5000000
+  AT_EPOCH_END: false
+
+EVALUATION:
+  VALID_SIM: TMM_FAST # TMM_FAST | NO_SIM
+  INCIDENCE_ANGLE: 0
+  ROI_MIN: 300
+  ROI_MAX: 1700
+  MAE_CHANNELS: null # null: all channels; or any list subset of [R, A, T]
+  COMMON_MAE:
+    ENABLED: true
+    WAVELENGTH_MIN: 300
+    WAVELENGTH_MAX: 1700
+    WAVELENGTH_STEPS: 10
+
+TARGET_SELECTION:
+  TARGET: null
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGETS: []
+  TARGET_GLOB: null # ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
+  N_TARGETS: 1
+
+TARGET_PREPROCESS:
+  MISMATCH_FILL_ORDER: R>T>A # any priority permutation of R, A, T, e.g. R>A>T | R>T>A | A>R>T
+  NOISE:
+    ENABLED: false
+    SIGMA_ABS: 0.1
+    SIGMA_REL: 0.0
+    PER_CHANNEL:
+      - 1.0
+      - 1.0
+      - 1.0
+    WL_MIN: 300
+    WL_MAX: 1700
+    CLIP_0_1: true
+  SMOOTH:
+    ENABLED: false
+    METHOD: gaussian # gaussian | boxcar
+    WIN: 10
+    SIGMA: 1.5
+  FILL_OUTSIDE_ROI:
+    ENABLED: false
+    SKIP_INDEX_0: true
+    MODE: smooth_random # flat_random | tilted_random | smooth_random | prior_plus_noise
+    STRENGTH: 0.65
+    KERNEL_SIZE: 20
+
+PLOTTING:
+  SAMPLE_WITH_NN: true
+  NN_CHUNK_SIZE: 512000
+  NN_DEVICE: null # null: auto | cpu | cuda | cuda:N
+  NK: true
+
+REALISTIC_TMM:
+  ENABLED: true
+  ANGLES:
+    - 0.0
+  ANGLE_WEIGHTS:
+    - 1.0
+  POLARIZATIONS:
+    - s # s | p; include both entries to average both polarizations
+  JITTER_REALIZATIONS: 1
+  THICKNESS_JITTER_NM: 0.0
+
+SPECTRUM_LATENT:
+  ENABLED: false
+  CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+  MODE: token # token is currently the only implemented mode
+  FREEZE_ENCODER: true
+
+TARGET_PHYSICALIZE:
+  ENABLED: false
+  SELECTION_TARGET: original # original | conditioned
+  # Applies to repeated target spectra from N_TARGETS/--target-samples.
+  # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.
+  RANDOM:
+    ENABLED: false
+    MODE: gaussian # gaussian; aliases: noise | gaussian_noise
+    SEED: ${EXPERIMENT.SEED}
+    SKIP_INDEX_0: true
+    SIGMA_ABS: 0.1
+    SIGMA_REL: 0.0
+    PER_CHANNEL:
+      - 1.0
+      - 1.0
+      - 1.0
+    WL_MIN: 300
+    WL_MAX: 1700
+    CLIP_0_1: true
+    RENORMALIZE: true
+  EDGE_SMOOTHING:
+    ENABLED: false
+    SIGMA_NM: 20
+    WIN_NM: 40
+  LEVEL_RELAXATION:
+    ENABLED: false
+    PASS_VALUE: 0.98
+    STOP_VALUE: 0.02
+    ABS_SCALE: 1.0
+  AE_PROJECT:
+    ENABLED: true
+    CHECKPOINT: ${PATHS.DATA_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+    DEVICE: null # null: inherit inference device | cpu | cuda | cuda:N
+    MODE: all # all | outside_roi
+    BLEND: 1.0
+    ROI_BLEND: 0.0
+    OUTSIDE_ROI_BLEND: 0.8
+    TRANSITION_BLEND: 0.4
+    TRANSITION_WIDTH_NM: 200
+  NN_BLEND:
+    ENABLED: false
+    SOURCE_SPLIT: train # train | test; ignored when SOURCE_PATHS is non-empty
+    SOURCE_PATHS: []
+    CHUNK_SIZE: 512000
+    DEVICE: null # null: inherit inference device | cpu | cuda | cuda:N
+    METRIC_ROI_MIN: ${EVALUATION.ROI_MIN}
+    METRIC_ROI_MAX: ${EVALUATION.ROI_MAX}
+    METRIC_CHANNELS:
+      - R
+      - T
+      - A
+    MODE: outside_roi # all | outside_roi
+    ROI_BLEND: 0.0
+    OUTSIDE_ROI_BLEND: 0.8
+    TRANSITION_BLEND: 0.4
+    TRANSITION_WIDTH_NM: 200
+
+REALISTIC_DATASET:
+  OUT_DIR: ${PATHS.DATA_PATH}/realistic_var
+  NUM_SAMPLES: 21000000
+  SHARD_SIZE: 100000
+  BATCH_SIZE: 512
+  SEED: ${EXPERIMENT.SEED}
+  DEVICE: cuda # cpu | cuda | cuda:N
+  OVERWRITE: true
+  FAMILY_WEIGHTS:
+    random_dielectric: 0.30
+    random: 0.20
+    sparse_metal_random: 0.08
+    dbr: 0.05
+    chirped_dbr: 0.04
+    cavity: 0.04
+    rugate: 0.05
+    apodized_dbr: 0.04
+    multi_cavity: 0.04
+    edge_filter: 0.04
+    multi_band_filter: 0.04
+    metal_dielectric_metal: 0.02
+    dielectric_metal_dielectric: 0.02
+    absorber_backed: 0.01
+    hybrid_dbr_metal: 0.01
+    tco_stack: 0.02
+  LAYERS:
+    MIN: 0
+    MAX: 100
+    OUTPUT_SEQ_LEN: ${SEQUENCE.MAX_SEQ_LEN}
+    FAMILY_MIN_LAYERS:
+      DBR: 2
+      CHIRPED_DBR: 2
+      CAVITY: 5
+      SYMMETRIC_MOTIF: 4
+      RUGATE: 8
+      APODIZED_DBR: 4
+      MULTI_CAVITY: 7
+      EDGE_FILTER: 4
+      MULTI_BAND_FILTER: 6
+      METAL_DIELECTRIC_METAL: 3
+      DIELECTRIC_METAL_DIELECTRIC: 3
+      ABSORBER_BACKED: 2
+      HYBRID_DBR_METAL: 3
+      SPARSE_METAL_RANDOM: 3
+      TCO_STACK: 3
+  THICKNESS:
+    MIN: 10
+    MAX: 500
+    STEP: 5
+    MAX_TOTAL_NM: 10000
+  SPECTRUM:
+    WAVELENGTH_MIN: ${SPECTRAL_GRID.WAVELENGTH_MIN}
+    WAVELENGTH_MAX: ${SPECTRAL_GRID.WAVELENGTH_MAX}
+    WAVELENGTH_STEP: ${SPECTRAL_GRID.WAVELENGTH_STEPS}
+  REALISTIC_AVERAGING:
+    ANGLES:
+      - 0.0
+    ANGLE_WEIGHTS:
+      - 1.0
+    POLARIZATIONS:
+      - s
+    JITTER_REALIZATIONS: 1
+    THICKNESS_JITTER_NM: 0.0
+    SAVE_DTYPE: float16 # float16 | float32
+  STRUCTURES:
+    CENTER_MIN: 100
+    CENTER_MAX: 2200
+    STRUCTURE_JITTER_FRACTION: 0.10
