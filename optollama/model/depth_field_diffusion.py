@@ -15,6 +15,33 @@ from .optollama import SpectrumEmbedding as OptoLlamaSpectrumEmbedding
 from .optollama import TimestepEmbedding as OptoLlamaTimestepEmbedding
 
 
+def weighted_depth_field_loss(
+    loss_per_bin: torch.Tensor,
+    corrupted: torch.Tensor,
+    *,
+    corrupted_loss_weight: float = 1.0,
+    uncorrupted_loss_weight: float = 1.0,
+    loss_on_corrupted_only: bool = False,
+) -> torch.Tensor:
+    """Average per-bin loss with separate weights for corrupted and clean positions."""
+    corrupted_weight = float(corrupted_loss_weight)
+    uncorrupted_weight = 0.0 if loss_on_corrupted_only else float(uncorrupted_loss_weight)
+    if not math.isfinite(corrupted_weight) or corrupted_weight < 0.0:
+        raise ValueError(f"corrupted_loss_weight must be finite and non-negative, got {corrupted_weight}")
+    if not math.isfinite(uncorrupted_weight) or uncorrupted_weight < 0.0:
+        raise ValueError(f"uncorrupted_loss_weight must be finite and non-negative, got {uncorrupted_weight}")
+    if corrupted_weight == 0.0 and uncorrupted_weight == 0.0:
+        raise ValueError("At least one depth-field positional loss weight must be positive.")
+
+    position_weights = torch.where(
+        corrupted,
+        corrupted.new_full((), corrupted_weight, dtype=loss_per_bin.dtype),
+        corrupted.new_full((), uncorrupted_weight, dtype=loss_per_bin.dtype),
+    )
+    denominator = position_weights.sum().clamp_min(torch.finfo(position_weights.dtype).tiny)
+    return (loss_per_bin * position_weights).sum() / denominator
+
+
 def _group_count(channels: int, max_groups: int = 8) -> int:
     for groups in range(min(max_groups, channels), 0, -1):
         if channels % groups == 0:
@@ -836,6 +863,8 @@ class DepthFieldDiffusion(nn.Module):
         random_replace_prob: float = 0.10,
         corruption_config: DepthFieldCorruptionConfig | dict | None = None,
         loss_on_corrupted_only: bool = False,
+        corrupted_loss_weight: float = 1.0,
+        uncorrupted_loss_weight: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         """Return a denoising CE loss dictionary."""
         batch_size = int(clean_fields.size(0))
@@ -858,11 +887,13 @@ class DepthFieldDiffusion(nn.Module):
             reduction="none",
         ).view_as(clean_fields)
 
-        if loss_on_corrupted_only:
-            denom = corrupted.float().sum().clamp_min(1.0)
-            loss = (loss_per_bin * corrupted.float()).sum() / denom
-        else:
-            loss = loss_per_bin.mean()
+        loss = weighted_depth_field_loss(
+            loss_per_bin,
+            corrupted,
+            corrupted_loss_weight=corrupted_loss_weight,
+            uncorrupted_loss_weight=uncorrupted_loss_weight,
+            loss_on_corrupted_only=loss_on_corrupted_only,
+        )
 
         return {
             "loss": loss,

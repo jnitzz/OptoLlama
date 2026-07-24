@@ -193,6 +193,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Compute CE only on bins that were masked/replaced. Default supervises every bin.",
     )
+    parser.add_argument(
+        "--corrupted-loss-weight",
+        type=float,
+        default=None,
+        help="Relative CE weight for bins changed by corruption.",
+    )
+    parser.add_argument(
+        "--uncorrupted-loss-weight",
+        type=float,
+        default=None,
+        help="Relative CE weight for bins left unchanged by corruption.",
+    )
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint to resume.")
     parser.add_argument(
         "--reset-optimizer-on-resume",
@@ -498,6 +510,16 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         "loss_on_corrupted_only",
         nested_required(block, "TRAIN", "LOSS_ON_CORRUPTED_ONLY"),
         "DEPTH_FIELD.TRAIN.LOSS_ON_CORRUPTED_ONLY",
+    )
+    set_arg_default(
+        args,
+        "corrupted_loss_weight",
+        nested_get(block, "TRAIN", "CORRUPTED_LOSS_WEIGHT", default=1.0),
+    )
+    set_arg_default(
+        args,
+        "uncorrupted_loss_weight",
+        nested_get(block, "TRAIN", "UNCORRUPTED_LOSS_WEIGHT", default=1.0),
     )
 
     set_arg_config_required(args, "eval_mode", nested_required(block, "EVAL", "MODE"), "DEPTH_FIELD.EVAL.MODE")
@@ -918,6 +940,8 @@ def depth_field_training_loss(
     random_replace_prob: float = 0.10,
     corruption_config: optollama.model.DepthFieldCorruptionConfig | dict | None = None,
     loss_on_corrupted_only: bool = False,
+    corrupted_loss_weight: float = 1.0,
+    uncorrupted_loss_weight: float = 1.0,
     timestep_schedule: dict[str, Any] | None = None,
     global_samples_seen: int = 0,
 ) -> dict[str, torch.Tensor]:
@@ -948,11 +972,13 @@ def depth_field_training_loss(
         reduction="none",
     ).view_as(clean_fields)
 
-    if loss_on_corrupted_only:
-        denom = corrupted.float().sum().clamp_min(1.0)
-        loss = (loss_per_bin * corrupted.float()).sum() / denom
-    else:
-        loss = loss_per_bin.mean()
+    loss = optollama.model.weighted_depth_field_loss(
+        loss_per_bin,
+        corrupted,
+        corrupted_loss_weight=corrupted_loss_weight,
+        uncorrupted_loss_weight=uncorrupted_loss_weight,
+        loss_on_corrupted_only=loss_on_corrupted_only,
+    )
 
     return {
         "loss": loss,
@@ -1630,6 +1656,8 @@ def run_epoch(
                     random_replace_prob=args.random_replace_prob,
                     corruption_config=args.corruption_config,
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
+                    corrupted_loss_weight=args.corrupted_loss_weight,
+                    uncorrupted_loss_weight=args.uncorrupted_loss_weight,
                     timestep_schedule=timestep_schedule,
                     global_samples_seen=global_samples_before,
                 )
@@ -1740,6 +1768,8 @@ def run_epoch(
                     random_replace_prob=args.random_replace_prob,
                     corruption_config=args.corruption_config,
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
+                    corrupted_loss_weight=args.corrupted_loss_weight,
+                    uncorrupted_loss_weight=args.uncorrupted_loss_weight,
                 )
             loss = out["loss"]
             if not count_batch_metrics:
@@ -2219,6 +2249,8 @@ def main() -> None:
             f"ddp={ddp}, world={world_size}, {model_desc}, "
             f"corruption={args.corruption_config.mode}, "
             f"random_replace={args.random_replace_prob:g}/{args.corruption_config.random_replace_schedule}, "
+            f"loss_weights={args.corrupted_loss_weight:g}:"
+            f"{0.0 if args.loss_on_corrupted_only else args.uncorrupted_loss_weight:g}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
             f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
         )

@@ -5,6 +5,7 @@ from unittest import mock
 
 import torch
 
+from optollama.model.depth_field_diffusion import weighted_depth_field_loss
 from optollama.model.optollama import AdaLayerNormGaussian
 from scripts.train_depth_field_diffusion import (
     finite_tensor_stats,
@@ -19,6 +20,47 @@ from scripts.train_depth_field_diffusion import (
 
 
 class DepthFieldTrainingSafetyTests(unittest.TestCase):
+    def test_mixed_depth_field_loss_weights_clean_and_corrupted_bins(self) -> None:
+        per_bin = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        corrupted = torch.tensor([[True, True, False, False]])
+
+        mixed = weighted_depth_field_loss(
+            per_bin,
+            corrupted,
+            corrupted_loss_weight=1.0,
+            uncorrupted_loss_weight=0.1,
+        )
+        strict = weighted_depth_field_loss(
+            per_bin,
+            corrupted,
+            corrupted_loss_weight=1.0,
+            uncorrupted_loss_weight=0.1,
+            loss_on_corrupted_only=True,
+        )
+        clean_only = weighted_depth_field_loss(
+            torch.tensor([[4.0]]),
+            torch.tensor([[False]]),
+            corrupted_loss_weight=1.0,
+            uncorrupted_loss_weight=0.1,
+        )
+
+        self.assertAlmostEqual(float(mixed), 3.7 / 2.2, places=6)
+        self.assertAlmostEqual(float(strict), 1.5, places=6)
+        self.assertAlmostEqual(float(clean_only), 4.0, places=6)
+
+    def test_mixed_depth_field_loss_rejects_invalid_weights(self) -> None:
+        per_bin = torch.ones((1, 2))
+        corrupted = torch.tensor([[True, False]])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            weighted_depth_field_loss(per_bin, corrupted, corrupted_loss_weight=-1.0)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            weighted_depth_field_loss(
+                per_bin,
+                corrupted,
+                corrupted_loss_weight=0.0,
+                uncorrupted_loss_weight=0.0,
+            )
+
     def test_amp_dtype_aliases_and_cpu_disable(self) -> None:
         self.assertEqual(normalize_amp_dtype("fp16"), "float16")
         self.assertEqual(normalize_amp_dtype("bf16"), "bfloat16")
@@ -127,6 +169,8 @@ class DepthFieldTrainingSafetyTests(unittest.TestCase):
             random_replace_prob=0.15,
             corruption_config=None,
             loss_on_corrupted_only=False,
+            corrupted_loss_weight=1.0,
+            uncorrupted_loss_weight=1.0,
         )
         vocab = SimpleNamespace(void_id=1)
         with (
