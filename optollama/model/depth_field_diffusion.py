@@ -138,12 +138,16 @@ def _normalize_model_type(model_type: str | None) -> str:
         "optollama_windowed_depth_v3": "optollama_depth_windowed_v3",
         "windowed_optollama_depth_v3": "optollama_depth_windowed_v3",
         "windowed_depth_v3": "optollama_depth_windowed_v3",
+        "hybrid": "optollama_depth_hybrid",
+        "depth_hybrid": "optollama_depth_hybrid",
+        "optollama_depth_hybrid": "optollama_depth_hybrid",
+        "optollama_hybrid_depth": "optollama_depth_hybrid",
     }
     if value not in aliases:
         raise ValueError(
             f"Unknown depth-field model_type={model_type!r}; expected 'conv', 'attention', "
             "'optollama_depth', 'optollama_depth_windowed', 'optollama_depth_windowed_v2', "
-            "or 'optollama_depth_windowed_v3'."
+            "'optollama_depth_windowed_v3', or 'optollama_depth_hybrid'."
         )
     return aliases[value]
 
@@ -428,6 +432,63 @@ class DepthFieldBlock(nn.Module):
         return x + h
 
 
+class InterleavedDepthConvBlock(nn.Module):
+    """Residual depth-axis refinement inserted after a transformer block."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+        conv_type: str,
+        residual_init: float,
+    ) -> None:
+        super().__init__()
+        channels = int(channels)
+        dilation = int(dilation)
+        padding = dilation * (int(kernel_size) // 2)
+        groups = _group_count(channels)
+        conv_type = _normalize_conv_type(conv_type)
+
+        self.dilation = dilation
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = _make_depth_conv(
+            channels,
+            kernel_size=int(kernel_size),
+            padding=padding,
+            dilation=dilation,
+            conv_type=conv_type,
+        )
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.dropout = nn.Dropout(float(dropout))
+        self.conv2 = _make_depth_conv(
+            channels,
+            kernel_size=int(kernel_size),
+            padding=padding,
+            dilation=dilation,
+            conv_type=conv_type,
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(float(residual_init)))
+
+    def forward(
+        self,
+        depth_tokens: torch.Tensor,
+        time_condition: torch.Tensor,
+        spectrum_condition: torch.Tensor,
+    ) -> torch.Tensor:
+        """Refine transformer states while preserving their global residual path."""
+        target_length = int(depth_tokens.size(1))
+        x = depth_tokens.transpose(1, 2).contiguous()
+        h = self.conv1(functional.silu(self.norm1(x)))
+        h = _match_depth_length(h, target_length)
+        h = h + time_condition.unsqueeze(-1) + spectrum_condition.unsqueeze(-1)
+        h = self.conv2(self.dropout(functional.silu(self.norm2(h))))
+        h = _match_depth_length(h, target_length)
+        return depth_tokens + self.residual_scale.to(dtype=h.dtype) * h.transpose(1, 2).contiguous()
+
+
 class DepthFieldAttentionBlock(nn.Module):
     """Conditioned self-attention block for a complete depth-field sequence."""
 
@@ -627,6 +688,8 @@ class DepthFieldModelConfig:
     timesteps: int = 100
     dropout: float = 0.0
     conv_type: str = "full"
+    hybrid_dilations: tuple[int, ...] = ()
+    hybrid_residual_init: float = 1.0e-3
     spectrum_patch_size: int = 8
     spectrum_patch_stride: int = 4
     spectrum_encoder_blocks: int = 2
@@ -634,8 +697,18 @@ class DepthFieldModelConfig:
     spectrum_ffn_multiplier: float = 2.0
 
     def __post_init__(self) -> None:
+        """Normalize aliases and validate constructor settings."""
         object.__setattr__(self, "model_type", _normalize_model_type(self.model_type))
         object.__setattr__(self, "conv_type", _normalize_conv_type(self.conv_type))
+        hybrid_dilations = tuple(int(value) for value in self.hybrid_dilations)
+        if not hybrid_dilations:
+            base_dilations = (1, 2, 4, 8, 16, 32, 64)
+            hybrid_dilations = tuple(
+                base_dilations[min(index, len(base_dilations) - 1)]
+                for index in range(int(self.n_blocks))
+            )
+        object.__setattr__(self, "hybrid_dilations", hybrid_dilations)
+        object.__setattr__(self, "hybrid_residual_init", float(self.hybrid_residual_init))
         object.__setattr__(self, "n_heads", int(self.n_heads))
         object.__setattr__(self, "ffn_multiplier", float(self.ffn_multiplier))
         object.__setattr__(self, "spectrum_patch_size", int(self.spectrum_patch_size))
@@ -653,6 +726,7 @@ class DepthFieldModelConfig:
             "optollama_depth_windowed",
             "optollama_depth_windowed_v2",
             "optollama_depth_windowed_v3",
+            "optollama_depth_hybrid",
         }
         if self.model_type in attention_models and int(self.d_model) % int(self.n_heads) != 0:
             raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
@@ -666,10 +740,22 @@ class DepthFieldModelConfig:
             raise ValueError(f"spectrum_encoder_heads must be positive, got {self.spectrum_encoder_heads}.")
         if float(self.spectrum_ffn_multiplier) <= 0.0:
             raise ValueError(f"spectrum_ffn_multiplier must be positive, got {self.spectrum_ffn_multiplier}.")
+        if any(dilation <= 0 for dilation in self.hybrid_dilations):
+            raise ValueError(f"hybrid_dilations must contain only positive integers, got {self.hybrid_dilations}.")
+        if not math.isfinite(self.hybrid_residual_init) or self.hybrid_residual_init < 0.0:
+            raise ValueError(
+                f"hybrid_residual_init must be finite and non-negative, got {self.hybrid_residual_init}."
+            )
+        if self.model_type == "optollama_depth_hybrid" and len(self.hybrid_dilations) != int(self.n_blocks):
+            raise ValueError(
+                "Hybrid model requires one dilation per transformer block; "
+                f"got {len(self.hybrid_dilations)} dilations for n_blocks={self.n_blocks}."
+            )
         windowed_models = {
             "optollama_depth_windowed",
             "optollama_depth_windowed_v2",
             "optollama_depth_windowed_v3",
+            "optollama_depth_hybrid",
         }
         if self.model_type in windowed_models and int(self.d_model) % int(self.spectrum_encoder_heads) != 0:
             raise ValueError(
@@ -691,6 +777,8 @@ class DepthFieldModelConfig:
             "timesteps": int(self.timesteps),
             "dropout": float(self.dropout),
             "conv_type": _normalize_conv_type(self.conv_type),
+            "hybrid_dilations": list(self.hybrid_dilations),
+            "hybrid_residual_init": float(self.hybrid_residual_init),
             "spectrum_patch_size": int(self.spectrum_patch_size),
             "spectrum_patch_stride": int(self.spectrum_patch_stride),
             "spectrum_encoder_blocks": int(self.spectrum_encoder_blocks),
@@ -714,6 +802,8 @@ class DepthFieldModelConfig:
             timesteps=int(data.get("timesteps", 100)),
             dropout=float(data.get("dropout", 0.0)),
             conv_type=_normalize_conv_type(data.get("conv_type", "full")),
+            hybrid_dilations=tuple(int(value) for value in data.get("hybrid_dilations", ())),
+            hybrid_residual_init=float(data.get("hybrid_residual_init", 1.0e-3)),
             spectrum_patch_size=int(data.get("spectrum_patch_size", 8)),
             spectrum_patch_stride=int(data.get("spectrum_patch_stride", 4)),
             spectrum_encoder_blocks=int(data.get("spectrum_encoder_blocks", 2)),
@@ -1198,6 +1288,17 @@ class DepthFieldOptoLlamaDiffusion(DepthFieldDiffusion):
         """Project final depth states using the legacy OptoLlama output head."""
         return self.output(depth_tokens)
 
+    def _run_depth_blocks(
+        self,
+        depth_tokens: torch.Tensor,
+        spectrum_tokens: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the configured depth-token backbone."""
+        for block in self.blocks:
+            depth_tokens = block(depth_tokens, spectrum_tokens, cond)
+        return depth_tokens
+
     def forward(self, spectra: torch.Tensor, noised_fields: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Predict clean material logits with OptoLlama-style conditioning."""
         if spectra.shape[1:] != self.spectrum_shape:
@@ -1214,8 +1315,7 @@ class DepthFieldOptoLlamaDiffusion(DepthFieldDiffusion):
         depth_tokens = depth_tokens + time_token.to(dtype=depth_tokens.dtype)
         cond = self._block_condition(spectrum_tokens, time_token).to(dtype=depth_tokens.dtype)
 
-        for block in self.blocks:
-            depth_tokens = block(depth_tokens, spectrum_tokens, cond)
+        depth_tokens = self._run_depth_blocks(depth_tokens, spectrum_tokens, cond)
         return self._output_logits(depth_tokens)
 
 
@@ -1293,9 +1393,58 @@ class DepthFieldWindowedOptoLlamaV3Diffusion(DepthFieldWindowedOptoLlamaV2Diffus
         return time_token.squeeze(1)
 
 
+class DepthFieldHybridDiffusion(DepthFieldWindowedOptoLlamaV3Diffusion):
+    """Windowed transformer with interleaved conditioned depth-axis convolutions."""
+
+    def __init__(self, config: DepthFieldModelConfig) -> None:
+        super().__init__(config)
+        self.hybrid_dilations = tuple(int(value) for value in config.hybrid_dilations)
+        self.conv_time_condition = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.conv_spectrum_condition = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.conv_blocks = nn.ModuleList(
+            [
+                InterleavedDepthConvBlock(
+                    self.d_model,
+                    kernel_size=int(config.kernel_size),
+                    dilation=dilation,
+                    dropout=float(config.dropout),
+                    conv_type=config.conv_type,
+                    residual_init=float(config.hybrid_residual_init),
+                )
+                for dilation in self.hybrid_dilations
+            ]
+        )
+
+    @property
+    def convolution_receptive_field_bins(self) -> int:
+        """Return the nominal receptive field of the sequential convolution path."""
+        return 1 + 2 * (int(self.config.kernel_size) - 1) * sum(self.hybrid_dilations)
+
+    def _run_depth_blocks(
+        self,
+        depth_tokens: torch.Tensor,
+        spectrum_tokens: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        time_condition = self.conv_time_condition(cond).to(dtype=depth_tokens.dtype)
+        spectrum_condition = self.conv_spectrum_condition(spectrum_tokens[:, -1]).to(dtype=depth_tokens.dtype)
+        for transformer_block, conv_block in zip(self.blocks, self.conv_blocks, strict=True):
+            depth_tokens = transformer_block(depth_tokens, spectrum_tokens, cond)
+            depth_tokens = conv_block(depth_tokens, time_condition, spectrum_condition)
+        return depth_tokens
+
+
 def build_depth_field_model(config: DepthFieldModelConfig) -> DepthFieldDiffusion:
     """Build the configured depth-field diffusion model."""
     model_type = _normalize_model_type(config.model_type)
+    if model_type == "optollama_depth_hybrid":
+        return DepthFieldHybridDiffusion(config)
     if model_type == "optollama_depth_windowed_v3":
         return DepthFieldWindowedOptoLlamaV3Diffusion(config)
     if model_type == "optollama_depth_windowed_v2":

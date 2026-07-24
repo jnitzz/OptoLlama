@@ -104,13 +104,19 @@ def parse_args() -> argparse.Namespace:
             "optollama-windowed-depth-v3",
             "windowed_depth_v3",
             "windowed-depth-v3",
+            "hybrid",
+            "depth_hybrid",
+            "depth-hybrid",
+            "optollama_depth_hybrid",
+            "optollama-depth-hybrid",
         ],
         help=(
             "Depth-field backbone type. 'conv' uses dilated Conv1d blocks, 'attention' uses global self-attention, "
             "'optollama_depth' uses OptoLlama-style cross/self-attention blocks, and "
             "'optollama_depth_windowed' adds wavelength-window spectrum conditioning, and its V2 variant adds "
             "pooled-spectrum AdaLN conditioning plus final LayerNorm. V3 instead appends the pooled spectrum as "
-            "a global cross-attention token and keeps AdaLN timestep-only."
+            "a global cross-attention token and keeps AdaLN timestep-only. 'hybrid' interleaves V3 blocks with "
+            "conditioned depth-axis convolutions."
         ),
     )
     parser.add_argument("--d-model", type=int, default=None, help="Depth-field model channel width.")
@@ -122,6 +128,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=["full", "standard", "conv", "separable", "depthwise", "depthwise_separable", "depthwise-separable"],
         help="Depth-field residual convolution type. 'separable' uses depthwise + pointwise Conv1d.",
+    )
+    parser.add_argument(
+        "--hybrid-dilations",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One depth-axis convolution dilation per transformer block in the hybrid model.",
+    )
+    parser.add_argument(
+        "--hybrid-residual-init",
+        type=float,
+        default=None,
+        help="Initial residual scale for interleaved hybrid convolution blocks.",
     )
     parser.add_argument("--n-heads", type=int, default=None, help="Attention heads when --model-type=attention.")
     parser.add_argument("--ffn-multiplier", type=float, default=None, help="Attention feed-forward width multiplier.")
@@ -441,6 +460,12 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         args.kernel_size = nested_get(block, "MODEL", "KERNEL_SIZE", default=7)
     if args.conv_type is None:
         args.conv_type = nested_get(block, "MODEL", "CONV_TYPE", default="full")
+    set_arg_default(args, "hybrid_dilations", nested_get(block, "MODEL", "HYBRID_DILATIONS"))
+    set_arg_default(
+        args,
+        "hybrid_residual_init",
+        nested_get(block, "MODEL", "HYBRID_RESIDUAL_INIT", default=1.0e-3),
+    )
     if args.n_heads is None:
         args.n_heads = nested_get(block, "MODEL", "N_HEADS", default=8)
     if args.ffn_multiplier is None:
@@ -1970,6 +1995,8 @@ def main() -> None:
         n_heads=int(args.n_heads),
         ffn_multiplier=float(args.ffn_multiplier),
         conv_type=str(args.conv_type),
+        hybrid_dilations=tuple(int(value) for value in (args.hybrid_dilations or ())),
+        hybrid_residual_init=float(args.hybrid_residual_init),
         timesteps=int(args.diffusion_steps),
         dropout=float(args.dropout),
         spectrum_patch_size=int(args.spectrum_patch_size),
@@ -2221,6 +2248,7 @@ def main() -> None:
             "optollama_depth_windowed",
             "optollama_depth_windowed_v2",
             "optollama_depth_windowed_v3",
+            "optollama_depth_hybrid",
         }
         if model_config.model_type in transformer_models:
             model_desc += f", heads={model_config.n_heads}, ffn={model_config.ffn_multiplier:g}"
@@ -2230,6 +2258,7 @@ def main() -> None:
                 "optollama_depth_windowed",
                 "optollama_depth_windowed_v2",
                 "optollama_depth_windowed_v3",
+                "optollama_depth_hybrid",
             }:
                 model_desc += (
                     f", spectrum_patch={model_config.spectrum_patch_size}"
@@ -2240,6 +2269,15 @@ def main() -> None:
                 model_desc += ", pooled_spectrum_adaln=true, final_norm=true"
             elif model_config.model_type == "optollama_depth_windowed_v3":
                 model_desc += ", pooled_spectrum_token=true, adaln_condition=time_only, final_norm=true"
+            elif model_config.model_type == "optollama_depth_hybrid":
+                receptive_field_nm = (
+                    1 + 2 * (model_config.kernel_size - 1) * sum(model_config.hybrid_dilations)
+                ) * float(args.dz_nm)
+                model_desc += (
+                    ", pooled_spectrum_token=true, adaln_condition=time_only, final_norm=true, "
+                    f"interleaved_conv={model_config.conv_type}, dilations={list(model_config.hybrid_dilations)}, "
+                    f"conv_rf={receptive_field_nm:g}nm"
+                )
         else:
             model_desc += f", conv={model_config.conv_type}, kernel={model_config.kernel_size}"
         print(
