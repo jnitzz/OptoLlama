@@ -224,6 +224,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Relative CE weight for bins left unchanged by corruption.",
     )
+    parser.add_argument(
+        "--condition-dropout-prob",
+        type=float,
+        default=None,
+        help="Probability of replacing a complete target spectrum with the all-zero CFG condition during training.",
+    )
+    parser.add_argument(
+        "--boundary-loss",
+        dest="boundary_loss_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Increase CE weight around material transitions.",
+    )
+    parser.add_argument(
+        "--boundary-loss-radius-bins",
+        type=int,
+        default=None,
+        help="Number of bins to expand on each side of transition-adjacent bins.",
+    )
+    parser.add_argument(
+        "--boundary-loss-weight",
+        type=float,
+        default=None,
+        help="CE multiplier for bins selected by the boundary mask.",
+    )
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint to resume.")
     parser.add_argument(
         "--reset-optimizer-on-resume",
@@ -249,6 +274,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-sampling-steps", type=int, default=None, help="TMM validation denoising steps.")
     parser.add_argument("--eval-temperature", type=float, default=None, help="TMM validation sampling temperature.")
     parser.add_argument("--eval-top-k", type=int, default=None, help="TMM validation top-k material sampling filter.")
+    parser.add_argument(
+        "--eval-cfg-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale. 1 uses one conditional forward pass; other positive values use CFG.",
+    )
     parser.add_argument("--eval-deterministic", action=argparse.BooleanOptionalAction, default=None, help="Use argmax sampling for TMM validation.")
     parser.add_argument(
         "--eval-remask-strategy",
@@ -546,12 +577,22 @@ def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) ->
         "uncorrupted_loss_weight",
         nested_get(block, "TRAIN", "UNCORRUPTED_LOSS_WEIGHT", default=1.0),
     )
+    set_arg_default(
+        args,
+        "condition_dropout_prob",
+        nested_get(block, "TRAIN", "CONDITION_DROPOUT_PROB", default=0.0),
+    )
+    boundary_loss = nested_get(block, "TRAIN", "BOUNDARY_LOSS", default={}) or {}
+    set_arg_default(args, "boundary_loss_enabled", nested_get(boundary_loss, "ENABLED", default=False))
+    set_arg_default(args, "boundary_loss_radius_bins", nested_get(boundary_loss, "RADIUS_BINS", default=0))
+    set_arg_default(args, "boundary_loss_weight", nested_get(boundary_loss, "WEIGHT", default=1.0))
 
     set_arg_config_required(args, "eval_mode", nested_required(block, "EVAL", "MODE"), "DEPTH_FIELD.EVAL.MODE")
     set_arg_config_required(args, "eval_mc_samples", nested_required(block, "EVAL", "MC_SAMPLES"), "DEPTH_FIELD.EVAL.MC_SAMPLES")
     set_arg_config_required(args, "eval_sampling_steps", nested_required(block, "EVAL", "SAMPLING_STEPS"), "DEPTH_FIELD.EVAL.SAMPLING_STEPS")
     set_arg_config_required(args, "eval_temperature", nested_required(block, "EVAL", "TEMPERATURE"), "DEPTH_FIELD.EVAL.TEMPERATURE")
     set_arg_config_required(args, "eval_top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
+    set_arg_default(args, "eval_cfg_scale", nested_get(block, "EVAL", "CFG_SCALE", default=1.0))
     set_arg_config_required(args, "eval_deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
     set_arg_config_required(args, "eval_remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
     set_arg_config_required(args, "eval_tmm_device", nested_required(block, "EVAL", "TMM_DEVICE"), "DEPTH_FIELD.EVAL.TMM_DEVICE")
@@ -967,6 +1008,10 @@ def depth_field_training_loss(
     loss_on_corrupted_only: bool = False,
     corrupted_loss_weight: float = 1.0,
     uncorrupted_loss_weight: float = 1.0,
+    condition_dropout_prob: float = 0.0,
+    boundary_loss_enabled: bool = False,
+    boundary_loss_radius_bins: int = 0,
+    boundary_loss_weight: float = 1.0,
     timestep_schedule: dict[str, Any] | None = None,
     global_samples_seen: int = 0,
 ) -> dict[str, torch.Tensor]:
@@ -985,7 +1030,11 @@ def depth_field_training_loss(
         random_replace_prob=random_replace_prob,
         corruption_config=corruption_config,
     )
-    logits = model(spectra, noised_fields, timesteps)
+    conditioned_spectra, condition_dropped = optollama.model.drop_spectrum_condition(
+        spectra,
+        condition_dropout_prob,
+    )
+    logits = model(conditioned_spectra, noised_fields, timesteps)
 
     weights = torch.ones(int(core.num_materials), device=clean_fields.device, dtype=logits.dtype)
     if 0 <= int(void_id) < int(core.num_materials):
@@ -996,6 +1045,17 @@ def depth_field_training_loss(
         weight=weights,
         reduction="none",
     ).view_as(clean_fields)
+
+    boundary = optollama.model.depth_field_boundary_mask(clean_fields, boundary_loss_radius_bins)
+    boundary_weight = float(boundary_loss_weight)
+    if not math.isfinite(boundary_weight) or boundary_weight <= 0.0:
+        raise ValueError(f"boundary_loss_weight must be finite and positive, got {boundary_loss_weight}")
+    if boundary_loss_enabled:
+        loss_per_bin = loss_per_bin * torch.where(
+            boundary,
+            loss_per_bin.new_full((), boundary_weight),
+            loss_per_bin.new_ones(()),
+        )
 
     loss = optollama.model.weighted_depth_field_loss(
         loss_per_bin,
@@ -1011,6 +1071,8 @@ def depth_field_training_loss(
         "timesteps": timesteps,
         "noised_fields": noised_fields,
         "corrupted": corrupted,
+        "condition_dropped": condition_dropped,
+        "boundary": boundary,
     }
 
 
@@ -1363,6 +1425,7 @@ def run_tmm_evaluation(
             temperature=float(args.eval_temperature),
             top_k=int(args.eval_top_k),
             deterministic=bool(args.eval_deterministic or args.eval_temperature <= 0.0),
+            guidance_scale=float(args.eval_cfg_scale),
             remask_strategy=str(args.eval_remask_strategy),
             corruption_config=args.corruption_config,
         )
@@ -1505,6 +1568,7 @@ def run_tmm_evaluation(
         "samples_seen": int(target_totals[1].item()),
         "mc_samples": int(mc_samples),
         "sampling_steps": int(args.eval_sampling_steps or sample_model.timesteps),
+        "cfg_scale": float(args.eval_cfg_scale),
         "remask_strategy": str(args.eval_remask_strategy),
         "corruption": args.corruption_config.to_dict(),
         "tmm_batch_size": int(args.eval_tmm_batch_size),
@@ -1525,6 +1589,7 @@ def run_tmm_evaluation(
                     "mc_samples": int(mc_samples),
                     "score_mode": "field",
                     "rank_by": "field",
+                    "cfg_scale": float(args.eval_cfg_scale),
                     "remask_strategy": str(args.eval_remask_strategy),
                     "corruption": args.corruption_config.to_dict(),
                     "record_spectra": bool(args.eval_record_spectra),
@@ -1683,6 +1748,10 @@ def run_epoch(
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
                     corrupted_loss_weight=args.corrupted_loss_weight,
                     uncorrupted_loss_weight=args.uncorrupted_loss_weight,
+                    condition_dropout_prob=float(getattr(args, "condition_dropout_prob", 0.0)),
+                    boundary_loss_enabled=bool(getattr(args, "boundary_loss_enabled", False)),
+                    boundary_loss_radius_bins=int(getattr(args, "boundary_loss_radius_bins", 0)),
+                    boundary_loss_weight=float(getattr(args, "boundary_loss_weight", 1.0)),
                     timestep_schedule=timestep_schedule,
                     global_samples_seen=global_samples_before,
                 )
@@ -1795,6 +1864,10 @@ def run_epoch(
                     loss_on_corrupted_only=args.loss_on_corrupted_only,
                     corrupted_loss_weight=args.corrupted_loss_weight,
                     uncorrupted_loss_weight=args.uncorrupted_loss_weight,
+                    condition_dropout_prob=0.0,
+                    boundary_loss_enabled=bool(getattr(args, "boundary_loss_enabled", False)),
+                    boundary_loss_radius_bins=int(getattr(args, "boundary_loss_radius_bins", 0)),
+                    boundary_loss_weight=float(getattr(args, "boundary_loss_weight", 1.0)),
                 )
             loss = out["loss"]
             if not count_batch_metrics:
@@ -1894,6 +1967,7 @@ def make_checkpoint_extra(
             "eval_temperature": float(args.eval_temperature),
             "eval_top_k": int(args.eval_top_k),
             "eval_deterministic": bool(args.eval_deterministic),
+            "eval_cfg_scale": float(args.eval_cfg_scale),
             "eval_remask_strategy": str(args.eval_remask_strategy),
             "corruption": args.corruption_config.to_dict(),
             "eval_tmm_batch_size": int(args.eval_tmm_batch_size),
@@ -1908,6 +1982,15 @@ def make_checkpoint_extra(
         "train_schedules": {
             "lr": lr_schedule_config(cfg),
             "timestep": timestep_schedule_config(cfg),
+        },
+        "training_objective": {
+            "condition_dropout_prob": float(args.condition_dropout_prob),
+            "boundary_loss_enabled": bool(args.boundary_loss_enabled),
+            "boundary_loss_radius_bins": int(args.boundary_loss_radius_bins),
+            "boundary_loss_weight": float(args.boundary_loss_weight),
+            "loss_on_corrupted_only": bool(args.loss_on_corrupted_only),
+            "corrupted_loss_weight": float(args.corrupted_loss_weight),
+            "uncorrupted_loss_weight": float(args.uncorrupted_loss_weight),
         },
         "ema": {
             "enabled": ema is not None,
@@ -2289,8 +2372,11 @@ def main() -> None:
             f"random_replace={args.random_replace_prob:g}/{args.corruption_config.random_replace_schedule}, "
             f"loss_weights={args.corrupted_loss_weight:g}:"
             f"{0.0 if args.loss_on_corrupted_only else args.uncorrupted_loss_weight:g}, "
+            f"condition_dropout={args.condition_dropout_prob:g}, "
+            f"boundary_loss={args.boundary_loss_enabled}/{args.boundary_loss_radius_bins}/{args.boundary_loss_weight:g}, "
             f"eval_mc={args.eval_mc_samples}, eval_steps={args.eval_sampling_steps}, "
-            f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_remask={args.eval_remask_strategy}"
+            f"eval_temp={args.eval_temperature:g}, eval_top_k={args.eval_top_k}, eval_cfg={args.eval_cfg_scale:g}, "
+            f"eval_remask={args.eval_remask_strategy}"
         )
         if validate_every_samples > 0:
             print(f"Mid-epoch validation enabled every {validate_every_samples} global train samples.")

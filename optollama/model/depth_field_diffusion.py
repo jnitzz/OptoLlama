@@ -42,6 +42,49 @@ def weighted_depth_field_loss(
     return (loss_per_bin * position_weights).sum() / denominator
 
 
+def depth_field_boundary_mask(clean_fields: torch.Tensor, radius_bins: int = 0) -> torch.Tensor:
+    """Mark material bins at transitions and optionally expand around them."""
+    if clean_fields.dim() != 2:
+        raise ValueError(f"clean_fields must have shape [B,D], got {tuple(clean_fields.shape)}")
+    radius = int(radius_bins)
+    if radius < 0:
+        raise ValueError(f"radius_bins must be non-negative, got {radius_bins}")
+
+    mask = torch.zeros_like(clean_fields, dtype=torch.bool)
+    if clean_fields.size(1) > 1:
+        transitions = clean_fields[:, 1:] != clean_fields[:, :-1]
+        mask[:, :-1] |= transitions
+        mask[:, 1:] |= transitions
+    if radius > 0:
+        mask = functional.max_pool1d(
+            mask.unsqueeze(1).to(dtype=torch.float32),
+            kernel_size=2 * radius + 1,
+            stride=1,
+            padding=radius,
+        ).squeeze(1).bool()
+    return mask
+
+
+def drop_spectrum_condition(
+    spectra: torch.Tensor,
+    probability: float,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace complete spectrum conditions with the all-zero CFG null condition."""
+    dropout_probability = float(probability)
+    if not math.isfinite(dropout_probability) or not 0.0 <= dropout_probability <= 1.0:
+        raise ValueError(f"condition dropout probability must be finite and in [0, 1], got {probability}")
+
+    dropped = torch.zeros(spectra.size(0), dtype=torch.bool, device=spectra.device)
+    if dropout_probability == 0.0:
+        return spectra, dropped
+    dropped = torch.rand(spectra.size(0), device=spectra.device, generator=generator) < dropout_probability
+    broadcast_shape = (spectra.size(0),) + (1,) * (spectra.dim() - 1)
+    conditioned = spectra.masked_fill(dropped.view(broadcast_shape), 0.0)
+    return conditioned, dropped
+
+
 def _group_count(channels: int, max_groups: int = 8) -> int:
     for groups in range(min(max_groups, channels), 0, -1):
         if channels % groups == 0:
@@ -955,6 +998,10 @@ class DepthFieldDiffusion(nn.Module):
         loss_on_corrupted_only: bool = False,
         corrupted_loss_weight: float = 1.0,
         uncorrupted_loss_weight: float = 1.0,
+        condition_dropout_prob: float = 0.0,
+        boundary_loss_enabled: bool = False,
+        boundary_loss_radius_bins: int = 0,
+        boundary_loss_weight: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         """Return a denoising CE loss dictionary."""
         batch_size = int(clean_fields.size(0))
@@ -965,7 +1012,8 @@ class DepthFieldDiffusion(nn.Module):
             random_replace_prob=random_replace_prob,
             corruption_config=corruption_config,
         )
-        logits = self(spectra, noised_fields, timesteps)
+        conditioned_spectra, condition_dropped = drop_spectrum_condition(spectra, condition_dropout_prob)
+        logits = self(conditioned_spectra, noised_fields, timesteps)
 
         weights = torch.ones(self.num_materials, device=clean_fields.device, dtype=logits.dtype)
         if 0 <= int(void_id) < self.num_materials:
@@ -976,6 +1024,17 @@ class DepthFieldDiffusion(nn.Module):
             weight=weights,
             reduction="none",
         ).view_as(clean_fields)
+
+        boundary = depth_field_boundary_mask(clean_fields, boundary_loss_radius_bins)
+        boundary_weight = float(boundary_loss_weight)
+        if not math.isfinite(boundary_weight) or boundary_weight <= 0.0:
+            raise ValueError(f"boundary_loss_weight must be finite and positive, got {boundary_loss_weight}")
+        if boundary_loss_enabled:
+            loss_per_bin = loss_per_bin * torch.where(
+                boundary,
+                loss_per_bin.new_full((), boundary_weight),
+                loss_per_bin.new_ones(()),
+            )
 
         loss = weighted_depth_field_loss(
             loss_per_bin,
@@ -991,6 +1050,8 @@ class DepthFieldDiffusion(nn.Module):
             "timesteps": timesteps,
             "noised_fields": noised_fields,
             "corrupted": corrupted,
+            "condition_dropped": condition_dropped,
+            "boundary": boundary,
         }
 
     @staticmethod
@@ -1066,6 +1127,7 @@ class DepthFieldDiffusion(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         deterministic: bool = False,
+        guidance_scale: float = 1.0,
         remask_strategy: str = "confidence",
         corruption_config: DepthFieldCorruptionConfig | dict | None = None,
         generator: torch.Generator | None = None,
@@ -1082,6 +1144,9 @@ class DepthFieldDiffusion(nn.Module):
         batch_size = int(spectra.size(0))
         device = spectra.device
         remask_strategy = self._normalize_remask_strategy(remask_strategy)
+        guidance_scale_value = float(guidance_scale)
+        if not math.isfinite(guidance_scale_value) or guidance_scale_value < 0.0:
+            raise ValueError(f"guidance_scale must be finite and non-negative, got {guidance_scale}")
         fields = torch.full((batch_size, self.depth_bins), int(self.mask_id), dtype=torch.long, device=device)
 
         total_steps = int(steps or self.timesteps)
@@ -1095,7 +1160,14 @@ class DepthFieldDiffusion(nn.Module):
         first_repaired_step = torch.full((), len(step_values), dtype=torch.long, device=device)
         for step_idx, timestep in enumerate(step_values):
             timesteps = torch.full((batch_size,), int(timestep.item()), dtype=torch.long, device=device)
-            logits = self(spectra, fields, timesteps)
+            if guidance_scale_value == 1.0:
+                logits = self(spectra, fields, timesteps)
+            elif guidance_scale_value == 0.0:
+                logits = self(torch.zeros_like(spectra), fields, timesteps)
+            else:
+                conditional_logits = self(spectra, fields, timesteps)
+                unconditional_logits = self(torch.zeros_like(spectra), fields, timesteps)
+                logits = unconditional_logits + guidance_scale_value * (conditional_logits - unconditional_logits)
             pred, confidence, repaired = self._sample_logits(
                 logits,
                 temperature=temperature,

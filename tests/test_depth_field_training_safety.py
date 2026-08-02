@@ -1,3 +1,4 @@
+import math
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,9 +6,10 @@ from unittest import mock
 
 import torch
 
-from optollama.model.depth_field_diffusion import weighted_depth_field_loss
+from optollama.model.depth_field_diffusion import depth_field_boundary_mask, weighted_depth_field_loss
 from optollama.model.optollama import AdaLayerNormGaussian
 from scripts.train_depth_field_diffusion import (
+    depth_field_training_loss,
     finite_tensor_stats,
     first_nonfinite_model_tensor,
     first_nonfinite_optimizer_tensor,
@@ -20,6 +22,55 @@ from scripts.train_depth_field_diffusion import (
 
 
 class DepthFieldTrainingSafetyTests(unittest.TestCase):
+    def test_boundary_mask_marks_transition_context(self) -> None:
+        fields = torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]])
+
+        adjacent = depth_field_boundary_mask(fields, radius_bins=0)
+        expanded = depth_field_boundary_mask(fields, radius_bins=1)
+
+        self.assertEqual(adjacent.tolist(), [[False, True, True, False, True, True, False, False]])
+        self.assertEqual(expanded.tolist(), [[True, True, True, True, True, True, True, False]])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            depth_field_boundary_mask(fields, radius_bins=-1)
+
+    def test_training_loss_applies_boundary_weight_and_null_condition_dropout(self) -> None:
+        class UniformModel(torch.nn.Module):
+            timesteps = 1
+            num_materials = 2
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.last_spectra = None
+
+            def corrupt(self, clean_fields, _timesteps, **_kwargs):
+                return clean_fields, torch.ones_like(clean_fields, dtype=torch.bool)
+
+            def forward(self, spectra, clean_fields, _timesteps):
+                self.last_spectra = spectra
+                return torch.zeros((*clean_fields.shape, self.num_materials), device=clean_fields.device)
+
+        spectra = torch.ones((1, 3, 4))
+        fields = torch.tensor([[0, 0, 1, 1]])
+        model = UniformModel()
+
+        baseline = depth_field_training_loss(model, spectra, fields, void_id=-1)
+        weighted = depth_field_training_loss(
+            model,
+            spectra,
+            fields,
+            void_id=-1,
+            condition_dropout_prob=1.0,
+            boundary_loss_enabled=True,
+            boundary_loss_radius_bins=0,
+            boundary_loss_weight=2.0,
+        )
+
+        self.assertAlmostEqual(float(baseline["loss"]), math.log(2.0), places=6)
+        self.assertAlmostEqual(float(weighted["loss"]), 1.5 * math.log(2.0), places=6)
+        self.assertTrue(torch.all(model.last_spectra == 0.0))
+        self.assertEqual(weighted["condition_dropped"].tolist(), [True])
+        self.assertEqual(weighted["boundary"].tolist(), [[False, True, True, False]])
+
     def test_mixed_depth_field_loss_weights_clean_and_corrupted_bins(self) -> None:
         per_bin = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
         corrupted = torch.tensor([[True, True, False, False]])

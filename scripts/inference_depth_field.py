@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling-steps", type=int, default=None, help="Denoising steps. Required unless DEPTH_FIELD.EVAL.SAMPLING_STEPS is set.")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature. <=0 uses argmax.")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k material sampling filter. 0 disables.")
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale. 1 uses one conditional forward pass; other positive values use CFG.",
+    )
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=None, help="Use argmax instead of sampling.")
     parser.add_argument(
         "--remask-strategy",
@@ -184,6 +190,8 @@ def apply_depth_field_eval_defaults(cfg: dict[str, Any], args: argparse.Namespac
     set_arg_config_required(args, "sampling_steps", nested_required(block, "EVAL", "SAMPLING_STEPS"), "DEPTH_FIELD.EVAL.SAMPLING_STEPS")
     set_arg_config_required(args, "temperature", nested_required(block, "EVAL", "TEMPERATURE"), "DEPTH_FIELD.EVAL.TEMPERATURE")
     set_arg_config_required(args, "top_k", nested_required(block, "EVAL", "TOP_K"), "DEPTH_FIELD.EVAL.TOP_K")
+    if args.cfg_scale is None:
+        args.cfg_scale = nested_get(block, "EVAL", "CFG_SCALE", default=1.0)
     set_arg_config_required(args, "deterministic", nested_required(block, "EVAL", "DETERMINISTIC"), "DEPTH_FIELD.EVAL.DETERMINISTIC")
     set_arg_config_required(args, "remask_strategy", nested_required(block, "EVAL", "REMASK_STRATEGY"), "DEPTH_FIELD.EVAL.REMASK_STRATEGY")
     corruption = nested_get(block, "CORRUPTION", default={}) or {}
@@ -627,7 +635,8 @@ def run_depth_field_inference(
         f"{'target=' + target if target is not None else 'split=' + args.split}, "
         f"mc={mc_samples}, bins={model.depth_bins}, dz={dz_nm:g}nm, "
         f"max={max_thickness_nm:g}nm, score_mode={score_mode}, rank_by={rank_by}, "
-        f"remask={args.remask_strategy}, corruption={args.corruption_config.mode}, mc_batch={mc_batch_size}, "
+        f"remask={args.remask_strategy}, cfg={args.cfg_scale:g}, corruption={args.corruption_config.mode}, "
+        f"mc_batch={mc_batch_size}, "
         f"model_device={device}, tmm_device={tmm_device}"
     )
 
@@ -663,6 +672,7 @@ def run_depth_field_inference(
                 temperature=float(args.temperature),
                 top_k=int(args.top_k),
                 deterministic=bool(args.deterministic or args.temperature <= 0.0),
+                guidance_scale=float(args.cfg_scale),
                 remask_strategy=str(args.remask_strategy),
                 corruption_config=args.corruption_config,
             )
@@ -817,6 +827,7 @@ def run_depth_field_inference(
         "mc_samples": mc_samples,
         "score_mode": score_mode,
         "rank_by": rank_by,
+        "cfg_scale": float(args.cfg_scale),
         "remask_strategy": str(args.remask_strategy),
         "corruption": args.corruption_config.to_dict(),
         "mae_mean": float(torch.tensor(mae_all).mean().item()) if mae_all else None,

@@ -68,6 +68,41 @@ class DepthFieldSamplingTests(unittest.TestCase):
         self.assertEqual(self.model._last_sampling_nonfinite_positions, 8)
         self.assertEqual(self.model._last_sampling_first_nonfinite_step, 0)
 
+    def test_classifier_free_guidance_uses_null_spectrum_and_skips_extra_pass_at_one(self) -> None:
+        spectra = torch.ones((1, 3, 8))
+        calls: list[bool] = []
+
+        def guided_forward(current_spectra, fields, _timesteps):
+            conditioned = bool(current_spectra.abs().sum().item() > 0.0)
+            calls.append(conditioned)
+            logits = torch.zeros((fields.size(0), fields.size(1), 4))
+            logits[..., 0 if conditioned else 1] = 2.0
+            return logits
+
+        with mock.patch.object(self.model, "forward", side_effect=guided_forward):
+            conditional = self.model.sample(spectra, steps=2, deterministic=True, guidance_scale=1.0)
+            conditional_calls = list(calls)
+            calls.clear()
+            unconditional = self.model.sample(spectra, steps=2, deterministic=True, guidance_scale=0.0)
+            unconditional_calls = list(calls)
+            calls.clear()
+            guided = self.model.sample(spectra, steps=2, deterministic=True, guidance_scale=2.0)
+            guided_calls = list(calls)
+
+        self.assertTrue(torch.all(conditional == 0))
+        self.assertTrue(torch.all(unconditional == 1))
+        self.assertTrue(torch.all(guided == 0))
+        self.assertEqual(conditional_calls, [True, True])
+        self.assertEqual(unconditional_calls, [False, False])
+        self.assertEqual(guided_calls, [True, False, True, False])
+
+    def test_classifier_free_guidance_rejects_invalid_scale(self) -> None:
+        spectra = torch.ones((1, 3, 8))
+        with self.assertRaisesRegex(ValueError, "guidance_scale"):
+            self.model.sample(spectra, guidance_scale=-1.0)
+        with self.assertRaisesRegex(ValueError, "guidance_scale"):
+            self.model.sample(spectra, guidance_scale=float("nan"))
+
 
 if __name__ == "__main__":
     unittest.main()
