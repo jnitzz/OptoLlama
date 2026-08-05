@@ -1,0 +1,60 @@
+EXPERIMENT:
+  MODEL: depth_field_spectrum_surrogate
+  RUN: DF_SPECTRUM_SURROGATE_10UM_01
+  SEED: 3
+
+PATHS:
+  DATA_PATH: E:/repos/OptoLlama/data # /scratch/htc/jschaibl/repos/OptoLlama/data
+  MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
+  TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
+  OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
+  TRAIN:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/00
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/01
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/02
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/03
+  TEST:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_test
+
+DATA_LOADING:
+  NUM_WORKERS: 8
+  SHARDED_LOADING: true
+  NUM_SAMPLES_TRAIN: 20000000
+  NUM_SAMPLES_TEST: 512
+  TRAIN_BATCH_SIZE: 64
+  TEST_BATCH_SIZE: 32
+
+SPECTRAL_GRID:
+  WAVELENGTH_MIN: 300
+  WAVELENGTH_MAX: 1700
+  WAVELENGTH_STEPS: 5
+
+DEPTH_FIELD:
+  DZ_NM: 5
+  MAX_THICKNESS_NM: 10000
+
+DEPTH_FIELD_SURROGATE:
+  OUT_DIR: ${PATHS.OUTPUT_PATH}
+  DZ_NM: ${DEPTH_FIELD.DZ_NM}
+  MAX_THICKNESS_NM: ${DEPTH_FIELD.MAX_THICKNESS_NM}
+  RESUME: null
+  VAL_BATCH_SIZE: 32
+  MODEL:
+    D_MODEL: 128
+    KERNEL_SIZE: 7
+    CONV_DILATIONS: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    DEPTH_POOL: 16
+    DECODER_BLOCKS: 2
+    DECODER_HEADS: 8
+    FFN_MULTIPLIER: 2.0
+    DROPOUT: 0.0
+  TRAIN:
+    AMP: true
+    AMP_DTYPE: auto # auto | float16/fp16 | bfloat16/bf16
+    EPOCHS: 3
+    LEARNING_RATE: 0.0002
+    WEIGHT_DECAY: 0.01
+    GRAD_CLIP: 1.0
+  LOSS:
+    HUBER_DELTA: 0.02 # SmoothL1/normalized-Huber transition point
+    DERIVATIVE_WEIGHT: 0.25

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 from collections.abc import Callable
@@ -250,6 +251,7 @@ def parse_args() -> argparse.Namespace:
         help="CE multiplier for bins selected by the boundary mask.",
     )
     parser.add_argument("--resume", type=str, default=None, help="Optional checkpoint to resume.")
+    parser.add_argument("--init-from", type=str, default=None, help="Initialize model weights for a new fine-tuning run.")
     parser.add_argument(
         "--reset-optimizer-on-resume",
         action=argparse.BooleanOptionalAction,
@@ -261,6 +263,22 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Rotate a recovery checkpoint after every finite mid-training validation.",
+    )
+    parser.add_argument(
+        "--spectral-aux",
+        dest="spectral_aux_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the frozen field-to-spectrum auxiliary training loss.",
+    )
+    parser.add_argument("--spectral-aux-checkpoint", type=str, default=None, help="Forward-surrogate checkpoint.")
+    parser.add_argument("--spectral-aux-weight", type=float, default=None, help="Maximum spectral auxiliary loss weight.")
+    parser.add_argument("--spectral-aux-every-n-steps", type=int, default=None, help="Apply spectral loss every N train steps.")
+    parser.add_argument(
+        "--spectral-aux-max-samples-per-rank",
+        type=int,
+        default=None,
+        help="Maximum eligible local samples sent through the surrogate on an auxiliary step.",
     )
     parser.add_argument("--save-every", type=int, default=1, help="Save the last checkpoint every N epochs.")
     parser.add_argument(
@@ -476,6 +494,85 @@ def resolve_resume_checkpoint(
     return None, None, False
 
 
+def resolve_init_checkpoint(cfg: dict[str, Any], args: argparse.Namespace) -> tuple[Path | None, str | None]:
+    """Resolve a weights-only initialization checkpoint for a new run."""
+    if args.init_from:
+        return Path(args.init_from), "--init-from"
+    checkpoint_cfg = cfg.get("CHECKPOINT") if isinstance(cfg.get("CHECKPOINT"), dict) else {}
+    value = checkpoint_cfg.get("INIT_FROM")
+    if value is None:
+        value = checkpoint_cfg.get("INIT_PATH")
+    if value is None or value is False:
+        return None, None
+    return Path(str(value)), "CHECKPOINT.INIT_FROM"
+
+
+def spectral_aux_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Return the normalized frozen-surrogate auxiliary objective settings."""
+    block = depth_field_block(cfg)
+    raw = nested_get(block, "TRAIN", "SPECTRAL_AUX", default={}) or {}
+    if not isinstance(raw, dict):
+        raise TypeError("DEPTH_FIELD.TRAIN.SPECTRAL_AUX must be a mapping.")
+    enabled = bool(args.spectral_aux_enabled if args.spectral_aux_enabled is not None else raw.get("ENABLED", False))
+    checkpoint = args.spectral_aux_checkpoint or raw.get("CHECKPOINT")
+    weight = float(args.spectral_aux_weight if args.spectral_aux_weight is not None else raw.get("WEIGHT", 0.0))
+    every_n_steps = int(
+        args.spectral_aux_every_n_steps
+        if args.spectral_aux_every_n_steps is not None
+        else raw.get("EVERY_N_STEPS", 4)
+    )
+    max_samples = int(
+        args.spectral_aux_max_samples_per_rank
+        if args.spectral_aux_max_samples_per_rank is not None
+        else raw.get("MAX_SAMPLES_PER_RANK", 8)
+    )
+    channel_names = raw.get("CHANNELS", ["R", "T"])
+    if isinstance(channel_names, str):
+        channel_names = [channel_names]
+    channel_map = {"R": 0, "A": 1, "T": 2}
+    try:
+        channels = tuple(channel_map[str(name).upper()] for name in channel_names)
+    except KeyError as exc:
+        raise ValueError(f"Unknown SPECTRAL_AUX channel {exc.args[0]!r}; expected R, A, or T.") from exc
+    config = {
+        "enabled": enabled,
+        "checkpoint": str(checkpoint) if checkpoint is not None else None,
+        "weight": weight,
+        "every_n_steps": every_n_steps,
+        "max_samples_per_rank": max_samples,
+        "max_noise_probability": float(raw.get("MAX_NOISE_PROBABILITY", 0.5)),
+        "skip_dropped_conditions": bool(raw.get("SKIP_DROPPED_CONDITIONS", True)),
+        "weight_ramp_samples": int(raw.get("WEIGHT_RAMP_SAMPLES", 5_000_000)),
+        "start_after_samples": int(raw.get("START_AFTER_SAMPLES", 0)),
+        "derivative_weight": float(raw.get("DERIVATIVE_WEIGHT", 0.25)),
+        "huber_delta": float(raw.get("HUBER_DELTA", 0.02)),
+        "channels": channels,
+        "channel_names": [str(name).upper() for name in channel_names],
+        "straight_through_temperature": float(raw.get("STRAIGHT_THROUGH_TEMPERATURE", 1.0)),
+    }
+    if enabled and not config["checkpoint"]:
+        raise ValueError("SPECTRAL_AUX.ENABLED=true requires SPECTRAL_AUX.CHECKPOINT.")
+    if weight < 0.0 or not math.isfinite(weight):
+        raise ValueError(f"SPECTRAL_AUX.WEIGHT must be finite and non-negative, got {weight}.")
+    if every_n_steps <= 0 or max_samples <= 0:
+        raise ValueError("SPECTRAL_AUX.EVERY_N_STEPS and MAX_SAMPLES_PER_RANK must be positive.")
+    if not 0.0 <= config["max_noise_probability"] <= 1.0:
+        raise ValueError("SPECTRAL_AUX.MAX_NOISE_PROBABILITY must be in [0,1].")
+    if config["weight_ramp_samples"] < 0 or config["start_after_samples"] < 0:
+        raise ValueError("SPECTRAL_AUX sample schedule values must be non-negative.")
+    if not channels:
+        raise ValueError("SPECTRAL_AUX.CHANNELS must contain at least one of R, A, or T.")
+    if config["derivative_weight"] < 0.0 or not math.isfinite(config["derivative_weight"]):
+        raise ValueError("SPECTRAL_AUX.DERIVATIVE_WEIGHT must be finite and non-negative.")
+    if config["huber_delta"] <= 0.0 or not math.isfinite(config["huber_delta"]):
+        raise ValueError("SPECTRAL_AUX.HUBER_DELTA must be finite and positive.")
+    if config["straight_through_temperature"] <= 0.0 or not math.isfinite(
+        config["straight_through_temperature"]
+    ):
+        raise ValueError("SPECTRAL_AUX.STRAIGHT_THROUGH_TEMPERATURE must be finite and positive.")
+    return config
+
+
 def apply_depth_field_defaults(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     block = depth_field_block(cfg)
     set_arg_config_required(args, "out_dir", block.get("OUT_DIR", MISSING), "DEPTH_FIELD.OUT_DIR")
@@ -689,6 +786,86 @@ def corruption_config_from_args(args: argparse.Namespace) -> optollama.model.Dep
         random_replace_schedule=str(args.random_replace_schedule),
         random_replace_power=float(args.random_replace_power),
     )
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    """Return a stable checkpoint provenance record without loading its tensors."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size": int(stat.st_size),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def distributed_file_fingerprint(path: Path) -> dict[str, Any]:
+    """Fingerprint a shared checkpoint only on the rank that saves metadata."""
+    if ddp_rank() == 0:
+        return file_fingerprint(path)
+    stat = path.stat()
+    return {"path": str(path), "size": int(stat.st_size), "sha256": None}
+
+
+def load_frozen_spectral_surrogate(
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    vocab: optollama.data.DepthFieldVocab,
+    depth_bins: int,
+    spectrum_width: int,
+    dz_nm: float,
+    wavelength_min: int,
+    wavelength_max: int,
+    wavelength_step: int,
+) -> tuple[torch.nn.Module | None, dict[str, Any] | None]:
+    """Load and validate the optional training-only spectrum surrogate."""
+    if not bool(config.get("enabled")):
+        return None, None
+    path = Path(str(config["checkpoint"]))
+    if not path.is_file():
+        raise FileNotFoundError(f"Spectral surrogate checkpoint does not exist: {path}")
+    surrogate, extra = optollama.model.load_depth_field_spectrum_surrogate(path, device=device)
+    surrogate_config = surrogate.config
+    expected = {
+        "num_materials": int(vocab.num_clean_classes),
+        "void_id": int(vocab.void_id),
+        "depth_bins": int(depth_bins),
+        "spectrum_width": int(spectrum_width),
+    }
+    actual = {key: int(getattr(surrogate_config, key)) for key in expected}
+    mismatches = [f"{key}: expected {expected[key]}, got {actual[key]}" for key in expected if expected[key] != actual[key]]
+    if not math.isclose(float(surrogate_config.dz_nm), float(dz_nm), rel_tol=0.0, abs_tol=1.0e-9):
+        mismatches.append(f"dz_nm: expected {dz_nm}, got {surrogate_config.dz_nm}")
+    saved_vocab = ((extra.get("depth_field") or {}).get("vocab") or {}).get("material_names")
+    if not isinstance(saved_vocab, list):
+        mismatches.append("checkpoint is missing depth_field.vocab.material_names")
+    elif list(saved_vocab) != list(vocab.material_names):
+        mismatches.append("material_names/order differs from the training depth-field vocabulary")
+    saved_grid = extra.get("spectral_grid") or {}
+    expected_grid = {
+        "wavelength_min": int(wavelength_min),
+        "wavelength_max": int(wavelength_max),
+        "wavelength_step": int(wavelength_step),
+    }
+    for key, expected_value in expected_grid.items():
+        if saved_grid.get(key) is None:
+            mismatches.append(f"checkpoint is missing spectral_grid.{key}")
+        elif int(saved_grid[key]) != expected_value:
+            mismatches.append(f"spectral_grid.{key}: expected {expected_value}, got {saved_grid[key]}")
+    if mismatches:
+        raise ValueError("Incompatible spectral surrogate checkpoint: " + "; ".join(mismatches))
+    surrogate.eval()
+    surrogate.requires_grad_(False)
+    metadata = {
+        **distributed_file_fingerprint(path),
+        "surrogate_config": surrogate_config.to_dict(),
+        "loss": extra.get("loss"),
+    }
+    return surrogate, metadata
 
 
 def ema_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1076,6 +1253,73 @@ def depth_field_training_loss(
     }
 
 
+def spectral_auxiliary_loss(
+    *,
+    output: dict[str, torch.Tensor],
+    target_spectra: torch.Tensor,
+    core_model: torch.nn.Module,
+    surrogate: torch.nn.Module | None,
+    config: dict[str, Any],
+    global_samples_seen: int,
+    batch_index: int,
+) -> dict[str, Any]:
+    """Return a sparse, ramped spectrum-consistency loss for eligible samples."""
+    zero = output["logits"].new_zeros(())
+    result: dict[str, Any] = {
+        "loss": zero,
+        "raw_loss": zero.detach(),
+        "level_loss": zero.detach(),
+        "derivative_loss": zero.detach(),
+        "weight": 0.0,
+        "samples": 0,
+        "applied": False,
+    }
+    if surrogate is None or not bool(config.get("enabled")):
+        return result
+    if int(batch_index) % int(config["every_n_steps"]) != 0:
+        return result
+    start_after = int(config["start_after_samples"])
+    progress_samples = max(0, int(global_samples_seen) - start_after)
+    if int(global_samples_seen) < start_after:
+        return result
+    ramp_samples = int(config["weight_ramp_samples"])
+    ramp = 1.0 if ramp_samples <= 0 else min(1.0, float(progress_samples) / float(ramp_samples))
+    effective_weight = float(config["weight"]) * ramp
+    if effective_weight <= 0.0:
+        return result
+
+    noise_probability = core_model.noise_probability(output["timesteps"]).detach()
+    eligible = noise_probability <= float(config["max_noise_probability"])
+    if bool(config["skip_dropped_conditions"]):
+        eligible &= ~output["condition_dropped"].detach().bool()
+    indices = torch.nonzero(eligible, as_tuple=False).flatten()[: int(config["max_samples_per_rank"])]
+    if indices.numel() == 0:
+        return result
+
+    probabilities = optollama.model.straight_through_material_probabilities(
+        output["logits"][indices],
+        temperature=float(config["straight_through_temperature"]),
+    )
+    predicted_spectra = surrogate(probabilities)
+    parts = optollama.model.depth_field_spectrum_loss(
+        predicted_spectra,
+        target_spectra[indices],
+        channels=tuple(int(index) for index in config["channels"]),
+        derivative_weight=float(config["derivative_weight"]),
+        huber_delta=float(config["huber_delta"]),
+    )
+    result.update(
+        loss=parts["loss"] * effective_weight,
+        raw_loss=parts["loss"].detach(),
+        level_loss=parts["level_loss"].detach(),
+        derivative_loss=parts["derivative_loss"].detach(),
+        weight=effective_weight,
+        samples=int(indices.numel()),
+        applied=True,
+    )
+    return result
+
+
 def reduced_epoch_metrics(
     *,
     counts: torch.Tensor,
@@ -1090,6 +1334,7 @@ def reduced_epoch_metrics(
     dz_nm: float,
     device: torch.device,
     stability_counts: torch.Tensor | None = None,
+    spectral_stats: torch.Tensor | None = None,
 ) -> dict:
     reduced_counts = counts.detach().clone()
     totals = torch.tensor(
@@ -1130,6 +1375,19 @@ def reduced_epoch_metrics(
             nonfinite_gradient_steps=int(round(float(averaged[1].item()))),
             amp_skipped_steps=int(round(float(averaged[2].item()))),
             optimizer_steps=int(round(float(averaged[3].item()))),
+        )
+    if spectral_stats is not None:
+        reduced_spectral = spectral_stats.detach().clone().to(device=device, dtype=torch.float64)
+        all_reduce_sum(reduced_spectral)
+        spectral_samples = max(float(reduced_spectral[4].item()), 1.0)
+        metrics.update(
+            spectral_aux_loss=float(reduced_spectral[0].item() / spectral_samples),
+            spectral_aux_weighted_loss=float(reduced_spectral[1].item() / spectral_samples),
+            spectral_aux_level_loss=float(reduced_spectral[2].item() / spectral_samples),
+            spectral_aux_derivative_loss=float(reduced_spectral[3].item() / spectral_samples),
+            spectral_aux_samples=int(round(float(reduced_spectral[4].item()))),
+            spectral_aux_batches=int(round(float(reduced_spectral[5].item()))),
+            spectral_aux_weight=float(reduced_spectral[6].item() / spectral_samples),
         )
     return metrics
 
@@ -1634,6 +1892,7 @@ def run_epoch(
     lr_schedule: dict[str, Any] | None = None,
     timestep_schedule: dict[str, Any] | None = None,
     ema: ModelEma | None = None,
+    spectral_aux_model: torch.nn.Module | None = None,
 ) -> dict:
     model.train(train)
     set_loader_epoch(loader, epoch)
@@ -1648,6 +1907,7 @@ def run_epoch(
     active_nm_sum = 0.0
     counts = torch.zeros(6, dtype=torch.float64, device=device)
     stability_counts = torch.zeros(4, dtype=torch.float64, device=device)
+    spectral_stats = torch.zeros(7, dtype=torch.float64, device=device)
     consecutive_nonfinite_steps = 0
     desc = f"Epoch {epoch + 1}/{epochs} {'train' if train else 'val'}"
     show_progress = ddp_rank() == 0
@@ -1697,6 +1957,7 @@ def run_epoch(
                         dz_nm=args.dz_nm,
                         device=device,
                         stability_counts=stability_counts,
+                        spectral_stats=spectral_stats,
                     )
                     if show_progress:
                         pbar.set_postfix(skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%")
@@ -1755,7 +2016,20 @@ def run_epoch(
                     timestep_schedule=timestep_schedule,
                     global_samples_seen=global_samples_before,
                 )
-            loss = out["loss"]
+                spectral_aux = spectral_auxiliary_loss(
+                    output=out,
+                    target_spectra=spectra,
+                    core_model=unwrap_model(model),
+                    surrogate=spectral_aux_model,
+                    config=getattr(args, "spectral_aux_config", {"enabled": False}),
+                    global_samples_seen=global_samples_before,
+                    batch_index=batch_index,
+                )
+                denoise_loss = out["loss"]
+                loss = denoise_loss + spectral_aux["loss"]
+            out["denoise_loss"] = denoise_loss.detach()
+            out["spectral_aux_loss"] = spectral_aux["raw_loss"]
+            out["spectral_aux_weighted_loss"] = spectral_aux["loss"].detach()
             if not count_batch_metrics:
                 loss = loss * 0.0
             local_finite, global_finite = synchronized_finite_flags(spectra, out["logits"], loss)
@@ -1851,6 +2125,21 @@ def run_epoch(
                 consecutive_nonfinite_steps = 0
             if ema is not None and not amp_skipped:
                 ema.update(model)
+            if count_batch_metrics and bool(spectral_aux["applied"]) and not amp_skipped:
+                spectral_samples = int(spectral_aux["samples"])
+                spectral_stats += torch.tensor(
+                    [
+                        float(spectral_aux["raw_loss"].item()) * spectral_samples,
+                        float(spectral_aux["loss"].detach().item()) * spectral_samples,
+                        float(spectral_aux["level_loss"].item()) * spectral_samples,
+                        float(spectral_aux["derivative_loss"].item()) * spectral_samples,
+                        float(spectral_samples),
+                        1.0,
+                        float(spectral_aux["weight"]) * spectral_samples,
+                    ],
+                    dtype=torch.float64,
+                    device=device,
+                )
         else:
             with torch.no_grad(), autocast_context(device, amp_dtype):
                 out = depth_field_training_loss(
@@ -1890,6 +2179,7 @@ def run_epoch(
             dz_nm=args.dz_nm,
             device=device,
             stability_counts=stability_counts,
+            spectral_stats=spectral_stats,
         )
         metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
         if train:
@@ -1907,6 +2197,7 @@ def run_epoch(
                 full=f"{metrics['full_depth_fraction'] * 100.0:.1f}%",
                 nf=f"{metrics.get('nonfinite_forward_steps', 0) + metrics.get('nonfinite_gradient_steps', 0)}",
                 amp_skip=f"{metrics.get('amp_skipped_steps', 0)}",
+                spec=f"{metrics.get('spectral_aux_loss', 0.0):.4f}",
             )
 
         if next_validation_sample is not None and int(metrics["samples_seen"]) >= next_validation_sample:
@@ -1928,6 +2219,7 @@ def run_epoch(
         dz_nm=args.dz_nm,
         device=device,
         stability_counts=stability_counts,
+        spectral_stats=spectral_stats,
     )
     metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
     if train:
@@ -1991,7 +2283,12 @@ def make_checkpoint_extra(
             "loss_on_corrupted_only": bool(args.loss_on_corrupted_only),
             "corrupted_loss_weight": float(args.corrupted_loss_weight),
             "uncorrupted_loss_weight": float(args.uncorrupted_loss_weight),
+            "spectral_aux": {
+                **dict(getattr(args, "spectral_aux_config", {})),
+                "surrogate": getattr(args, "spectral_aux_metadata", None),
+            },
         },
+        "initialization": getattr(args, "init_from_provenance", None),
         "ema": {
             "enabled": ema is not None,
             "decay": float(ema.decay) if ema is not None else None,
@@ -2038,6 +2335,9 @@ def main() -> None:
     apply_depth_field_defaults(cfg, args)
     apply_loader_overrides(cfg, args)
     args.corruption_config = corruption_config_from_args(args)
+    args.spectral_aux_config = spectral_aux_config(cfg, args)
+    args.spectral_aux_metadata = None
+    args.init_from_provenance = None
 
     if args.seed is not None:
         cfg["SEED"] = int(args.seed)
@@ -2104,6 +2404,17 @@ def main() -> None:
     lr_schedule = lr_schedule_config(cfg)
     timestep_schedule = timestep_schedule_config(cfg)
     ema = make_ema(cfg, model)
+    spectral_aux_model, args.spectral_aux_metadata = load_frozen_spectral_surrogate(
+        args.spectral_aux_config,
+        device=device,
+        vocab=vocab,
+        depth_bins=depth_bins,
+        spectrum_width=int(model_config.spectrum_shape[-1]),
+        dz_nm=float(args.dz_nm),
+        wavelength_min=int(cfg["WAVELENGTH_MIN"]),
+        wavelength_max=int(cfg["WAVELENGTH_MAX"]),
+        wavelength_step=int(cfg["WAVELENGTH_STEPS"]),
+    )
 
     epochs = int(args.epochs if args.epochs is not None else cfg_required(cfg, "EPOCHS", "--epochs"))
     out_dir = Path(args.out_dir)
@@ -2123,6 +2434,57 @@ def main() -> None:
     global_sample_offset_adjustment = 0
     history: list[dict] = []
     resume_path, resume_source, resume_required = resolve_resume_checkpoint(cfg, args, last_path)
+    init_path, init_source = resolve_init_checkpoint(cfg, args)
+    if resume_path is not None and init_path is not None:
+        if args.init_from is not None:
+            raise ValueError(f"Use either resume ({resume_source}) or --init-from, not both.")
+        if resume_path.is_file() or resume_required:
+            if rank == 0:
+                print(f"Resume via {resume_source} supersedes initialization via {init_source}.")
+            init_path, init_source = None, None
+        else:
+            if rank == 0:
+                print(f"No checkpoint found for {resume_source}; using initialization via {init_source}.")
+            resume_path, resume_source = None, None
+    if init_path is not None:
+        if not init_path.is_file():
+            raise FileNotFoundError(f"{init_source} checkpoint does not exist: {init_path}")
+        _, init_blob = optollama.utils.load_checkpoint(
+            str(init_path),
+            model,
+            optimizer=None,
+            scaler=None,
+            map_location="cpu",
+            strict=True,
+        )
+        nonfinite_model_tensor = first_nonfinite_model_tensor(model)
+        checkpoint_finite = torch.tensor(
+            [int(nonfinite_model_tensor is None)],
+            dtype=torch.int32,
+            device=ddp_collective_device() if ddp_active() else device,
+        )
+        if ddp_active():
+            torch.distributed.all_reduce(checkpoint_finite, op=torch.distributed.ReduceOp.MIN)
+        if not bool(checkpoint_finite.item()):
+            raise FloatingPointError(
+                f"Refusing to initialize from non-finite checkpoint {init_path}; model_tensor={nonfinite_model_tensor}."
+            )
+        source_extra = init_blob.get("extra") or {}
+        source_history = list(source_extra.get("history") or [])
+        source_samples = None
+        if source_history:
+            source_samples = (source_history[-1].get("train") or {}).get("global_samples_seen")
+        args.init_from_provenance = {
+            **distributed_file_fingerprint(init_path),
+            "source": str(init_source),
+            "source_checkpoint_weights": source_extra.get("checkpoint_weights"),
+            "source_global_samples": source_samples,
+            "source_config_path": source_extra.get("config_path"),
+        }
+        if ema is not None:
+            ema.reset(model)
+        if rank == 0:
+            print(f"Initialized new depth-field run from {init_path} ({init_source}); optimizer/history/schedules start fresh.")
     if resume_path is not None:
         if resume_path.exists():
             reset_optimizer = bool(args.reset_optimizer_on_resume)
@@ -2172,6 +2534,15 @@ def main() -> None:
             raise FileNotFoundError(f"{resume_source} checkpoint does not exist: {resume_path}")
         elif rank == 0:
             print(f"Depth-field resume is enabled via {resume_source}, but {resume_path} does not exist; starting fresh.")
+
+    if rank == 0 and spectral_aux_model is not None:
+        spectral_cfg = args.spectral_aux_config
+        print(
+            "Spectral auxiliary: "
+            f"checkpoint={spectral_cfg['checkpoint']}, weight={spectral_cfg['weight']:g}, "
+            f"every={spectral_cfg['every_n_steps']} steps, max_local={spectral_cfg['max_samples_per_rank']}, "
+            f"noise<={spectral_cfg['max_noise_probability']:g}, channels={spectral_cfg['channel_names']}."
+        )
 
     primary_score_name = score_name_for_eval_mode(eval_mode)
     comparable_scores = [score for item in history if (score := comparable_record_score(item, primary_score_name)) is not None]
@@ -2436,6 +2807,7 @@ def main() -> None:
             lr_schedule=lr_schedule,
             timestep_schedule=timestep_schedule,
             ema=ema,
+            spectral_aux_model=spectral_aux_model,
         )
 
         if val_loader is not None and validate_at_epoch_end:
