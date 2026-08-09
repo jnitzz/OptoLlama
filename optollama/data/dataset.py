@@ -1,7 +1,7 @@
 import re
 from bisect import bisect_right
 from pathlib import Path
-from typing import Any, Optional, Self, Union
+from typing import Optional, Self, Union
 
 import safetensors.torch
 import torch
@@ -277,6 +277,7 @@ class ShardedSpectraDataset(IterableDataset):
         *,
         split: str,
         subset_n: Optional[int] = None,
+        start_index: int = 0,
         rank: int = 0,
         world_size: int = 1,
         seed: int = 0,
@@ -323,7 +324,11 @@ class ShardedSpectraDataset(IterableDataset):
             self.shard_offsets.append(self.shard_offsets[-1] + n)
 
         self.total_available = int(self.shard_offsets[-1])
-        requested_total = self.total_available if subset_n is None else min(int(subset_n), self.total_available)
+        start_index = int(start_index)
+        if start_index < 0 or start_index >= self.total_available:
+            raise ValueError(f"start_index must be in [0,{self.total_available}), got {start_index}")
+        available_from_start = self.total_available - start_index
+        requested_total = available_from_start if subset_n is None else min(int(subset_n), available_from_start)
         if requested_total <= 0:
             raise ValueError(f"{split} subset contains no samples: subset_n={subset_n}, available={self.total_available}")
 
@@ -335,7 +340,8 @@ class ShardedSpectraDataset(IterableDataset):
                 "increase NUM_SAMPLES_* or reduce DDP world size."
             )
         trimmed_total = self.samples_per_rank * self.world_size
-        self.rank_start = self.rank * self.samples_per_rank
+        self.start_index = start_index
+        self.rank_start = self.start_index + self.rank * self.samples_per_rank
         self.rank_stop = self.rank_start + self.samples_per_rank
         self.dropped_tail = self.total_samples - trimmed_total
         self.maximum_depth = int(stack_shape[1])

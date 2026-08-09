@@ -280,6 +280,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum eligible local samples sent through the surrogate on an auxiliary step.",
     )
+    parser.add_argument(
+        "--solution-bank",
+        nargs="+",
+        default=None,
+        help="Solution-bank shard files/directories used for exact-TMM-verified replay.",
+    )
+    parser.add_argument(
+        "--solution-bank-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable solution-bank replay.",
+    )
+    parser.add_argument(
+        "--solution-bank-replay-fraction",
+        type=float,
+        default=None,
+        help="Fraction of each retained training batch replaced with solution-bank examples.",
+    )
     parser.add_argument("--save-every", type=int, default=1, help="Save the last checkpoint every N epochs.")
     parser.add_argument(
         "--eval-mode",
@@ -570,6 +588,36 @@ def spectral_aux_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[s
         config["straight_through_temperature"]
     ):
         raise ValueError("SPECTRAL_AUX.STRAIGHT_THROUGH_TEMPERATURE must be finite and positive.")
+    return config
+
+
+def solution_bank_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Return normalized exact-TMM solution-bank replay settings."""
+    block = depth_field_block(cfg)
+    raw = nested_get(block, "TRAIN", "SOLUTION_BANK", default={}) or {}
+    if not isinstance(raw, dict):
+        raise TypeError("DEPTH_FIELD.TRAIN.SOLUTION_BANK must be a mapping.")
+    enabled_override = getattr(args, "solution_bank_enabled", None)
+    paths_override = getattr(args, "solution_bank", None)
+    replay_override = getattr(args, "solution_bank_replay_fraction", None)
+    paths = paths_override if paths_override is not None else raw.get("PATHS", raw.get("PATH"))
+    if isinstance(paths, (str, Path)):
+        paths = [str(paths)]
+    config = {
+        "enabled": bool(enabled_override if enabled_override is not None else raw.get("ENABLED", False)),
+        "paths": [str(path) for path in (paths or [])],
+        "replay_fraction": float(replay_override if replay_override is not None else raw.get("REPLAY_FRACTION", 0.0)),
+        "gold_fraction": float(raw.get("GOLD_FRACTION", 2.0 / 3.0)),
+        "seed": int(raw.get("SEED", cfg.get("SEED", 0) or 0)),
+    }
+    if not 0.0 <= config["replay_fraction"] <= 1.0:
+        raise ValueError("SOLUTION_BANK.REPLAY_FRACTION must be in [0,1].")
+    if not 0.0 <= config["gold_fraction"] <= 1.0:
+        raise ValueError("SOLUTION_BANK.GOLD_FRACTION must be in [0,1].")
+    if config["enabled"] and not config["paths"]:
+        raise ValueError("SOLUTION_BANK.ENABLED=true requires SOLUTION_BANK.PATHS.")
+    if config["enabled"] and config["replay_fraction"] <= 0.0:
+        raise ValueError("SOLUTION_BANK.ENABLED=true requires a positive REPLAY_FRACTION.")
     return config
 
 
@@ -1335,6 +1383,7 @@ def reduced_epoch_metrics(
     device: torch.device,
     stability_counts: torch.Tensor | None = None,
     spectral_stats: torch.Tensor | None = None,
+    replay_samples: int = 0,
 ) -> dict:
     reduced_counts = counts.detach().clone()
     totals = torch.tensor(
@@ -1347,6 +1396,7 @@ def reduced_epoch_metrics(
             float(seen_samples),
             float(overlimit_seen),
             float(skipped_overlimit),
+            float(replay_samples),
         ],
         dtype=torch.float64,
         device=device,
@@ -1365,6 +1415,9 @@ def reduced_epoch_metrics(
         skipped_overlimit=int(totals[7].item()),
         dz_nm=dz_nm,
     )
+    replay_total = int(round(float(totals[8].item())))
+    metrics["solution_bank_replay_samples"] = replay_total
+    metrics["solution_bank_replay_fraction"] = replay_total / max(int(totals[4].item()), 1)
     if stability_counts is not None:
         reduced_stability = stability_counts.detach().clone().to(device=device, dtype=torch.float64)
         all_reduce_sum(reduced_stability)
@@ -1893,6 +1946,7 @@ def run_epoch(
     timestep_schedule: dict[str, Any] | None = None,
     ema: ModelEma | None = None,
     spectral_aux_model: torch.nn.Module | None = None,
+    solution_bank: optollama.data.DepthFieldSolutionBankReplay | None = None,
 ) -> dict:
     model.train(train)
     set_loader_epoch(loader, epoch)
@@ -1908,6 +1962,7 @@ def run_epoch(
     counts = torch.zeros(6, dtype=torch.float64, device=device)
     stability_counts = torch.zeros(4, dtype=torch.float64, device=device)
     spectral_stats = torch.zeros(7, dtype=torch.float64, device=device)
+    replay_samples = 0
     consecutive_nonfinite_steps = 0
     desc = f"Epoch {epoch + 1}/{epochs} {'train' if train else 'val'}"
     show_progress = ddp_rank() == 0
@@ -1958,6 +2013,7 @@ def run_epoch(
                         device=device,
                         stability_counts=stability_counts,
                         spectral_stats=spectral_stats,
+                        replay_samples=replay_samples,
                     )
                     if show_progress:
                         pbar.set_postfix(skip=f"{metrics['overlimit_skip_fraction'] * 100.0:.1f}%")
@@ -1982,6 +2038,15 @@ def run_epoch(
             pad_idx=pad_idx,
             msk_idx=msk_idx,
         )
+        if train and count_batch_metrics and solution_bank is not None:
+            spectra_cpu, fields_cpu, replay_count = solution_bank.mix_batch(
+                spectra_cpu,
+                fields_cpu,
+                epoch=epoch,
+                batch_index=batch_index,
+                rank=ddp_rank(),
+            )
+            replay_samples += int(replay_count)
         if count_batch_metrics:
             active_bins = optollama.data.depth_field_active_bins(fields_cpu, vocab.void_id)
             full_count += int((active_bins >= fields_cpu.size(1)).sum().item())
@@ -2180,6 +2245,7 @@ def run_epoch(
             device=device,
             stability_counts=stability_counts,
             spectral_stats=spectral_stats,
+            replay_samples=replay_samples,
         )
         metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
         if train:
@@ -2198,6 +2264,7 @@ def run_epoch(
                 nf=f"{metrics.get('nonfinite_forward_steps', 0) + metrics.get('nonfinite_gradient_steps', 0)}",
                 amp_skip=f"{metrics.get('amp_skipped_steps', 0)}",
                 spec=f"{metrics.get('spectral_aux_loss', 0.0):.4f}",
+                bank=f"{metrics.get('solution_bank_replay_fraction', 0.0) * 100.0:.1f}%",
             )
 
         if next_validation_sample is not None and int(metrics["samples_seen"]) >= next_validation_sample:
@@ -2220,6 +2287,7 @@ def run_epoch(
         device=device,
         stability_counts=stability_counts,
         spectral_stats=spectral_stats,
+        replay_samples=replay_samples,
     )
     metrics["global_samples_seen"] = int(global_sample_offset + int(metrics["samples_seen"]))
     if train:
@@ -2287,6 +2355,7 @@ def make_checkpoint_extra(
                 **dict(getattr(args, "spectral_aux_config", {})),
                 "surrogate": getattr(args, "spectral_aux_metadata", None),
             },
+            "solution_bank": getattr(args, "solution_bank_metadata", None),
         },
         "initialization": getattr(args, "init_from_provenance", None),
         "ema": {
@@ -2337,6 +2406,8 @@ def main() -> None:
     args.corruption_config = corruption_config_from_args(args)
     args.spectral_aux_config = spectral_aux_config(cfg, args)
     args.spectral_aux_metadata = None
+    args.solution_bank_config = solution_bank_config(cfg, args)
+    args.solution_bank_metadata = None
     args.init_from_provenance = None
 
     if args.seed is not None:
@@ -2415,6 +2486,19 @@ def main() -> None:
         wavelength_max=int(cfg["WAVELENGTH_MAX"]),
         wavelength_step=int(cfg["WAVELENGTH_STEPS"]),
     )
+    solution_bank = None
+    if bool(args.solution_bank_config["enabled"]):
+        solution_bank = optollama.data.DepthFieldSolutionBankReplay(
+            args.solution_bank_config["paths"],
+            replay_fraction=float(args.solution_bank_config["replay_fraction"]),
+            gold_fraction=float(args.solution_bank_config["gold_fraction"]),
+            seed=int(args.solution_bank_config["seed"]),
+            expected_spectrum_shape=model_config.spectrum_shape,
+            expected_depth_bins=depth_bins,
+            expected_material_names=vocab.material_names,
+            expected_dz_nm=float(args.dz_nm),
+        )
+        args.solution_bank_metadata = solution_bank.summary()
 
     epochs = int(args.epochs if args.epochs is not None else cfg_required(cfg, "EPOCHS", "--epochs"))
     out_dir = Path(args.out_dir)
@@ -2542,6 +2626,14 @@ def main() -> None:
             f"checkpoint={spectral_cfg['checkpoint']}, weight={spectral_cfg['weight']:g}, "
             f"every={spectral_cfg['every_n_steps']} steps, max_local={spectral_cfg['max_samples_per_rank']}, "
             f"noise<={spectral_cfg['max_noise_probability']:g}, channels={spectral_cfg['channel_names']}."
+        )
+    if rank == 0 and solution_bank is not None:
+        bank_summary = solution_bank.summary()
+        print(
+            "Solution-bank replay: "
+            f"samples={bank_summary['samples']}, anchors={bank_summary['anchors']}, "
+            f"topologies={bank_summary['topologies']}, gold={bank_summary['gold_samples']}, "
+            f"silver={bank_summary['silver_samples']}, replay={bank_summary['replay_fraction']:.1%}."
         )
 
     primary_score_name = score_name_for_eval_mode(eval_mode)
@@ -2808,6 +2900,7 @@ def main() -> None:
             timestep_schedule=timestep_schedule,
             ema=ema,
             spectral_aux_model=spectral_aux_model,
+            solution_bank=solution_bank,
         )
 
         if val_loader is not None and validate_at_epoch_end:

@@ -167,6 +167,21 @@ def depth_field_active_bins(fields: torch.Tensor, void_id: int) -> torch.Tensor:
     return (fields != int(void_id)).sum(dim=-1)
 
 
+def compact_depth_fields(fields: torch.Tensor, void_id: int) -> torch.Tensor:
+    """Move non-void bins to a contiguous prefix while preserving their order."""
+    squeeze = fields.dim() == 1
+    if squeeze:
+        fields = fields.unsqueeze(0)
+    if fields.dim() != 2:
+        raise ValueError(f"fields must have shape [B,D] or [D], got {tuple(fields.shape)}")
+
+    compacted = torch.full_like(fields, int(void_id))
+    for row in range(int(fields.size(0))):
+        active = fields[row][fields[row] != int(void_id)]
+        compacted[row, : int(active.numel())] = active
+    return compacted[0] if squeeze else compacted
+
+
 def token_stack_total_thickness_nm(
     stacks: torch.Tensor,
     idx_to_token: dict[int, str],
