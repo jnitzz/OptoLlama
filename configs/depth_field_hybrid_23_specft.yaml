@@ -1,10 +1,10 @@
 EXPERIMENT:
   MODEL: optollama
-  RUN: DF_HYBRID_10UM_17
+  RUN: DF_HYBRID_SPECFT_23
   SEED: 3
 
 PATHS:
-  DATA_PATH: E:/repos/OptoLlama/data # /scratch/htc/jschaibl/repos/OptoLlama/data
+  DATA_PATH: E:/repos/OptoLlama/data #/scratch/htc/jschaibl/repos/OptoLlama/data #
   MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
   TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
   OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
@@ -25,7 +25,7 @@ DATA_LOADING:
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
   NUM_SAMPLES_TEST: 512
-  TRAIN_BATCH_SIZE: 96
+  TRAIN_BATCH_SIZE: 20
   TEST_BATCH_SIZE: 32
 
 SPECTRAL_GRID:
@@ -34,7 +34,8 @@ SPECTRAL_GRID:
   WAVELENGTH_STEPS: 5
 
 CHECKPOINT:
-  RESUME: null # null | false: fresh start; true: depth-field-last.pt; or an explicit checkpoint path
+  RESUME: true # use Run 21 last checkpoint when present; otherwise fall back to INIT_FROM
+  INIT_FROM: ${PATHS.DATA_PATH}/output_DF_HYBRID_10UM_20/depth-field-best-frozen.pt # immutable EMA source checkpoint
   RESET_OPTIMIZER: false
   SAVE_VALIDATION_CHECKPOINT: true
 
@@ -51,8 +52,8 @@ DEPTH_FIELD:
   CORRUPTION:
     MODE: hybrid # iid | hybrid
     IID_FRACTION: 0.20
-    SPAN_FRACTION: 0.60
-    LAYER_FRACTION: 0.20
+    SPAN_FRACTION: 0.50
+    LAYER_FRACTION: 0.30
     SPAN_MIN_BINS: 4 # 20 nm at DZ_NM=5
     SPAN_MAX_BINS: 128 # 640 nm at DZ_NM=5
     SPAN_SCALE_WITH_NOISE: true
@@ -66,9 +67,9 @@ DEPTH_FIELD:
     N_BLOCKS: 8
     N_HEADS: 8
     FFN_MULTIPLIER: 4.0
-    SPECTRUM_PATCH_SIZE: 8 # 40 nm windows on the 5 nm grid
-    SPECTRUM_PATCH_STRIDE: 4 # 20 nm overlap stride; produces 70 local spectral tokens
-    SPECTRUM_ENCODER_BLOCKS: 2
+    SPECTRUM_PATCH_SIZE: 4 # 20 nm windows on the 5 nm grid
+    SPECTRUM_PATCH_STRIDE: 2 # 10 nm overlap stride; produces 140 local spectral tokens
+    SPECTRUM_ENCODER_BLOCKS: 4
     SPECTRUM_ENCODER_HEADS: 8
     SPECTRUM_FFN_MULTIPLIER: 2.0
     # Hybrid adds one residual separable Conv1d block after each transformer block.
@@ -99,22 +100,43 @@ DEPTH_FIELD:
     LOSS_ON_CORRUPTED_ONLY: false # true forces the uncorrupted-bin weight to zero
     CORRUPTED_LOSS_WEIGHT: 1.0 # relative positional weight after material-class weighting
     UNCORRUPTED_LOSS_WEIGHT: 0.1
+    # Null-spectrum training enables classifier-free guidance without changing the architecture.
+    CONDITION_DROPOUT_PROB: 0.10
+    BOUNDARY_LOSS:
+      ENABLED: true
+      RADIUS_BINS: 2 # transition-adjacent bins plus two bins of context on each side
+      WEIGHT: 2.0
+    SPECTRAL_AUX:
+      # Matched control: pass --no-spectral-aux plus separate --out-dir and --eval-samples-dir paths.
+      ENABLED: true
+      CHECKPOINT: ${PATHS.DATA_PATH}/output_DF_SPECTRUM_SURROGATE_10UM_01/depth-field-spectrum-surrogate-best-frozen.pt
+      EVERY_N_STEPS: 4
+      MAX_SAMPLES_PER_RANK: 8
+      MAX_NOISE_PROBABILITY: 0.5
+      SKIP_DROPPED_CONDITIONS: true
+      WEIGHT: 0.10
+      WEIGHT_RAMP_SAMPLES: 5000000
+      START_AFTER_SAMPLES: 0
+      CHANNELS: [R, T]
+      HUBER_DELTA: 0.02 # SmoothL1/normalized-Huber transition point
+      DERIVATIVE_WEIGHT: 0.25
+      STRAIGHT_THROUGH_TEMPERATURE: 1.0
     LR_SCHEDULE:
       ENABLED: true
       TYPE: cosine # cosine | linear | constant/flat
-      WARMUP_SAMPLES: 500000
-      TOTAL_SAMPLES: 200000000
-      START_LR: 0.00005
+      WARMUP_SAMPLES: 1000000
+      TOTAL_SAMPLES: 40000000
+      START_LR: 0.000001
       MAX_LR: ${OPTIMIZATION.LEARNING_RATE}
-      MIN_LR: 0.00001
+      MIN_LR: 0.000001
     TIMESTEP_SCHEDULE:
       ENABLED: true
       TYPE: high_noise_warmup # high_noise_warmup; aliases: high_noise | noise_warmup
-      WARMUP_SAMPLES: 2000000
+      WARMUP_SAMPLES: 0 # source model is already trained; use the full timestep range immediately
       HIGH_NOISE_MIN_FRACTION: 0.6
     EMA:
-      ENABLED: false
-      DECAY: 0.9999
+      ENABLED: true
+      DECAY: 0.99993
       DEVICE: model # model | cpu
       VALIDATE: true
   EVAL:
@@ -126,6 +148,7 @@ DEPTH_FIELD:
     REMASK_STRATEGY: random # random | confidence
     TEMPERATURE: 1.0 # >0: sampling temperature; <=0: argmax
     TOP_K: 0 # 0 or >= material classes: disabled; otherwise retain top k classes
+    CFG_SCALE: 1.0 # 1: conditional sampling at normal cost; >1: CFG with two model passes per step
     DETERMINISTIC: false
     TMM_DEVICE: auto # auto/same | cpu | cuda | cuda:N
     TMM_BATCH_SIZE: 16
@@ -136,8 +159,8 @@ DEPTH_FIELD:
     RECORD_ALL_MC: true
 
 OPTIMIZATION:
-  LEARNING_RATE: 0.00005
-  EPOCHS: 20
+  LEARNING_RATE: 0.000002
+  EPOCHS: 2
 
 VALIDATION:
   EVERY_N_TRAIN_SAMPLES: 5000000

@@ -4,7 +4,7 @@ EXPERIMENT:
   SEED: 3
 
 PATHS:
-  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data # E:/repos/OptoLlama/data
+  DATA_PATH: E:/repos/OptoLlama/data #/scratch/htc/jschaibl/repos/OptoLlama/data #
   MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
   TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
   OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}

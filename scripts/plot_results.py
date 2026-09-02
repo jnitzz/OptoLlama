@@ -176,10 +176,40 @@ def _sample_stamp(path: Path) -> str | None:
     return None if match is None else match.group(1)
 
 
-def _sample_plot_filename(sample_path: str, sample_index: int) -> str:
+def _sample_plot_filename(sample_path: str, sample_index: int, mc_index: int | None = None) -> str:
     """Build the default sample plot filename from the sample result timestamp."""
     stamp = _sample_stamp(Path(sample_path)) or optollama.utils.make_run_stamp()
-    return f"sample_{sample_index}_{stamp}.pdf"
+    mc_suffix = f"_mc_{mc_index}" if mc_index is not None else ""
+    return f"sample_{sample_index}{mc_suffix}_{stamp}.pdf"
+
+
+def select_sample_result(results: list[dict], sample_index: int, mc_index: int | None = None) -> dict:
+    """Select a top-level result or one of its recorded Monte Carlo candidates."""
+    if sample_index < 0 or sample_index >= len(results):
+        raise IndexError(f"Sample index {sample_index} is out of range for {len(results)} results.")
+
+    parent = results[sample_index]
+    if mc_index is None:
+        return parent
+
+    candidates = parent.get("all_mc")
+    if not isinstance(candidates, list):
+        raise ValueError(
+            f"Sample {sample_index} has no recorded all_mc candidates. "
+            "Re-run inference with --record-all-mc."
+        )
+    if mc_index < 0 or mc_index >= len(candidates):
+        raise IndexError(
+            f"MC index {mc_index} is out of range for sample {sample_index} "
+            f"with {len(candidates)} candidates."
+        )
+    candidate = candidates[mc_index]
+    if not isinstance(candidate, dict):
+        raise TypeError(f"MC candidate {mc_index} for sample {sample_index} is not a result object.")
+
+    selected = {key: value for key, value in parent.items() if key != "all_mc"}
+    selected.update(candidate)
+    return selected
 
 
 def _latest_sample_entries_by_folder(
@@ -274,6 +304,12 @@ def parse_arguments() -> argparse.Namespace:
     sample = subparsers.add_parser("sample", help="Plot one target/prediction sample.")
     sample.add_argument("--config", type=str, default=argparse.SUPPRESS, help="Path to YAML config file.")
     sample.add_argument("--index", type=int, default=None, help="Result index to plot. Defaults to the best-MAE sample.")
+    sample.add_argument(
+        "--mc-index",
+        type=int,
+        default=None,
+        help="Zero-based all_mc candidate index within the selected result.",
+    )
     sample.add_argument("--target", type=str, default=None, help="Optional target name/stem/path to plot in multi-target mode.")
     sample.add_argument("--samples-path", type=str, default=None, help="Override config SAMPLES_PATH.")
     sample.add_argument("--no-nn", action="store_true", help="Disable optional nearest-neighbor overlay.")
@@ -400,10 +436,9 @@ def _sample_one(
         bundle = optollama.plotting.load_plot_bundle(bundle_path)
 
     sample_index = args.index if args.index is not None else optollama.plotting.select_best_result_index(results)
-    if sample_index < 0 or sample_index >= len(results):
-        raise IndexError(f"Sample index {sample_index} is out of range for {len(results)} results.")
-
-    sample = results[sample_index]
+    mc_index = args.mc_index
+    sample = select_sample_result(results, sample_index, mc_index)
+    sample_label = f"sample {sample_index}, MC {mc_index}" if mc_index is not None else f"sample {sample_index}"
     wavelengths = (
         bundle.wavelengths
         if bundle is not None and bundle.wavelengths is not None
@@ -431,7 +466,7 @@ def _sample_one(
         nn_mae = nn_match["mae"]
         cache = nn_match.get("cache") or {}
         cache_note = f", cache={'hit' if cache.get('hit') else 'miss'}" if cache else ""
-        print(f"NN match for sample {sample_index}: train index {nn_id}, MAE={nn_mae:.6f}{cache_note}")
+        print(f"NN match for {sample_label}: train index {nn_id}, MAE={nn_mae:.6f}{cache_note}")
 
     fig = optollama.plotting.plot_sample_comparison(
         wavelengths=wavelengths,
@@ -454,11 +489,11 @@ def _sample_one(
         nn_tokens=nn_tokens,
         nn_id=nn_id,
         nn_mae=nn_mae,
-        title=f"{title_prefix} sample {sample_index}" if title_prefix else f"Sample {sample_index}",
+        title=f"{title_prefix} {sample_label}" if title_prefix else sample_label.capitalize(),
     )
 
     if save_path is None and args.save is None:
-        default_filename = _sample_plot_filename(path, sample_index)
+        default_filename = _sample_plot_filename(path, sample_index, mc_index)
         if cfg.get("TARGET_NAME"):
             save_path = os.path.join(str(cfg["OUTPUT_PATH"]), default_filename)
         else:

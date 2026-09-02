@@ -1,10 +1,10 @@
 EXPERIMENT:
   MODEL: optollama
-  RUN: OPTOLLAMA_DEPTH_FIELD_WINDOWED_V2_10UM_12
+  RUN: DEPTH_FIELD_15UM_CLEAN_03
   SEED: 3
 
 PATHS:
-  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data
+  DATA_PATH: E:/repos/OptoLlama/data
   MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
   TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
   OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
@@ -13,30 +13,22 @@ PATHS:
   IDS_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-ids.json
   PLOT_BUNDLE_PATH: ${PATHS.OUTPUT_PATH}/${EXPERIMENT.MODEL}-${EXPERIMENT.RUN}-plot-bundle.npz
   TRAIN:
-    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/00
-    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/01
-    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/02
-    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/03
+    - ${PATHS.DATA_PATH}/realistic_07_20M_train
   TEST:
-    - ${PATHS.DATA_PATH}/realistic_10um_20M_test
+    - ${PATHS.DATA_PATH}/realistic_07_20M_test
 
 DATA_LOADING:
   NUM_WORKERS: 8
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
   NUM_SAMPLES_TEST: 512
-  TRAIN_BATCH_SIZE: 128
+  TRAIN_BATCH_SIZE: 64
   TEST_BATCH_SIZE: 32
 
 SPECTRAL_GRID:
   WAVELENGTH_MIN: 300
   WAVELENGTH_MAX: 1700
   WAVELENGTH_STEPS: 5
-
-CHECKPOINT:
-  RESUME: ${PATHS.OUTPUT_PATH}/depth-field-best.pt
-  RESET_OPTIMIZER: true
-  SAVE_VALIDATION_CHECKPOINT: true
 
 SEQUENCE:
   MAX_SEQ_LEN: 101
@@ -46,66 +38,29 @@ DEPTH_FIELD:
   ENABLED: true
   OUT_DIR: ${PATHS.OUTPUT_PATH}
   DZ_NM: 5
-  MAX_THICKNESS_NM: 10000
-  OUTPUT_SEQ_LEN: 2000
-  CORRUPTION:
-    MODE: hybrid
-    IID_FRACTION: 0.20
-    SPAN_FRACTION: 0.60
-    LAYER_FRACTION: 0.20
-    SPAN_MIN_BINS: 4 # 20 nm at DZ_NM=5
-    SPAN_MAX_BINS: 64 # 320 nm at DZ_NM=5
-    SPAN_SCALE_WITH_NOISE: true
+  MAX_THICKNESS_NM: 15000
+  OUTPUT_SEQ_LEN: 3000
   MODEL:
-    TYPE: optollama_depth_windowed_v2
-    D_MODEL: 896
+    D_MODEL: 1024
     N_BLOCKS: 8
-    N_HEADS: 8
-    FFN_MULTIPLIER: 4.0
-    SPECTRUM_PATCH_SIZE: 8 # 40 nm windows on the 5 nm grid
-    SPECTRUM_PATCH_STRIDE: 4 # 20 nm overlap stride; produces 70 spectral tokens
-    SPECTRUM_ENCODER_BLOCKS: 2
-    SPECTRUM_ENCODER_HEADS: 8
-    SPECTRUM_FFN_MULTIPLIER: 2.0
-    # V2 pools the window tokens into every block's AdaLN condition and normalizes final depth states.
-    # Ignored by transformer backbones; retained for config compatibility.
     KERNEL_SIZE: 7
-    CONV_TYPE: full
+    CONV_TYPE: separable
     DROPOUT: 0.0
     DIFFUSION_STEPS: 200
   TRAIN:
     AMP: true
-    AMP_DTYPE: auto # BF16 only when every allocated GPU supports it; otherwise FP16.
-    MAX_CONSECUTIVE_NONFINITE_STEPS: 2
     WEIGHT_DECAY: 0.01
     GRAD_CLIP: 1.0
     KEEP_OVERLIMIT_STACKS: false
     VOID_LOSS_WEIGHT: 0.05
     RANDOM_REPLACE_PROB: 0.15
     LOSS_ON_CORRUPTED_ONLY: false
-    LR_SCHEDULE:
-      ENABLED: true
-      TYPE: cosine
-      WARMUP_SAMPLES: 500000
-      TOTAL_SAMPLES: 200000000
-      START_LR: 0.00005
-      MAX_LR: ${OPTIMIZATION.LEARNING_RATE}
-      MIN_LR: 0.00001
-    TIMESTEP_SCHEDULE:
-      ENABLED: true
-      TYPE: high_noise_warmup
-      WARMUP_SAMPLES: 2000000
-      HIGH_NOISE_MIN_FRACTION: 0.6
-    EMA:
-      ENABLED: false
-      DECAY: 0.9999
-      DEVICE: model
-      VALIDATE: true
   EVAL:
     MODE: tmm
     SCORE_MODE: field
     RANK_BY: auto
     MC_SAMPLES: 10
+    MC_BATCH_SIZE: 16
     SAMPLING_STEPS: 200
     REMASK_STRATEGY: random
     TEMPERATURE: 1.0
@@ -113,19 +68,18 @@ DEPTH_FIELD:
     DETERMINISTIC: false
     TMM_DEVICE: auto
     TMM_BATCH_SIZE: 16
-    FAIL_ON_NONFINITE: true
     SAVE_SAMPLES: true
     SAMPLES_DIR: ${DEPTH_FIELD.OUT_DIR}/validation_samples
     RECORD_SPECTRA: true
-    RECORD_ALL_MC: true
+    RECORD_ALL_MC: false
 
 OPTIMIZATION:
-  LEARNING_RATE: 0.00005
-  EPOCHS: 20
+  LEARNING_RATE: 0.0001
+  EPOCHS: 1000
 
 VALIDATION:
-  EVERY_N_TRAIN_SAMPLES: 5000000
-  AT_EPOCH_END: false
+  EVERY_N_TRAIN_SAMPLES: 10000000
+  AT_EPOCH_END: true
 
 EVALUATION:
   VALID_SIM: TMM_FAST
@@ -140,26 +94,26 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  TARGET: null
-  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
-  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
-  TARGETS: []
-  TARGET_GLOB: null # ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
+  # TARGET: null
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_G_realistic.csv
+  TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
+  # TARGET: ${PATHS.DATA_PATH}/targets/target_T_G_realistic.csv
+  # TARGET_GLOB: ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
   N_TARGETS: 1
 
 TARGET_PREPROCESS:
   MISMATCH_FILL_ORDER: R>T>A
   NOISE:
     ENABLED: false
-    SIGMA_ABS: 0.1
+    SIGMA_ABS: 0.01
     SIGMA_REL: 0.0
     PER_CHANNEL:
       - 1.0
-      - 1.0
+      - 0.0
       - 1.0
     WL_MIN: 300
     WL_MAX: 1700
-    CLIP_0_1: true
+    CLIP_0_1: false
   SMOOTH:
     ENABLED: false
     METHOD: gaussian
@@ -182,12 +136,14 @@ REALISTIC_TMM:
   ENABLED: true
   ANGLES:
     - 0.0
+    - 8.0
   ANGLE_WEIGHTS:
+    - 1.0
     - 1.0
   POLARIZATIONS:
     - s
-  JITTER_REALIZATIONS: 1
-  THICKNESS_JITTER_NM: 0.0
+  JITTER_REALIZATIONS: 3
+  THICKNESS_JITTER_NM: 2.5
 
 SPECTRUM_LATENT:
   ENABLED: false
@@ -196,29 +152,12 @@ SPECTRUM_LATENT:
   FREEZE_ENCODER: true
 
 TARGET_PHYSICALIZE:
-  ENABLED: false
+  ENABLED: true
   SELECTION_TARGET: original
-  # Applies to repeated target spectra from N_TARGETS/--target-samples.
-  # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.
-  RANDOM:
-    ENABLED: false
-    MODE: gaussian
-    SEED: ${EXPERIMENT.SEED}
-    SKIP_INDEX_0: true
-    SIGMA_ABS: 0.1
-    SIGMA_REL: 0.0
-    PER_CHANNEL:
-      - 1.0
-      - 1.0
-      - 1.0
-    WL_MIN: 300
-    WL_MAX: 1700
-    CLIP_0_1: true
-    RENORMALIZE: true
   EDGE_SMOOTHING:
-    ENABLED: false
+    ENABLED: true
     SIGMA_NM: 20
-    WIN_NM: 40
+    WIN_NM: 80
   LEVEL_RELAXATION:
     ENABLED: false
     PASS_VALUE: 0.98
@@ -226,7 +165,7 @@ TARGET_PHYSICALIZE:
     ABS_SCALE: 1.0
   AE_PROJECT:
     ENABLED: true
-    CHECKPOINT: ${PATHS.DATA_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
+    CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
     DEVICE: null
     MODE: all
     BLEND: 1.0
@@ -240,8 +179,8 @@ TARGET_PHYSICALIZE:
     SOURCE_PATHS: []
     CHUNK_SIZE: 512000
     DEVICE: null
-    METRIC_ROI_MIN: ${EVALUATION.ROI_MIN}
-    METRIC_ROI_MAX: ${EVALUATION.ROI_MAX}
+    METRIC_ROI_MIN: 300 #${EVALUATION.ROI_MIN}
+    METRIC_ROI_MAX: 1700 #${EVALUATION.ROI_MAX}
     METRIC_CHANNELS:
       - R
       - T
@@ -301,7 +240,6 @@ REALISTIC_DATASET:
     MIN: 10
     MAX: 500
     STEP: 5
-    MAX_TOTAL_NM: 10000
   SPECTRUM:
     WAVELENGTH_MIN: ${SPECTRAL_GRID.WAVELENGTH_MIN}
     WAVELENGTH_MAX: ${SPECTRAL_GRID.WAVELENGTH_MAX}
@@ -309,12 +247,14 @@ REALISTIC_DATASET:
   REALISTIC_AVERAGING:
     ANGLES:
       - 0.0
+      - 8.0
     ANGLE_WEIGHTS:
+      - 1.0
       - 1.0
     POLARIZATIONS:
       - s
-    JITTER_REALIZATIONS: 1
-    THICKNESS_JITTER_NM: 0.0
+    JITTER_REALIZATIONS: 3
+    THICKNESS_JITTER_NM: 2.5
     SAVE_DTYPE: float16
   STRUCTURES:
     CENTER_MIN: 100

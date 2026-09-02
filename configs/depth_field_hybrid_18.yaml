@@ -4,7 +4,7 @@ EXPERIMENT:
   SEED: 3
 
 PATHS:
-  DATA_PATH: /scratch/htc/jschaibl/repos/OptoLlama/data
+  DATA_PATH: E:/repos/OptoLlama/data #/scratch/htc/jschaibl/repos/OptoLlama/data
   MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
   TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
   OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
@@ -25,7 +25,7 @@ DATA_LOADING:
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
   NUM_SAMPLES_TEST: 512
-  TRAIN_BATCH_SIZE: 80
+  TRAIN_BATCH_SIZE: 88
   TEST_BATCH_SIZE: 32
 
 SPECTRAL_GRID:
@@ -114,7 +114,7 @@ DEPTH_FIELD:
       HIGH_NOISE_MIN_FRACTION: 0.6
     EMA:
       ENABLED: true
-      DECAY: 0.9999
+      DECAY: 0.9998
       DEVICE: model # model | cpu
       VALIDATE: true
   EVAL:
@@ -156,9 +156,9 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  TARGET: null
+  # TARGET: null
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
-  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
   TARGETS: []
   TARGET_GLOB: null # ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
   N_TARGETS: 1
@@ -212,7 +212,7 @@ SPECTRUM_LATENT:
   FREEZE_ENCODER: true
 
 TARGET_PHYSICALIZE:
-  ENABLED: false
+  ENABLED: true
   SELECTION_TARGET: original # original | conditioned
   # Applies to repeated target spectra from N_TARGETS/--target-samples.
   # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.

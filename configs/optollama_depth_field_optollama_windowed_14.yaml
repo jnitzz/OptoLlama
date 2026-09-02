@@ -25,7 +25,7 @@ DATA_LOADING:
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
   NUM_SAMPLES_TEST: 512
-  TRAIN_BATCH_SIZE: 64
+  TRAIN_BATCH_SIZE: 128
   TEST_BATCH_SIZE: 32
 
 SPECTRAL_GRID:
@@ -200,7 +200,7 @@ SPECTRUM_LATENT:
   FREEZE_ENCODER: true
 
 TARGET_PHYSICALIZE:
-  ENABLED: false
+  ENABLED: true
   SELECTION_TARGET: original # original | conditioned
   # Applies to repeated target spectra from N_TARGETS/--target-samples.
   # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.

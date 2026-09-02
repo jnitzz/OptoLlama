@@ -34,7 +34,7 @@ SPECTRAL_GRID:
   WAVELENGTH_STEPS: 5
 
 CHECKPOINT:
-  RESUME: null
+  RESUME: null # null | false: fresh start; true: depth-field-last.pt; or an explicit checkpoint path
   RESET_OPTIMIZER: false
   SAVE_VALIDATION_CHECKPOINT: true
 
@@ -49,7 +49,7 @@ DEPTH_FIELD:
   MAX_THICKNESS_NM: 10000
   OUTPUT_SEQ_LEN: 2000
   CORRUPTION:
-    MODE: hybrid
+    MODE: hybrid # iid | hybrid
     IID_FRACTION: 0.20
     SPAN_FRACTION: 0.60
     LAYER_FRACTION: 0.20
@@ -58,10 +58,10 @@ DEPTH_FIELD:
     SPAN_SCALE_WITH_NOISE: true
     # q(t) = RANDOM_REPLACE_PROB * (1 - noise_probability(t))^POWER.
     # This gives an all-MASK input at maximum noise and peaks replacements at intermediate noise.
-    RANDOM_REPLACE_SCHEDULE: noise_complement
+    RANDOM_REPLACE_SCHEDULE: noise_complement # constant | noise_complement
     RANDOM_REPLACE_POWER: 1.0
   MODEL:
-    TYPE: optollama_depth_windowed_v3
+    TYPE: optollama_depth_windowed_v3 # conv | attention | optollama_depth | optollama_depth_windowed | optollama_depth_windowed_v2 | optollama_depth_windowed_v3
     D_MODEL: 896
     N_BLOCKS: 8
     N_HEADS: 8
@@ -74,12 +74,12 @@ DEPTH_FIELD:
     # V3 adds one pooled global spectrum token to cross-attention while AdaLN remains timestep-only.
     # Ignored by transformer backbones; retained for config compatibility.
     KERNEL_SIZE: 7
-    CONV_TYPE: full
+    CONV_TYPE: full # full | separable; used only by TYPE: conv
     DROPOUT: 0.0
     DIFFUSION_STEPS: 200
   TRAIN:
     AMP: true
-    AMP_DTYPE: auto # BF16 only when every allocated GPU supports it; otherwise FP16.
+    AMP_DTYPE: auto # auto | float16/fp16 | bfloat16/bf16; auto uses BF16 only when every GPU supports it
     MAX_CONSECUTIVE_NONFINITE_STEPS: 2
     WEIGHT_DECAY: 0.01
     GRAD_CLIP: 1.0
@@ -89,7 +89,7 @@ DEPTH_FIELD:
     LOSS_ON_CORRUPTED_ONLY: false
     LR_SCHEDULE:
       ENABLED: true
-      TYPE: cosine
+      TYPE: cosine # cosine | linear | constant/flat
       WARMUP_SAMPLES: 500000
       TOTAL_SAMPLES: 200000000
       START_LR: 0.00005
@@ -97,25 +97,25 @@ DEPTH_FIELD:
       MIN_LR: 0.00001
     TIMESTEP_SCHEDULE:
       ENABLED: true
-      TYPE: high_noise_warmup
+      TYPE: high_noise_warmup # high_noise_warmup; aliases: high_noise | noise_warmup
       WARMUP_SAMPLES: 2000000
       HIGH_NOISE_MIN_FRACTION: 0.6
     EMA:
       ENABLED: false
       DECAY: 0.9999
-      DEVICE: model
+      DEVICE: model # model | cpu
       VALIDATE: true
   EVAL:
-    MODE: tmm
-    SCORE_MODE: field
-    RANK_BY: auto
+    MODE: tmm # tmm | denoise | both
+    SCORE_MODE: field # field | decoded | both
+    RANK_BY: auto # auto | field | decoded
     MC_SAMPLES: 10
     SAMPLING_STEPS: 200
-    REMASK_STRATEGY: random
-    TEMPERATURE: 1.0
-    TOP_K: 0
+    REMASK_STRATEGY: random # random | confidence
+    TEMPERATURE: 1.0 # >0: sampling temperature; <=0: argmax
+    TOP_K: 0 # 0 or >= material classes: disabled; otherwise retain top k classes
     DETERMINISTIC: false
-    TMM_DEVICE: auto
+    TMM_DEVICE: auto # auto/same | cpu | cuda | cuda:N
     TMM_BATCH_SIZE: 16
     FAIL_ON_NONFINITE: true
     SAVE_SAMPLES: true
@@ -132,11 +132,11 @@ VALIDATION:
   AT_EPOCH_END: false
 
 EVALUATION:
-  VALID_SIM: TMM_FAST
+  VALID_SIM: TMM_FAST # TMM_FAST | NO_SIM
   INCIDENCE_ANGLE: 0
   ROI_MIN: 300
   ROI_MAX: 1700
-  MAE_CHANNELS: null
+  MAE_CHANNELS: null # null: all channels; or any list subset of [R, A, T]
   COMMON_MAE:
     ENABLED: true
     WAVELENGTH_MIN: 300
@@ -144,15 +144,15 @@ EVALUATION:
     WAVELENGTH_STEPS: 10
 
 TARGET_SELECTION:
-  TARGET: null
+  # TARGET: null
   # TARGET: ${PATHS.DATA_PATH}/targets/target_R_1300_1700_T_rest_realistic.csv
-  # TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
   TARGETS: []
   TARGET_GLOB: null # ${PATHS.DATA_PATH}/targets/plants_realistic/target_T*
   N_TARGETS: 1
 
 TARGET_PREPROCESS:
-  MISMATCH_FILL_ORDER: R>T>A
+  MISMATCH_FILL_ORDER: R>T>A # any priority permutation of R, A, T, e.g. R>A>T | R>T>A | A>R>T
   NOISE:
     ENABLED: false
     SIGMA_ABS: 0.1
@@ -166,20 +166,20 @@ TARGET_PREPROCESS:
     CLIP_0_1: true
   SMOOTH:
     ENABLED: false
-    METHOD: gaussian
+    METHOD: gaussian # gaussian | boxcar
     WIN: 10
     SIGMA: 1.5
   FILL_OUTSIDE_ROI:
     ENABLED: false
     SKIP_INDEX_0: true
-    MODE: smooth_random
+    MODE: smooth_random # flat_random | tilted_random | smooth_random | prior_plus_noise
     STRENGTH: 0.65
     KERNEL_SIZE: 20
 
 PLOTTING:
   SAMPLE_WITH_NN: true
   NN_CHUNK_SIZE: 512000
-  NN_DEVICE: null
+  NN_DEVICE: null # null: auto | cpu | cuda | cuda:N
   NK: true
 
 REALISTIC_TMM:
@@ -189,24 +189,24 @@ REALISTIC_TMM:
   ANGLE_WEIGHTS:
     - 1.0
   POLARIZATIONS:
-    - s
+    - s # s | p; include both entries to average both polarizations
   JITTER_REALIZATIONS: 1
   THICKNESS_JITTER_NM: 0.0
 
 SPECTRUM_LATENT:
   ENABLED: false
   CHECKPOINT: ${PATHS.OUTPUT_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
-  MODE: token
+  MODE: token # token is currently the only implemented mode
   FREEZE_ENCODER: true
 
 TARGET_PHYSICALIZE:
   ENABLED: false
-  SELECTION_TARGET: original
+  SELECTION_TARGET: original # original | conditioned
   # Applies to repeated target spectra from N_TARGETS/--target-samples.
   # Sample index 0 stays unchanged when SKIP_INDEX_0 is true.
   RANDOM:
     ENABLED: false
-    MODE: gaussian
+    MODE: gaussian # gaussian; aliases: noise | gaussian_noise
     SEED: ${EXPERIMENT.SEED}
     SKIP_INDEX_0: true
     SIGMA_ABS: 0.1
@@ -231,8 +231,8 @@ TARGET_PHYSICALIZE:
   AE_PROJECT:
     ENABLED: true
     CHECKPOINT: ${PATHS.DATA_PATH}/spectrum_autoencoder/spectrum_autoencoder-best.pt
-    DEVICE: null
-    MODE: all
+    DEVICE: null # null: inherit inference device | cpu | cuda | cuda:N
+    MODE: all # all | outside_roi
     BLEND: 1.0
     ROI_BLEND: 0.0
     OUTSIDE_ROI_BLEND: 0.8
@@ -240,17 +240,17 @@ TARGET_PHYSICALIZE:
     TRANSITION_WIDTH_NM: 200
   NN_BLEND:
     ENABLED: false
-    SOURCE_SPLIT: train
+    SOURCE_SPLIT: train # train | test; ignored when SOURCE_PATHS is non-empty
     SOURCE_PATHS: []
     CHUNK_SIZE: 512000
-    DEVICE: null
+    DEVICE: null # null: inherit inference device | cpu | cuda | cuda:N
     METRIC_ROI_MIN: ${EVALUATION.ROI_MIN}
     METRIC_ROI_MAX: ${EVALUATION.ROI_MAX}
     METRIC_CHANNELS:
       - R
       - T
       - A
-    MODE: outside_roi
+    MODE: outside_roi # all | outside_roi
     ROI_BLEND: 0.0
     OUTSIDE_ROI_BLEND: 0.8
     TRANSITION_BLEND: 0.4
@@ -262,7 +262,7 @@ REALISTIC_DATASET:
   SHARD_SIZE: 100000
   BATCH_SIZE: 512
   SEED: ${EXPERIMENT.SEED}
-  DEVICE: cuda
+  DEVICE: cuda # cpu | cuda | cuda:N
   OVERWRITE: true
   FAMILY_WEIGHTS:
     random_dielectric: 0.30
@@ -319,7 +319,7 @@ REALISTIC_DATASET:
       - s
     JITTER_REALIZATIONS: 1
     THICKNESS_JITTER_NM: 0.0
-    SAVE_DTYPE: float16
+    SAVE_DTYPE: float16 # float16 | float32
   STRUCTURES:
     CENTER_MIN: 100
     CENTER_MAX: 2200
