@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from optollama.data.open_layer import (
     load_open_layer_target,
 )
 from optollama.model.open_layer_flow import OpenLayerFlow, OpenLayerFlowConfig, layer_slot_corruption_mask
+from scripts.train_open_layer_flow import averaged_metrics, make_loader, run_loss_epoch
 
 # ruff: noqa: D103
 
@@ -349,3 +351,96 @@ def test_layer_batch_to_runs_merges_sampled_adjacent_materials() -> None:
         layer_mask=torch.ones(1, 3, dtype=torch.bool),
     )
     assert runs == [[{"material": "C", "thickness_nm": 30.0}, {"material": "A", "thickness_nm": 30.0}]]
+
+
+def test_sharded_open_layer_loader_forces_single_worker_and_finite_length() -> None:
+    class FakeShardedDataset(torch.utils.data.IterableDataset):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            super().__init__()
+
+        def __len__(self) -> int:
+            return 8
+
+        def __iter__(self):
+            yield from range(8)
+
+    cfg = {
+        "DATA_PATH_TRAIN": "unused",
+        "TRAIN_BATCH_SIZE": 2,
+        "NUM_WORKERS": 8,
+        "SHARDED_LOADING": True,
+    }
+    with mock.patch("optollama.data.ShardedSpectraDataset", FakeShardedDataset):
+        _, loader = make_loader(
+            cfg,
+            split="train",
+            collator=lambda batch: batch,  # type: ignore[arg-type]
+            subset_n=8,
+            rank=0,
+            world_size=1,
+        )
+    assert loader.num_workers == 0
+    assert len(loader) == 4
+    assert list(loader) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+
+def test_averaged_metrics_are_sample_weighted() -> None:
+    totals = torch.tensor([10.0, 3.0, 4.0])
+    assert averaged_metrics(totals, ("loss", "material_accuracy")) == {
+        "loss": 2.5,
+        "material_accuracy": 0.75,
+    }
+
+
+def test_open_layer_epoch_skips_nonfinite_gradient_without_poisoning_weights() -> None:
+    class InfiniteBackward(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: object, value: torch.Tensor) -> torch.Tensor:
+            del ctx
+            return value * 0.0 + 1.0
+
+        @staticmethod
+        def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+            del ctx
+            return (torch.full_like(grad_output, float("inf")),)
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    calls = 0
+
+    def fake_training_loss(_model: torch.nn.Module, _batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        loss = InfiniteBackward.apply(model.weight.sum()) if calls == 1 else model.weight.square().sum()
+        zero = loss.detach() * 0.0
+        return {
+            "loss": loss,
+            "material_loss": zero,
+            "thickness_loss": zero,
+            "material_accuracy": zero,
+            "full_material_accuracy": zero,
+            "mean_timestep": zero,
+            "corrupted_fraction": zero,
+            "masked_fraction": zero,
+            "replaced_fraction": zero,
+            "supervised_samples": torch.ones((), dtype=torch.long),
+        }
+
+    loader = [{"dummy": torch.zeros(1)}, {"dummy": torch.zeros(1)}]
+    with mock.patch("scripts.train_open_layer_flow.compute_training_loss", side_effect=fake_training_loss):
+        metrics = run_loss_epoch(
+            model=model,
+            loader=loader,  # type: ignore[arg-type]
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            scaler=scaler,
+            amp_dtype=None,
+            grad_clip=1.0,
+            epoch=0,
+            epochs=1,
+            max_consecutive_nonfinite_steps=2,
+        )
+    assert metrics["nonfinite_gradient_steps"] == 1
+    assert metrics["optimizer_steps"] == 1
+    assert torch.isfinite(model.weight).all()

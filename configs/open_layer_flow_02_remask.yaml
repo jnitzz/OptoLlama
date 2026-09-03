@@ -17,7 +17,8 @@ PATHS:
     - ${PATHS.DATA_PATH}/realistic_10um_20M_test
 
 DATA_LOADING:
-  NUM_WORKERS: 8
+  # Sharded iterable loading must stay single-worker to avoid replaying each rank range.
+  NUM_WORKERS: 0
   SHARDED_LOADING: true
   NUM_SAMPLES_TRAIN: 20000000
   NUM_SAMPLES_TEST: 512
@@ -90,6 +91,7 @@ OPEN_LAYER:
     LEARNING_RATE: 0.0001
     WEIGHT_DECAY: 0.01
     GRAD_CLIP: 1.0
+    MAX_CONSECUTIVE_NONFINITE_STEPS: 8 # 0 aborts on the first non-finite step
     AMP: true
     AMP_DTYPE: auto # auto | float16 | bfloat16
 

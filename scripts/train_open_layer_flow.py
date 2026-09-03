@@ -184,6 +184,11 @@ def make_loader(
     batch_size = int(cfg["TRAIN_BATCH_SIZE" if train else "TEST_BATCH_SIZE"])
     workers = int(cfg.get("NUM_WORKERS", 0))
     if bool(cfg.get("SHARDED_LOADING", False)):
+        if workers and rank == 0:
+            print(
+                f"Sharded open-layer loading forces NUM_WORKERS=0 (configured {workers}) "
+                "to prevent each worker from replaying the rank-local sample range."
+            )
         sharded_dataset = optollama.data.ShardedSpectraDataset(
             paths,
             split=split,
@@ -196,7 +201,7 @@ def make_loader(
         loader = DataLoader(
             sharded_dataset,
             batch_size=batch_size,
-            num_workers=workers,
+            num_workers=0,
             pin_memory=torch.cuda.is_available(),
             drop_last=train,
             collate_fn=collator,
@@ -227,6 +232,33 @@ def reduce_totals(totals: torch.Tensor) -> torch.Tensor:
     if optollama.utils.is_ddp():
         torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
     return totals
+
+
+def synchronized_finite(value: torch.Tensor) -> bool:
+    """Return whether a tensor is finite on every distributed rank."""
+    finite = torch.tensor(
+        int(bool(torch.isfinite(value.detach()).all().item())),
+        dtype=torch.int32,
+        device=value.device,
+    )
+    if optollama.utils.is_ddp():
+        torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
+    return bool(finite.item())
+
+
+def reduce_max(values: torch.Tensor) -> torch.Tensor:
+    """Take distributed maxima for counters synchronized per optimizer step."""
+    if optollama.utils.is_ddp():
+        torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MAX)
+    return values
+
+
+def averaged_metrics(totals: torch.Tensor, metric_keys: tuple[str, ...]) -> dict[str, float]:
+    """Convert sample-weighted metric totals into running averages."""
+    samples = float(totals[-1].item())
+    if samples <= 0:
+        return {key: 0.0 for key in metric_keys}
+    return {key: float(totals[idx].item() / samples) for idx, key in enumerate(metric_keys)}
 
 
 def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenLayerFlow:
@@ -266,6 +298,7 @@ def run_loss_epoch(
     epoch: int,
     epochs: int,
     max_steps: int | None = None,
+    max_consecutive_nonfinite_steps: int = 8,
 ) -> dict[str, float]:
     """Train or validate the denoising objectives for one epoch."""
     train = optimizer is not None
@@ -282,10 +315,13 @@ def run_loss_epoch(
         "replaced_fraction",
     )
     totals = torch.zeros(len(metric_keys) + 1, dtype=torch.float64, device=device)
+    stability = torch.zeros(4, dtype=torch.long, device=device)
+    consecutive_nonfinite = 0
+    show_progress = not (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0)
     progress = tqdm.tqdm(
         loader,
         desc=f"Epoch {epoch + 1}/{epochs} open-layer {'train' if train else 'val'}",
-        disable=(torch.distributed.is_initialized() and torch.distributed.get_rank() != 0),
+        disable=not show_progress,
     )
     for step, raw_batch in enumerate(progress):
         if max_steps is not None and step >= max_steps:
@@ -298,15 +334,60 @@ def run_loss_epoch(
         with context, autocast_context(device, amp_dtype):
             outputs = compute_training_loss(model, batch)
             loss = outputs["loss"]
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError(f"Non-finite open-layer loss at epoch={epoch + 1}, step={step}.")
+        if not synchronized_finite(loss):
+            if not train:
+                raise FloatingPointError(f"Non-finite open-layer validation loss at epoch={epoch + 1}, step={step}.")
+            stability[0] += 1
+            consecutive_nonfinite += 1
+            assert optimizer is not None
+            optimizer.zero_grad(set_to_none=True)
+            if show_progress:
+                tqdm.tqdm.write(
+                    f"Skipped non-finite open-layer forward step at epoch={epoch + 1}, step={step}; "
+                    f"consecutive={consecutive_nonfinite}."
+                )
+            limit = int(max_consecutive_nonfinite_steps)
+            if limit <= 0 or consecutive_nonfinite >= limit:
+                raise FloatingPointError(
+                    f"Aborting after {consecutive_nonfinite} consecutive non-finite open-layer forward steps "
+                    f"at epoch={epoch + 1}, step={step}."
+                )
+            continue
         if train:
             assert optimizer is not None
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, error_if_nonfinite=True)
+            clip_limit = float(grad_clip) if grad_clip > 0.0 else float("inf")
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit, error_if_nonfinite=False)
+            if not synchronized_finite(norm):
+                stability[1] += 1
+                consecutive_nonfinite += 1
+                if scaler.is_enabled():
+                    scale = float(scaler.get_scale())
+                    scaler.update(new_scale=max(scale * 0.5, 1.0))
+                    stability[2] += 1
+                optimizer.zero_grad(set_to_none=True)
+                if show_progress:
+                    tqdm.tqdm.write(
+                        f"Skipped non-finite open-layer gradient step at epoch={epoch + 1}, step={step}; "
+                        f"consecutive={consecutive_nonfinite}."
+                    )
+                limit = int(max_consecutive_nonfinite_steps)
+                if limit <= 0 or consecutive_nonfinite >= limit:
+                    raise FloatingPointError(
+                        f"Aborting after {consecutive_nonfinite} consecutive non-finite open-layer gradient steps "
+                        f"at epoch={epoch + 1}, step={step}."
+                    )
+                continue
+            scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
             scaler.step(optimizer)
             scaler.update()
+            amp_skipped = bool(scale_before is not None and float(scaler.get_scale()) < scale_before)
+            if amp_skipped:
+                stability[2] += 1
+            else:
+                stability[3] += 1
+                consecutive_nonfinite = 0
         else:
             norm = torch.zeros((), device=device)
 
@@ -316,18 +397,28 @@ def run_loss_epoch(
             dtype=torch.float64,
             device=device,
         )
+        running = averaged_metrics(totals, metric_keys)
         progress.set_postfix(
-            loss=f"{float(loss.detach().item()):.4f}",
-            mat=f"{100.0 * float(outputs['material_accuracy'].item()):.1f}%",
-            full=f"{100.0 * float(outputs['full_material_accuracy'].item()):.1f}%",
+            loss=f"{running['loss']:.4f}",
+            mat=f"{100.0 * running['material_accuracy']:.1f}%",
+            full=f"{100.0 * running['full_material_accuracy']:.1f}%",
             grad=f"{float(norm):.2f}",
+            nf=f"{int(stability[0].item() + stability[1].item())}",
+            amp_skip=f"{int(stability[2].item())}",
         )
 
     totals = reduce_totals(totals)
+    stability = reduce_max(stability)
     samples = float(totals[-1].item())
     if samples <= 0:
         raise RuntimeError("No supervised samples remained after applying material holdouts.")
-    return {key: float(totals[idx].item() / samples) for idx, key in enumerate(metric_keys)} | {"samples": int(samples)}
+    return averaged_metrics(totals, metric_keys) | {
+        "samples": int(samples),
+        "nonfinite_forward_steps": int(stability[0].item()),
+        "nonfinite_gradient_steps": int(stability[1].item()),
+        "amp_skipped_steps": int(stability[2].item()),
+        "optimizer_steps": int(stability[3].item()),
+    }
 
 
 @torch.no_grad()
@@ -473,6 +564,7 @@ def main() -> None:
     amp_dtype = resolve_amp_dtype(amp_enabled, device, str(train_cfg.get("AMP_DTYPE", "auto")))
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     grad_clip = float(train_cfg.get("GRAD_CLIP", 1.0))
+    max_consecutive_nonfinite_steps = int(train_cfg.get("MAX_CONSECUTIVE_NONFINITE_STEPS", 8))
     epochs = int(args.epochs or train_cfg.get("EPOCHS", 10))
     start_epoch = 0
     history: list[dict[str, Any]] = []
@@ -533,6 +625,7 @@ def main() -> None:
             epoch=epoch,
             epochs=epochs,
             max_steps=args.max_train_steps,
+            max_consecutive_nonfinite_steps=max_consecutive_nonfinite_steps,
         )
         val_metrics = run_loss_epoch(
             model=model,

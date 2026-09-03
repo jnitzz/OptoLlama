@@ -44,6 +44,23 @@ sbatch --nodes=4 --ntasks-per-node=4 --gres=gpu:4 \
   --config configs/open_layer_flow_01.yaml"
 ```
 
+Sharded loading intentionally uses `NUM_WORKERS: 0`. `ShardedSpectraDataset`
+already partitions samples across DDP ranks; additional DataLoader workers would
+each replay the complete rank-local range and multiply the apparent epoch
+length. With 20 million samples, four ranks, and batch size 64 per rank, the
+correct progress-bar length is 78,125 batches.
+
+Training skips isolated non-finite forward or gradient steps synchronously on
+all ranks. The progress bar reports `nf` and `amp_skip`; the history records
+`nonfinite_forward_steps`, `nonfinite_gradient_steps`, `amp_skipped_steps`, and
+`optimizer_steps`. `MAX_CONSECUTIVE_NONFINITE_STEPS` controls when repeated
+failures abort instead of being hidden.
+
+The live `loss`, `mat`, and `full` values are cumulative, sample-weighted
+averages for the current epoch on the displayed rank. Final epoch metrics are
+reduced across all ranks. `grad` remains the current step's gradient norm so
+that short numerical spikes stay visible.
+
 For a bounded smoke run:
 
 ```bash
