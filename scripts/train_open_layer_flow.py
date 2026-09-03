@@ -139,6 +139,8 @@ def make_collator(
     query = nested(block, "QUERY", default={}) or {}
     bank = nested(block, "MATERIAL_BANK", default={}) or {}
     thickness = nested(block, "THICKNESS", default={}) or {}
+    synchronize_query_shapes = bool(query.get("SYNC_SHAPES_ACROSS_RANKS", True))
+    query_shape_seed = int(cfg.get("SEED", 0)) + (0 if train else 10_000) if synchronize_query_shapes else None
     transform = optollama.data.ThicknessTransform(
         min_nm=float(thickness.get("MIN_NM", 5.0)),
         max_nm=float(thickness.get("MAX_LAYER_NM", thickness.get("MAX_NM", 10_000.0))),
@@ -163,6 +165,7 @@ def make_collator(
         thickness_transform=transform,
         coverage_tolerance_nm=float(query.get("MATERIAL_COVERAGE_TOLERANCE_NM", 0.0)),
         seed=seed,
+        query_shape_seed=query_shape_seed,
     )
 
 
@@ -582,6 +585,12 @@ def main() -> None:
         print(
             f"Open-layer model: parameters={parameter_count:,}, train_samples={train_n:,}, "
             f"world={world_size}, batch/rank={cfg['TRAIN_BATCH_SIZE']}"
+        )
+        query_cfg = nested(block, "QUERY", default={}) or {}
+        print(
+            f"Open-layer query sampling: mode={query_cfg.get('SAMPLING', 'mixed')}, "
+            f"points={query_cfg.get('MIN_POINTS', 64)}-{query_cfg.get('MAX_POINTS', len(cfg['WAVELENGTHS']))}, "
+            f"sync_shapes_across_ranks={bool(query_cfg.get('SYNC_SHAPES_ACROSS_RANKS', True))}"
         )
         print(
             f"Open-layer material process: {model_config.material_process}, "

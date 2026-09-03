@@ -310,21 +310,23 @@ def sample_query_indices(
     max_points: int,
     mode: str,
     generator: torch.Generator | None = None,
+    shape_generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Sample a sorted fixed-grid subset for one collated batch."""
+    """Sample a sorted fixed-grid subset with optionally shared shape randomness."""
     if width <= 0:
         raise ValueError(f"width must be positive, got {width}.")
     low = max(1, min(int(min_points), width))
     high = max(low, min(int(max_points), width))
+    shape_generator = generator if shape_generator is None else shape_generator
     normalized_mode = str(mode).lower().replace("-", "_")
     if normalized_mode == "mixed":
-        draw = int(torch.randint(0, 3, (1,), generator=generator).item())
+        draw = int(torch.randint(0, 3, (1,), generator=shape_generator).item())
         normalized_mode = ("full", "window", "random")[draw]
     if normalized_mode == "full":
         return torch.arange(width, dtype=torch.long)
     if normalized_mode not in {"window", "random"}:
         raise ValueError(f"Unknown query sampling mode {mode!r}; expected full, window, random, or mixed.")
-    count = int(torch.randint(low, high + 1, (1,), generator=generator).item()) if high > low else low
+    count = int(torch.randint(low, high + 1, (1,), generator=shape_generator).item()) if high > low else low
     if normalized_mode == "window":
         start_max = width - count
         start = int(torch.randint(0, start_max + 1, (1,), generator=generator).item()) if start_max > 0 else 0
@@ -357,6 +359,7 @@ class OpenLayerBatchCollator:
         thickness_transform: ThicknessTransform | None = None,
         coverage_tolerance_nm: float = 0.0,
         seed: int = 0,
+        query_shape_seed: int | None = None,
     ) -> None:
         self.wavelengths_nm = wavelengths_nm.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         self.catalog = catalog
@@ -383,6 +386,7 @@ class OpenLayerBatchCollator:
         self.thickness_transform = thickness_transform or ThicknessTransform()
         self.coverage_tolerance_nm = float(coverage_tolerance_nm)
         self.seed = int(seed)
+        self.query_shape_seed = None if query_shape_seed is None else int(query_shape_seed)
         self.calls = 0
         if self.max_layers <= 0 or self.max_candidates <= 0:
             raise ValueError("max_layers and max_candidates must be positive.")
@@ -390,13 +394,19 @@ class OpenLayerBatchCollator:
             # Per-sample banks can still be smaller, but the complete catalog is not assumed to fit.
             pass
 
-    def _generator(self) -> torch.Generator:
-        generator = torch.Generator()
+    def _generators(self) -> tuple[torch.Generator, torch.Generator]:
+        """Return rank-local content and optionally rank-shared shape generators."""
         worker = torch.utils.data.get_worker_info()
         worker_id = 0 if worker is None else int(worker.id) + 1
-        generator.manual_seed(self.seed + self.calls * 1_000_003 + worker_id * 97)
+        call = self.calls
         self.calls += 1
-        return generator
+        content_generator = torch.Generator()
+        content_generator.manual_seed(self.seed + call * 1_000_003 + worker_id * 97)
+        if self.query_shape_seed is None:
+            return content_generator, content_generator
+        shape_generator = torch.Generator()
+        shape_generator.manual_seed(self.query_shape_seed + call * 1_000_003 + worker_id * 97)
+        return content_generator, shape_generator
 
     def _candidate_indices(self, true_ids: Sequence[int], generator: torch.Generator) -> torch.Tensor:
         unique_true = list(dict.fromkeys(int(value) for value in true_ids))
@@ -423,7 +433,7 @@ class OpenLayerBatchCollator:
         """Collate raw dataset tuples into model-ready tensors."""
         if not samples:
             raise ValueError("Cannot collate an empty sample list.")
-        generator = self._generator()
+        generator, shape_generator = self._generators()
         width = int(samples[0][0].shape[-1])
         if width != len(self.wavelengths_nm):
             raise ValueError(f"Dataset spectrum width {width} does not match wavelength grid {len(self.wavelengths_nm)}.")
@@ -433,6 +443,7 @@ class OpenLayerBatchCollator:
             max_points=self.max_query_points,
             mode=self.query_sampling,
             generator=generator,
+            shape_generator=shape_generator,
         )
         query_wavelengths = self.wavelengths_nm[query_indices]
         all_curves = self.catalog.interpolate(

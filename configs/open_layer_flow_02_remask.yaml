@@ -51,6 +51,7 @@ OPEN_LAYER:
     MIN_POINTS: 64
     MAX_POINTS: 281
     SAMPLING: mixed # full | window | random | mixed
+    SYNC_SHAPES_ACROSS_RANKS: true # shared mode/count; rank-local wavelength positions
     WAVELENGTH_SCALE_NM: 1000
     FOURIER_BANDS: 4
     MATERIAL_COVERAGE_TOLERANCE_NM: 100

@@ -61,6 +61,11 @@ averages for the current epoch on the displayed rank. Final epoch metrics are
 reduced across all ranks. `grad` remains the current step's gradient norm so
 that short numerical spikes stay visible.
 
+With `SYNC_SHAPES_ACROSS_RANKS: true`, all DDP ranks use the same query sampling
+mode and wavelength count on a given batch. Window starts, random wavelength
+positions, candidate order, and distractors remain rank-local. This balances
+per-rank tensor shapes without reducing the diversity of query content.
+
 For a bounded smoke run:
 
 ```bash

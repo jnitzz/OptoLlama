@@ -12,6 +12,7 @@ from optollama.data.open_layer import (
     ThicknessTransform,
     layer_batch_to_runs,
     load_open_layer_target,
+    sample_query_indices,
 )
 from optollama.model.open_layer_flow import OpenLayerFlow, OpenLayerFlowConfig, layer_slot_corruption_mask
 from scripts.train_open_layer_flow import averaged_metrics, make_loader, run_loss_epoch
@@ -59,6 +60,34 @@ def test_thickness_transform_roundtrip() -> None:
     transform = ThicknessTransform(5.0, 10_000.0)
     values = torch.tensor([5.0, 20.0, 300.0, 10_000.0])
     assert torch.allclose(transform.decode(transform.encode(values)), values, rtol=1.0e-5, atol=1.0e-4)
+
+
+def test_query_shapes_can_be_synchronized_without_sharing_positions() -> None:
+    shape_a = torch.Generator().manual_seed(41)
+    shape_b = torch.Generator().manual_seed(41)
+    content_a = torch.Generator().manual_seed(3)
+    content_b = torch.Generator().manual_seed(19)
+    position_differences = 0
+    for _ in range(32):
+        indices_a = sample_query_indices(
+            281,
+            min_points=64,
+            max_points=281,
+            mode="mixed",
+            generator=content_a,
+            shape_generator=shape_a,
+        )
+        indices_b = sample_query_indices(
+            281,
+            min_points=64,
+            max_points=281,
+            mode="mixed",
+            generator=content_b,
+            shape_generator=shape_b,
+        )
+        assert len(indices_a) == len(indices_b)
+        position_differences += int(not torch.equal(indices_a, indices_b))
+    assert position_differences > 0
 
 
 def test_coordinate_target_loader_accepts_long_form_csv(tmp_path: Path) -> None:
