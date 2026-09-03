@@ -93,6 +93,30 @@ def test_collator_builds_local_material_targets_and_merges_neighbors() -> None:
     assert batch["candidate_global_ids"].tolist() == [[0, 1, 2]]
 
 
+def test_collator_keeps_empty_stacks_batch_safe_but_unsupervised() -> None:
+    catalog = synthetic_catalog()
+    collator = OpenLayerBatchCollator(
+        wavelengths_nm=torch.tensor([300.0, 500.0, 700.0]),
+        catalog=catalog,
+        idx_to_token={0: "<PAD>", 1: "<MSK>", 2: "<EOS>"},
+        eos_idx=2,
+        pad_idx=0,
+        msk_idx=1,
+        max_layers=3,
+        max_candidates=3,
+        min_query_points=3,
+        max_query_points=3,
+        query_sampling="full",
+        randomize_candidates=False,
+        random_distractors=False,
+    )
+    batch = collator([(torch.rand(3, 3), torch.tensor([2, 0, 0]), 121)])
+    assert batch["sample_mask"].tolist() == [False]
+    assert batch["layer_mask"].tolist() == [[True, False, False]]
+    assert batch["material_targets"].tolist() == [[-100, -100, -100]]
+    assert batch["candidate_mask"].any()
+
+
 def test_material_holdout_removes_distractor_exposure_and_supervision() -> None:
     catalog = synthetic_catalog()
     tokens = ["<PAD>", "<MSK>", "<EOS>", "A_10", "B_20", "C_30"]

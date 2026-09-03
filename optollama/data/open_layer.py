@@ -410,6 +410,10 @@ class OpenLayerBatchCollator:
         selected = unique_true
         if self.random_distractors:
             selected += distractors[: self.max_candidates - len(unique_true)]
+        if not selected:
+            # Empty stacks are unsupervised, but still need a non-empty bank so
+            # their placeholder layer can pass safely through attention.
+            selected = [0]
         if self.randomize_candidates and len(selected) > 1:
             order = torch.randperm(len(selected), generator=generator).tolist()
             selected = [selected[idx] for idx in order]
@@ -462,28 +466,30 @@ class OpenLayerBatchCollator:
                 msk_idx=self.msk_idx,
                 merge_adjacent=self.merge_adjacent,
             )
-            if not global_materials:
-                raise ValueError(f"Sample {sample_index} contains no physical layers.")
+            physical_layer_count = len(global_materials)
+            if physical_layer_count == 0:
+                sample_mask[batch_idx] = False
             if any(material_id in self.holdout_indices for material_id in global_materials):
                 sample_mask[batch_idx] = False
-            if len(global_materials) > self.max_layers:
+            if physical_layer_count > self.max_layers:
                 raise ValueError(
-                    f"Sample {sample_index} has {len(global_materials)} layers after canonicalization, "
+                    f"Sample {sample_index} has {physical_layer_count} layers after canonicalization, "
                     f"exceeding MAX_LAYERS={self.max_layers}."
                 )
             candidates = self._candidate_indices(global_materials, generator)
             local_lookup = {int(global_id): local_id for local_id, global_id in enumerate(candidates.tolist())}
             local_materials = torch.tensor([local_lookup[value] for value in global_materials], dtype=torch.long)
-            layer_count = len(global_materials)
+            active_layer_count = max(physical_layer_count, 1)
             candidate_count = len(candidates)
 
             target[batch_idx] = spectrum.index_select(0, channel_indices).index_select(1, query_indices).transpose(0, 1)
             candidate_nk[batch_idx, :candidate_count] = all_curves.index_select(0, candidates)
             candidate_mask[batch_idx, :candidate_count] = True
             candidate_global_ids[batch_idx, :candidate_count] = candidates
-            material_targets[batch_idx, :layer_count] = local_materials
-            thickness_nm[batch_idx, :layer_count] = torch.tensor(layer_thickness, dtype=torch.float32)
-            layer_mask[batch_idx, :layer_count] = True
+            if physical_layer_count:
+                material_targets[batch_idx, :physical_layer_count] = local_materials
+                thickness_nm[batch_idx, :physical_layer_count] = torch.tensor(layer_thickness, dtype=torch.float32)
+            layer_mask[batch_idx, :active_layer_count] = True
             sample_indices[batch_idx] = int(sample_index)
 
         return {

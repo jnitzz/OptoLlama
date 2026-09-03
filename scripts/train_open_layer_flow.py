@@ -388,6 +388,10 @@ def validate_tmm(
     for raw_batch in loader:
         if processed >= max_samples:
             break
+        valid_rows = raw_batch["sample_mask"].to(dtype=torch.bool)
+        if not bool(valid_rows.any()):
+            continue
+        raw_batch = {key: value[valid_rows] for key, value in raw_batch.items()}
         keep = min(int(raw_batch["target_spectrum"].shape[0]), max_samples - processed)
         raw_batch = {key: value[:keep] for key, value in raw_batch.items()}
         batch = move_batch(raw_batch, device)
