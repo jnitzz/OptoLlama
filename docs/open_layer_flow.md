@@ -18,7 +18,16 @@ training, and the output head scores candidate embeddings instead of fixed
 material class IDs.
 
 The first version uses masked material denoising and rectified flow for
-normalized log thickness. It does not yet implement CTMC material flow,
+normalized log thickness. Two material processes are available:
+
+- `monotonic` (the `open_layer_flow_01.yaml` baseline) reveals masked slots once;
+- `full_remask` predicts every active material slot at every step, then randomly
+  masks a new mixture of isolated slots and contiguous layer spans.
+
+`full_remask` keeps active-layer, material-MASK, and padding states separate. A
+masked layer still carries its evolving continuous thickness state. The pointer
+head never predicts MASK; the final step contains only query-local candidate
+materials. The model does not yet implement CTMC material flow,
 angle/polarization conditioning, learned layer count, spectral reward training,
 or depth-field convolutional refinement.
 
@@ -51,6 +60,29 @@ Checkpoints and history are written to `OPEN_LAYER.OUT_DIR`:
 - `open-layer-history.json`.
 
 The full configuration is approximately 77.85 million trainable parameters.
+
+### Full-prediction random-remask experiment
+
+`configs/open_layer_flow_02_remask.yaml` enables the layer-space counterpart of
+the depth-field denoising policy:
+
+- 30% of the corruption budget is allocated to isolated layer slots;
+- 70% is allocated to contiguous spans of 2-8 physical layer slots;
+- span length grows with noise level;
+- up to 10% of corrupted slots use a wrong query-local material instead of MASK,
+  with replacement probability decaying to zero at the all-MASK endpoint;
+- material CE weights are 1.0 on corrupted slots and 0.1 on visible slots.
+
+Training and sampling use the same span policy. Sampling starts from all MASK,
+rewrites every active material slot, randomly constructs the next mask pattern,
+and independently advances continuous thickness flow. Existing checkpoints that
+do not contain these settings load as the monotonic baseline.
+
+Launch it with the same job script as the baseline after changing `CONFIG` to:
+
+```bash
+CONFIG=/scratch/htc/jschaibl/repos/OptoLlama/configs/open_layer_flow_02_remask.yaml
+```
 
 ## Inference
 

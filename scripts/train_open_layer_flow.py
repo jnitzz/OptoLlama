@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
-import torch.nn.functional as functional
 import tqdm  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader, Subset
 
@@ -90,6 +89,7 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
     model = nested(block, "MODEL", default={}) or {}
     query = nested(block, "QUERY", default={}) or {}
     process = nested(block, "DENOISING", default={}) or {}
+    corruption = nested(process, "CORRUPTION", default={}) or {}
     thickness = nested(block, "THICKNESS", default={}) or {}
     channels = tuple(str(value) for value in query.get("CHANNELS", ["R", "T"]))
     return optollama.model.OpenLayerFlowConfig(
@@ -103,6 +103,18 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
         dropout=float(model.get("DROPOUT", 0.0)),
         wavelength_scale_nm=float(query.get("WAVELENGTH_SCALE_NM", 1_000.0)),
         wavelength_fourier_bands=int(query.get("FOURIER_BANDS", 4)),
+        material_process=str(process.get("MATERIAL_PROCESS", "monotonic")),
+        material_corruption_mode=str(corruption.get("MODE", "iid")),
+        material_iid_fraction=float(corruption.get("IID_FRACTION", 1.0)),
+        material_span_fraction=float(corruption.get("SPAN_FRACTION", 0.0)),
+        material_span_min_layers=int(corruption.get("SPAN_MIN_LAYERS", 2)),
+        material_span_max_layers=int(corruption.get("SPAN_MAX_LAYERS", 8)),
+        material_span_scale_with_noise=bool(corruption.get("SPAN_SCALE_WITH_NOISE", True)),
+        material_random_replace_prob=float(process.get("RANDOM_REPLACE_PROB", 0.0)),
+        material_random_replace_schedule=str(corruption.get("RANDOM_REPLACE_SCHEDULE", "constant")),
+        material_random_replace_power=float(corruption.get("RANDOM_REPLACE_POWER", 1.0)),
+        material_corrupted_loss_weight=float(process.get("CORRUPTED_LOSS_WEIGHT", 1.0)),
+        material_uncorrupted_loss_weight=float(process.get("UNCORRUPTED_LOSS_WEIGHT", 0.0)),
         thickness_loss_weight=float(process.get("THICKNESS_LOSS_WEIGHT", 1.0)),
         thickness_huber_delta=float(process.get("THICKNESS_HUBER_DELTA", 0.1)),
         min_thickness_nm=float(thickness.get("MIN_NM", 5.0)),
@@ -227,68 +239,19 @@ def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenLayerFlow:
 def compute_training_loss(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Compute the joint objective through the DDP wrapper when present."""
     core = unwrap_model(model)
-    clean_materials = batch["material_targets"].to(dtype=torch.long)
-    clean_thickness = batch["thickness_targets"].to(dtype=torch.float32)
-    layer_mask = batch["layer_mask"].to(dtype=torch.bool)
-    sample_mask = batch.get(
-        "sample_mask",
-        torch.ones(layer_mask.shape[0], device=layer_mask.device, dtype=torch.bool),
-    ).to(dtype=torch.bool)
-    supervised_layers = layer_mask & sample_mask[:, None]
-    batch_size = clean_materials.shape[0]
-    timesteps = torch.rand(batch_size, device=clean_materials.device).clamp_(1.0e-4, 1.0 - 1.0e-4)
-    corrupted = (torch.rand(clean_materials.shape, device=clean_materials.device) < timesteps[:, None]) & supervised_layers
-    for row in range(batch_size):
-        if bool(sample_mask[row]) and not bool(corrupted[row].any()):
-            active = torch.nonzero(supervised_layers[row], as_tuple=False).flatten()
-            if active.numel():
-                choice = active[torch.randint(active.numel(), (1,), device=active.device)]
-                corrupted[row, choice] = True
-    noised_materials = clean_materials.clone()
-    noised_materials[corrupted | ~layer_mask] = core.MASK_MATERIAL
-    thickness_noise = torch.randn_like(clean_thickness)
-    thickness_state = (1.0 - timesteps[:, None]) * clean_thickness + timesteps[:, None] * thickness_noise
-    target_velocity = thickness_noise - clean_thickness
+    state = core.prepare_training_state(batch)
     outputs = model(
         wavelengths_nm=batch["wavelengths_nm"],
         target_spectrum=batch["target_spectrum"],
         query_mask=batch["query_mask"],
         candidate_nk=batch["candidate_nk"],
         candidate_mask=batch["candidate_mask"],
-        material_ids=noised_materials,
-        thickness_state=thickness_state,
-        layer_mask=layer_mask,
-        timesteps=timesteps,
+        material_ids=state["noised_materials"],
+        thickness_state=state["thickness_state"],
+        layer_mask=state["layer_mask"],
+        timesteps=state["timesteps"],
     )
-    if bool(corrupted.any()):
-        material_loss = functional.cross_entropy(outputs["material_logits"][corrupted], clean_materials[corrupted])
-        accuracy = (outputs["material_logits"][corrupted].argmax(-1) == clean_materials[corrupted]).float().mean()
-    else:
-        finite_logits = torch.where(
-            torch.isfinite(outputs["material_logits"]),
-            outputs["material_logits"],
-            torch.zeros_like(outputs["material_logits"]),
-        )
-        material_loss = finite_logits.sum() * 0.0
-        accuracy = torch.zeros((), device=clean_materials.device)
-    if bool(supervised_layers.any()):
-        thickness_loss = functional.smooth_l1_loss(
-            outputs["thickness_velocity"][supervised_layers],
-            target_velocity[supervised_layers],
-            beta=core.config.thickness_huber_delta,
-        )
-    else:
-        thickness_loss = outputs["thickness_velocity"].sum() * 0.0
-    total = material_loss + core.config.thickness_loss_weight * thickness_loss
-    return {
-        "loss": total,
-        "material_loss": material_loss.detach(),
-        "thickness_loss": thickness_loss.detach(),
-        "material_accuracy": accuracy,
-        "mean_timestep": timesteps.mean().detach(),
-        "corrupted_fraction": corrupted.sum().float() / supervised_layers.sum().clamp_min(1),
-        "supervised_samples": sample_mask.sum().detach(),
-    }
+    return core.loss_from_training_state(outputs, state)
 
 
 def run_loss_epoch(
@@ -307,7 +270,18 @@ def run_loss_epoch(
     """Train or validate the denoising objectives for one epoch."""
     train = optimizer is not None
     model.train(train)
-    totals = torch.zeros(7, dtype=torch.float64, device=device)
+    metric_keys = (
+        "loss",
+        "material_loss",
+        "thickness_loss",
+        "material_accuracy",
+        "full_material_accuracy",
+        "mean_timestep",
+        "corrupted_fraction",
+        "masked_fraction",
+        "replaced_fraction",
+    )
+    totals = torch.zeros(len(metric_keys) + 1, dtype=torch.float64, device=device)
     progress = tqdm.tqdm(
         loader,
         desc=f"Epoch {epoch + 1}/{epochs} open-layer {'train' if train else 'val'}",
@@ -338,21 +312,14 @@ def run_loss_epoch(
 
         batch_size = int(outputs["supervised_samples"].item())
         totals += torch.tensor(
-            [
-                float(loss.detach().item()) * batch_size,
-                float(outputs["material_loss"].item()) * batch_size,
-                float(outputs["thickness_loss"].item()) * batch_size,
-                float(outputs["material_accuracy"].item()) * batch_size,
-                float(outputs["mean_timestep"].item()) * batch_size,
-                float(outputs["corrupted_fraction"].item()) * batch_size,
-                float(batch_size),
-            ],
+            [float(outputs[key].detach().item()) * batch_size for key in metric_keys] + [float(batch_size)],
             dtype=torch.float64,
             device=device,
         )
         progress.set_postfix(
             loss=f"{float(loss.detach().item()):.4f}",
             mat=f"{100.0 * float(outputs['material_accuracy'].item()):.1f}%",
+            full=f"{100.0 * float(outputs['full_material_accuracy'].item()):.1f}%",
             grad=f"{float(norm):.2f}",
         )
 
@@ -360,8 +327,7 @@ def run_loss_epoch(
     samples = float(totals[-1].item())
     if samples <= 0:
         raise RuntimeError("No supervised samples remained after applying material holdouts.")
-    keys = ("loss", "material_loss", "thickness_loss", "material_accuracy", "mean_timestep", "corrupted_fraction")
-    return {key: float(totals[idx].item() / samples) for idx, key in enumerate(keys)} | {"samples": int(samples)}
+    return {key: float(totals[idx].item() / samples) for idx, key in enumerate(metric_keys)} | {"samples": int(samples)}
 
 
 @torch.no_grad()
@@ -524,6 +490,16 @@ def main() -> None:
         print(
             f"Open-layer model: parameters={parameter_count:,}, train_samples={train_n:,}, "
             f"world={world_size}, batch/rank={cfg['TRAIN_BATCH_SIZE']}"
+        )
+        print(
+            f"Open-layer material process: {model_config.material_process}, "
+            f"corruption={model_config.material_corruption_mode}, "
+            f"iid/span={model_config.material_iid_fraction:g}/{model_config.material_span_fraction:g}, "
+            f"span_layers={model_config.material_span_min_layers}-{model_config.material_span_max_layers}, "
+            f"random_replace={model_config.material_random_replace_prob:g}/"
+            f"{model_config.material_random_replace_schedule}, "
+            f"loss_weights={model_config.material_corrupted_loss_weight:g}/"
+            f"{model_config.material_uncorrupted_loss_weight:g}"
         )
     if optollama.utils.is_ddp():
         torch.distributed.barrier()

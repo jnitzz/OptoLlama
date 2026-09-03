@@ -1,6 +1,6 @@
 EXPERIMENT:
   MODEL: open_layer_flow
-  RUN: OPEN_LAYER_FLOW_01
+  RUN: OPEN_LAYER_FLOW_02
   SEED: 3
 
 PATHS:
@@ -52,15 +52,12 @@ OPEN_LAYER:
     SAMPLING: mixed # full | window | random | mixed
     WAVELENGTH_SCALE_NM: 1000
     FOURIER_BANDS: 4
-    # Existing spectra were generated with endpoint-clamped n/k curves; TiO2 starts near 396 nm.
     MATERIAL_COVERAGE_TOLERANCE_NM: 100
 
   MATERIAL_BANK:
-    MAX_CANDIDATES: 24 # current token vocabulary contains 19 physical materials
+    MAX_CANDIDATES: 24
     RANDOMIZE_ORDER: true
     RANDOM_DISTRACTORS: true
-    # Holdout samples produce no training gradient, and held-out curves are not distractors.
-    # Validation still includes the materials for a strict zero-shot selection test.
     HOLDOUT_MATERIALS: [] # e.g. [TiO2]
 
   THICKNESS:
@@ -69,9 +66,22 @@ OPEN_LAYER:
     MAX_TOTAL_NM: 10000
 
   DENOISING:
-    MATERIAL_PROCESS: masked # masked/monotonic baseline | full_remask
+    MATERIAL_PROCESS: full_remask # monotonic | full_remask
     THICKNESS_PROCESS: rectified_flow
     TRAIN_TIMESTEPS: 200 # documents the training-time continuum; t is sampled continuously
+    CORRUPTION:
+      MODE: hybrid # iid | hybrid
+      IID_FRACTION: 0.30
+      SPAN_FRACTION: 0.70
+      SPAN_MIN_LAYERS: 2
+      SPAN_MAX_LAYERS: 8
+      SPAN_SCALE_WITH_NOISE: true
+      # q(t) = RANDOM_REPLACE_PROB * (1 - t)^RANDOM_REPLACE_POWER.
+      RANDOM_REPLACE_SCHEDULE: noise_complement # constant | noise_complement
+      RANDOM_REPLACE_POWER: 1.0
+    RANDOM_REPLACE_PROB: 0.10
+    CORRUPTED_LOSS_WEIGHT: 1.0
+    UNCORRUPTED_LOSS_WEIGHT: 0.1
     THICKNESS_LOSS_WEIGHT: 1.0
     THICKNESS_HUBER_DELTA: 0.1
 

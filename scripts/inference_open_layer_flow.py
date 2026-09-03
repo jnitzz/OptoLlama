@@ -158,6 +158,11 @@ def main() -> None:
     temperature = float(args.temperature if args.temperature is not None else eval_cfg.get("TEMPERATURE", 1.0))
     if mc_samples <= 0 or mc_batch_size <= 0:
         raise ValueError("MC sample counts must be positive.")
+    print(
+        f"Open-layer inference: process={model_config.material_process}, "
+        f"corruption={model_config.material_corruption_mode}, layers={layer_counts}, "
+        f"mc={mc_samples}, steps={sampling_steps}, temperature={temperature:g}"
+    )
 
     tmm_idx_to_token, material_to_token_id = tmm_vocabulary_for_candidates(idx_to_token, candidate_names)
     tmm_ctx: optollama.evaluation.simulation.TMMContext = optollama.evaluation.simulation.TMMContext.make(
@@ -224,6 +229,8 @@ def main() -> None:
             "wavelengths_nm": target_wavelengths.tolist(),
             "target_path": str(target_path),
             "checkpoint": str(checkpoint),
+            "material_process": model_config.material_process,
+            "material_corruption_mode": model_config.material_corruption_mode,
             "all_mc": all_records,
         }
     )

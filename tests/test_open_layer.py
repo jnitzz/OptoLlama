@@ -12,7 +12,7 @@ from optollama.data.open_layer import (
     layer_batch_to_runs,
     load_open_layer_target,
 )
-from optollama.model.open_layer_flow import OpenLayerFlow, OpenLayerFlowConfig
+from optollama.model.open_layer_flow import OpenLayerFlow, OpenLayerFlowConfig, layer_slot_corruption_mask
 
 # ruff: noqa: D103
 
@@ -27,17 +27,17 @@ def synthetic_catalog() -> MaterialCatalog:
     )
 
 
-def tiny_model() -> OpenLayerFlow:
-    return OpenLayerFlow(
-        OpenLayerFlowConfig(
-            d_model=32,
-            n_blocks=2,
-            n_heads=4,
-            query_encoder_blocks=1,
-            max_layers=6,
-            wavelength_fourier_bands=2,
-        )
-    )
+def tiny_model(**overrides: object) -> OpenLayerFlow:
+    values = {
+        "d_model": 32,
+        "n_blocks": 2,
+        "n_heads": 4,
+        "query_encoder_blocks": 1,
+        "max_layers": 6,
+        "wavelength_fourier_bands": 2,
+    }
+    values.update(overrides)
+    return OpenLayerFlow(OpenLayerFlowConfig(**values))  # type: ignore[arg-type]
 
 
 def synthetic_condition(batch: int = 2) -> dict[str, torch.Tensor]:
@@ -195,6 +195,133 @@ def test_training_loss_and_sampling_are_finite() -> None:
     assert torch.all(sampled["material_ids"][sampled["layer_mask"]] >= 0)
     assert torch.all(sampled["thickness_nm"][sampled["layer_mask"]] >= 5.0)
     assert torch.all(sampled["thickness_nm"].sum(dim=1) <= 10_000.001)
+
+
+def test_hybrid_layer_corruption_respects_budget_and_builds_spans() -> None:
+    config = tiny_model(
+        material_process="full_remask",
+        material_corruption_mode="hybrid",
+        material_iid_fraction=0.0,
+        material_span_fraction=1.0,
+        material_span_min_layers=2,
+        material_span_max_layers=2,
+        material_span_scale_with_noise=False,
+    ).config
+    active = torch.tensor([[True, True, True, True, True, True]])
+    selected = layer_slot_corruption_mask(
+        active,
+        torch.tensor([0.5]),
+        config=config,
+        generator=torch.Generator().manual_seed(5),
+    )
+    assert selected.sum().item() == 3
+    assert torch.any(selected[:, :-1] & selected[:, 1:])
+
+
+def test_noise_complement_keeps_high_noise_endpoint_all_mask() -> None:
+    model = tiny_model(
+        material_process="full_remask",
+        material_corruption_mode="hybrid",
+        material_iid_fraction=0.3,
+        material_span_fraction=0.7,
+        material_random_replace_prob=1.0,
+        material_random_replace_schedule="noise_complement",
+    )
+    clean = torch.tensor([[0, 1, 2, 0]])
+    active = torch.ones_like(clean, dtype=torch.bool)
+    candidates = torch.ones((1, 3), dtype=torch.bool)
+    noised, corrupted, replaced = model.corrupt_materials(clean, active, candidates, torch.ones(1))
+    assert torch.all(corrupted)
+    assert not torch.any(replaced)
+    assert torch.all(noised == model.MASK_MATERIAL)
+
+
+def test_random_replacements_are_valid_wrong_local_candidates() -> None:
+    model = tiny_model(
+        material_process="full_remask",
+        material_random_replace_prob=1.0,
+        material_random_replace_schedule="constant",
+    )
+    clean = torch.tensor([[0, 1, 2, 0]])
+    active = torch.ones_like(clean, dtype=torch.bool)
+    candidates = torch.ones((1, 3), dtype=torch.bool)
+    noised, corrupted, replaced = model.corrupt_materials(
+        clean,
+        active,
+        candidates,
+        torch.ones(1),
+        generator=torch.Generator().manual_seed(7),
+    )
+    assert torch.all(corrupted & replaced)
+    assert torch.all((noised >= 0) & (noised < 3))
+    assert torch.all(noised != clean)
+
+    sparse_clean = torch.tensor([[0, 2]])
+    sparse_candidates = torch.tensor([[True, False, True]])
+    sparse_noised, _, sparse_replaced = model.corrupt_materials(
+        sparse_clean,
+        torch.ones_like(sparse_clean, dtype=torch.bool),
+        sparse_candidates,
+        torch.ones(1),
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert torch.all(sparse_replaced)
+    assert sparse_noised.tolist() == [[2, 0]]
+
+
+def test_full_remask_trains_visible_slots_and_samples_without_masks() -> None:
+    torch.manual_seed(8)
+    model = tiny_model(
+        material_process="full_remask",
+        material_corruption_mode="hybrid",
+        material_iid_fraction=0.3,
+        material_span_fraction=0.7,
+        material_uncorrupted_loss_weight=0.1,
+    )
+    condition = synthetic_condition(batch=1)
+    batch = {
+        **condition,
+        "material_targets": torch.tensor([[0, 1, 2]]),
+        "thickness_targets": torch.tensor([[-0.5, 0.2, 0.4]]),
+        "layer_mask": torch.ones((1, 3), dtype=torch.bool),
+    }
+    losses = model.training_loss(batch, timesteps=torch.zeros(1))
+    assert losses["corrupted"].sum().item() == 0
+    assert losses["material_loss"].item() > 0.0
+    losses["loss"].backward()
+
+    sampled = model.eval().sample(**condition, layer_counts=torch.tensor([3]), steps=4)
+    assert torch.all(sampled["material_ids"] >= 0)
+
+
+def test_full_remask_rewrites_already_visible_materials() -> None:
+    model = tiny_model(material_process="full_remask")
+    condition = synthetic_condition(batch=1)
+    proposal_steps: list[int] = []
+
+    def fake_encode(*_args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        empty = torch.empty(0)
+        return empty, empty
+
+    def fake_forward(**kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
+        material_ids = kwargs["material_ids"]
+        candidate = len(proposal_steps) % 3
+        proposal_steps.append(candidate)
+        logits = torch.full((*material_ids.shape, 3), -10.0)
+        logits[:, :, candidate] = 10.0
+        return {"material_logits": logits, "thickness_velocity": torch.zeros_like(kwargs["thickness_state"])}
+
+    model.encode_condition = fake_encode  # type: ignore[method-assign]
+    model.forward = fake_forward  # type: ignore[method-assign]
+    sampled = model.sample(
+        **condition,
+        layer_counts=torch.tensor([3]),
+        steps=3,
+        deterministic=True,
+        generator=torch.Generator().manual_seed(11),
+    )
+    assert proposal_steps == [0, 1, 2]
+    assert sampled["material_ids"].tolist() == [[2, 2, 2]]
 
 
 def test_all_holdout_batch_has_differentiable_zero_loss() -> None:
