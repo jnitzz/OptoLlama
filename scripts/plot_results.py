@@ -442,7 +442,11 @@ def _sample_one(
     wavelengths = (
         bundle.wavelengths
         if bundle is not None and bundle.wavelengths is not None
-        else cfg["WAVELENGTHS"].detach().cpu().numpy().astype(float)
+        else (
+            np.asarray(sample["wavelengths_nm"], dtype=float)
+            if sample.get("wavelengths_nm") is not None
+            else cfg["WAVELENGTHS"].detach().cpu().numpy().astype(float)
+        )
     )
     nn_spectrum = None
     nn_tokens = None

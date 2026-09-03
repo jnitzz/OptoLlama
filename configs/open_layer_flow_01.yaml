@@ -1,0 +1,120 @@
+EXPERIMENT:
+  MODEL: open_layer_flow
+  RUN: OPEN_LAYER_FLOW_01
+  SEED: 3
+
+PATHS:
+  DATA_PATH: E:/repos/OptoLlama/data # /scratch/htc/jschaibl/repos/OptoLlama/data
+  MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
+  TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
+  OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
+  TRAIN:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/00
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/01
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/02
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/03
+  TEST:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_test
+
+DATA_LOADING:
+  NUM_WORKERS: 8
+  SHARDED_LOADING: true
+  NUM_SAMPLES_TRAIN: 20000000
+  NUM_SAMPLES_TEST: 512
+  TRAIN_BATCH_SIZE: 64
+  TEST_BATCH_SIZE: 16
+
+SPECTRAL_GRID:
+  WAVELENGTH_MIN: 300
+  WAVELENGTH_MAX: 1700
+  WAVELENGTH_STEPS: 5
+
+CHECKPOINT:
+  RESUME: null
+
+OPEN_LAYER:
+  OUT_DIR: ${PATHS.OUTPUT_PATH}
+  MAX_LAYERS: 100
+  MERGE_ADJACENT: true
+
+  MODEL:
+    D_MODEL: 512
+    N_BLOCKS: 12
+    N_HEADS: 8
+    FFN_MULTIPLIER: 4.0
+    QUERY_ENCODER_BLOCKS: 2
+    DROPOUT: 0.0
+
+  QUERY:
+    CHANNELS: [R, T]
+    MIN_POINTS: 64
+    MAX_POINTS: 281
+    SAMPLING: mixed # full | window | random | mixed
+    WAVELENGTH_SCALE_NM: 1000
+    FOURIER_BANDS: 4
+    # Existing spectra were generated with endpoint-clamped n/k curves; TiO2 starts near 396 nm.
+    MATERIAL_COVERAGE_TOLERANCE_NM: 100
+
+  MATERIAL_BANK:
+    MAX_CANDIDATES: 24 # current token vocabulary contains 19 physical materials
+    RANDOMIZE_ORDER: true
+    RANDOM_DISTRACTORS: true
+    # Holdout samples produce no training gradient, and held-out curves are not distractors.
+    # Validation still includes the materials for a strict zero-shot selection test.
+    HOLDOUT_MATERIALS: [] # e.g. [TiO2]
+
+  THICKNESS:
+    MIN_NM: 5
+    MAX_LAYER_NM: 10000
+    MAX_TOTAL_NM: 10000
+
+  DENOISING:
+    MATERIAL_PROCESS: masked
+    THICKNESS_PROCESS: rectified_flow
+    TRAIN_TIMESTEPS: 200 # documents the training-time continuum; t is sampled continuously
+    THICKNESS_LOSS_WEIGHT: 1.0
+    THICKNESS_HUBER_DELTA: 0.1
+
+  TRAIN:
+    EPOCHS: 20
+    LEARNING_RATE: 0.0001
+    WEIGHT_DECAY: 0.01
+    GRAD_CLIP: 1.0
+    AMP: true
+    AMP_DTYPE: auto # auto | float16 | bfloat16
+
+  EVAL:
+    TMM_ENABLED: true
+    TMM_DEVICE: same # same | cpu | cuda | cuda:N
+    TMM_MAX_SAMPLES: 32
+    LAYER_COUNTS: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64]
+    MC_SAMPLES: 10
+    MC_BATCH_SIZE: 10
+    SAMPLING_STEPS: 32
+    TEMPERATURE: 1.0
+
+EVALUATION:
+  INCIDENCE_ANGLE: 0
+
+REALISTIC_TMM:
+  ENABLED: true
+  ANGLES: [0.0]
+  ANGLE_WEIGHTS: [1.0]
+  POLARIZATIONS: [s]
+  JITTER_REALIZATIONS: 1
+  THICKNESS_JITTER_NM: 0.0
+
+TARGET_SELECTION:
+  TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGETS: []
+  TARGET_GLOB: null
+  N_TARGETS: 1
+
+TARGET_PREPROCESS:
+  MISMATCH_FILL_ORDER: R>T>A
+  NOISE:
+    ENABLED: false
+  SMOOTH:
+    ENABLED: false
+  FILL_OUTSIDE_ROI:
+    ENABLED: false
