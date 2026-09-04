@@ -1,6 +1,6 @@
 EXPERIMENT:
   MODEL: open_layer_flow
-  RUN: OPEN_LAYER_FLOW_02
+  RUN: OPEN_LAYER_FLOW_04_ADALN
   SEED: 3
 
 PATHS:
@@ -40,12 +40,12 @@ OPEN_LAYER:
 
   MODEL:
     D_MODEL: 512
-    N_BLOCKS: 12
+    N_BLOCKS: 20
     N_HEADS: 8
     FFN_MULTIPLIER: 4.0
     QUERY_ENCODER_BLOCKS: 2
     DROPOUT: 0.0
-    ADALN_ZERO: false # false | true; true adds zero-initialized feature-wise residual gates
+    ADALN_ZERO: true # false | true; zero-initialized shift/scale and four feature-wise residual gates
 
   QUERY:
     CHANNELS: [R, T]

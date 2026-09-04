@@ -45,6 +45,7 @@ OPEN_LAYER:
     FFN_MULTIPLIER: 4.0
     QUERY_ENCODER_BLOCKS: 2
     DROPOUT: 0.0
+    ADALN_ZERO: false # false | true; true adds zero-initialized feature-wise residual gates
 
   QUERY:
     CHANNELS: [R, T]
@@ -95,6 +96,8 @@ OPEN_LAYER:
     MC_BATCH_SIZE: 10
     SAMPLING_STEPS: 32
     TEMPERATURE: 1.0
+    RECORD_SPECTRA: true # Saves targets, all MC RAT spectra, errors, and stacks.
+    SPECTRA_DIR: validation_spectra
 
 EVALUATION:
   INCIDENCE_ANGLE: 0

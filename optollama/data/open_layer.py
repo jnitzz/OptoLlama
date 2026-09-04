@@ -455,6 +455,7 @@ class OpenLayerBatchCollator:
         query_count = len(query_indices)
         channel_indices = torch.tensor([CHANNEL_TO_INDEX[channel] for channel in self.channels], dtype=torch.long)
         target = torch.empty((batch_size, query_count, len(self.channels)), dtype=torch.float32)
+        target_rat = torch.empty((batch_size, query_count, 3), dtype=torch.float32)
         candidate_nk = torch.zeros((batch_size, self.max_candidates, query_count, 2), dtype=torch.float32)
         candidate_mask = torch.zeros((batch_size, self.max_candidates), dtype=torch.bool)
         candidate_global_ids = torch.full((batch_size, self.max_candidates), -1, dtype=torch.long)
@@ -493,7 +494,9 @@ class OpenLayerBatchCollator:
             active_layer_count = max(physical_layer_count, 1)
             candidate_count = len(candidates)
 
-            target[batch_idx] = spectrum.index_select(0, channel_indices).index_select(1, query_indices).transpose(0, 1)
+            selected_spectrum = spectrum.index_select(1, query_indices)
+            target[batch_idx] = selected_spectrum.index_select(0, channel_indices).transpose(0, 1)
+            target_rat[batch_idx] = selected_spectrum.transpose(0, 1)
             candidate_nk[batch_idx, :candidate_count] = all_curves.index_select(0, candidates)
             candidate_mask[batch_idx, :candidate_count] = True
             candidate_global_ids[batch_idx, :candidate_count] = candidates
@@ -506,6 +509,7 @@ class OpenLayerBatchCollator:
         return {
             "wavelengths_nm": query_wavelengths.unsqueeze(0).expand(batch_size, -1).clone(),
             "target_spectrum": target,
+            "target_spectrum_rat": target_rat,
             "query_mask": torch.ones((batch_size, query_count), dtype=torch.bool),
             "candidate_nk": candidate_nk,
             "candidate_mask": candidate_mask,

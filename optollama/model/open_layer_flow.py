@@ -73,6 +73,7 @@ class OpenLayerFlowConfig:
     ffn_multiplier: float = 4.0
     query_encoder_blocks: int = 2
     dropout: float = 0.0
+    adaln_zero: bool = False
     wavelength_scale_nm: float = 1_000.0
     wavelength_fourier_bands: int = 4
     material_process: str = "monotonic"
@@ -371,6 +372,7 @@ class OpenLayerDecoderBlock(nn.Module):
 
     def __init__(self, config: OpenLayerFlowConfig) -> None:
         super().__init__()
+        self.adaln_zero = bool(config.adaln_zero)
         self.self_norm = nn.LayerNorm(config.d_model)
         self.target_norm = nn.LayerNorm(config.d_model)
         self.material_norm = nn.LayerNorm(config.d_model)
@@ -386,7 +388,16 @@ class OpenLayerDecoderBlock(nn.Module):
             nn.Linear(hidden, config.d_model),
         )
         self.dropout = nn.Dropout(config.dropout)
-        self.time_modulation = nn.Sequential(nn.SiLU(), nn.Linear(config.d_model, 2 * config.d_model))
+        modulation_chunks = 6 if self.adaln_zero else 2
+        self.time_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.d_model, modulation_chunks * config.d_model),
+        )
+        if self.adaln_zero:
+            modulation_output = self.time_modulation[-1]
+            assert isinstance(modulation_output, nn.Linear)
+            nn.init.zeros_(modulation_output.weight)
+            nn.init.zeros_(modulation_output.bias)
 
     @staticmethod
     def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -404,9 +415,17 @@ class OpenLayerDecoderBlock(nn.Module):
         candidate_padding_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Apply one conditioned decoder block."""
-        shift, scale = self.time_modulation(time_embedding).chunk(2, dim=-1)
+        modulation = self.time_modulation(time_embedding)
+        if self.adaln_zero:
+            shift, scale, self_gate, target_gate, material_gate, ffn_gate = modulation.chunk(6, dim=-1)
+        else:
+            shift, scale = modulation.chunk(2, dim=-1)
+            self_gate = target_gate = material_gate = ffn_gate = None
+
         h = self._modulate(self.self_norm(x), shift, scale)
         h, _ = self.self_attention(h, h, h, key_padding_mask=layer_padding_mask, need_weights=False)
+        if self_gate is not None:
+            h = self_gate[:, None, :] * h
         x = x + self.dropout(h)
 
         h = self._modulate(self.target_norm(x), shift, scale)
@@ -417,6 +436,8 @@ class OpenLayerDecoderBlock(nn.Module):
             key_padding_mask=query_padding_mask,
             need_weights=False,
         )
+        if target_gate is not None:
+            h = target_gate[:, None, :] * h
         x = x + self.dropout(h)
 
         h = self._modulate(self.material_norm(x), shift, scale)
@@ -427,8 +448,13 @@ class OpenLayerDecoderBlock(nn.Module):
             key_padding_mask=candidate_padding_mask,
             need_weights=False,
         )
+        if material_gate is not None:
+            h = material_gate[:, None, :] * h
         x = x + self.dropout(h)
-        x = x + self.dropout(self.ffn(self._modulate(self.ffn_norm(x), shift, scale)))
+        h = self.ffn(self._modulate(self.ffn_norm(x), shift, scale))
+        if ffn_gate is not None:
+            h = ffn_gate[:, None, :] * h
+        x = x + self.dropout(h)
         return x.masked_fill(layer_padding_mask.unsqueeze(-1), 0.0)
 
 

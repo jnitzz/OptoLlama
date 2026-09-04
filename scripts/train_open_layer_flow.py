@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 import tqdm  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader, Subset
@@ -101,6 +102,7 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
         ffn_multiplier=float(model.get("FFN_MULTIPLIER", 4.0)),
         query_encoder_blocks=int(model.get("QUERY_ENCODER_BLOCKS", 2)),
         dropout=float(model.get("DROPOUT", 0.0)),
+        adaln_zero=bool(model.get("ADALN_ZERO", False)),
         wavelength_scale_nm=float(query.get("WAVELENGTH_SCALE_NM", 1_000.0)),
         wavelength_fourier_bands=int(query.get("FOURIER_BANDS", 4)),
         material_process=str(process.get("MATERIAL_PROCESS", "monotonic")),
@@ -262,6 +264,67 @@ def averaged_metrics(totals: torch.Tensor, metric_keys: tuple[str, ...]) -> dict
     if samples <= 0:
         return {key: 0.0 for key in metric_keys}
     return {key: float(totals[idx].item() / samples) for idx, key in enumerate(metric_keys)}
+
+
+def select_mc_spectral_metrics(channel_mae: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Select coherent best-RT and best-RAT candidates from per-MC channel errors."""
+    if channel_mae.ndim != 3 or channel_mae.shape[-1] != 3:
+        raise ValueError("channel_mae must have shape [samples, mc, 3] in R/A/T order.")
+    rt_mae = channel_mae[..., (0, 2)].mean(dim=-1)
+    rat_mae = channel_mae.mean(dim=-1)
+    rows = torch.arange(channel_mae.shape[0], device=channel_mae.device)
+    best_rt_indices = rt_mae.argmin(dim=1)
+    best_rat_indices = rat_mae.argmin(dim=1)
+    best_rat_channels = channel_mae[rows, best_rat_indices]
+    return {
+        "best_rt_indices": best_rt_indices,
+        "best_rat_indices": best_rat_indices,
+        "best_rt_mae": rt_mae[rows, best_rt_indices],
+        "best_rat_mae": rat_mae[rows, best_rat_indices],
+        "rat_mae_at_best_rt": rat_mae[rows, best_rt_indices],
+        "rt_mae_at_best_rat": rt_mae[rows, best_rat_indices],
+        "r_mae_at_best_rat": best_rat_channels[:, 0],
+        "a_mae_at_best_rat": best_rat_channels[:, 1],
+        "t_mae_at_best_rat": best_rat_channels[:, 2],
+    }
+
+
+def concatenate_validation_records(records: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """Concatenate validation record chunks along their sample dimension."""
+    nonempty = [record for record in records if record]
+    if not nonempty:
+        return {}
+    keys = tuple(nonempty[0])
+    if any(tuple(record) != keys for record in nonempty[1:]):
+        raise ValueError("Validation record chunks do not contain the same fields.")
+    return {key: np.concatenate([record[key] for record in nonempty], axis=0) for key in keys}
+
+
+def save_validation_spectra(
+    path: Path,
+    records: dict[str, np.ndarray],
+    *,
+    material_names: tuple[str, ...],
+    sampling_steps: int,
+) -> None:
+    """Save target spectra, all MC predictions, errors, and stack metadata."""
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    channel_mae = torch.from_numpy(records["mae_per_channel"])
+    selected = select_mc_spectral_metrics(channel_mae)
+    payload: dict[str, Any] = dict(records)
+    payload.update(
+        format_version=np.asarray(1, dtype=np.int64),
+        channel_order=np.asarray(("R", "A", "T")),
+        material_names=np.asarray(material_names),
+        sampling_steps=np.asarray(sampling_steps, dtype=np.int64),
+        mae_rt=channel_mae[..., (0, 2)].mean(dim=-1).cpu().numpy(),
+        mae_rat=channel_mae.mean(dim=-1).cpu().numpy(),
+        best_rt_indices=selected["best_rt_indices"].cpu().numpy(),
+        best_rat_indices=selected["best_rat_indices"].cpu().numpy(),
+    )
+    np.savez_compressed(path, **payload)
 
 
 def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenLayerFlow:
@@ -439,11 +502,13 @@ def validate_tmm(
     max_samples: int,
     mc_samples: int,
     sampling_steps: int,
-) -> dict[str, float]:
-    """Measure best-of-MC exact-TMM R/T MAE using each target's true layer count."""
+    save_spectra_path: Path | None = None,
+) -> dict[str, Any]:
+    """Measure exact-TMM R/A/T errors and optionally retain every MC spectrum."""
     core = unwrap_model(model)
     core.eval()
-    mae_values: list[torch.Tensor] = []
+    channel_mae_chunks: list[torch.Tensor] = []
+    record_chunks: list[dict[str, np.ndarray]] = []
     processed = 0
     for raw_batch in loader:
         if processed >= max_samples:
@@ -456,7 +521,11 @@ def validate_tmm(
         raw_batch = {key: value[:keep] for key, value in raw_batch.items()}
         batch = move_batch(raw_batch, device)
         layer_counts = batch["layer_mask"].sum(dim=1)
-        batch_mae: list[torch.Tensor] = []
+        target_rat = raw_batch["target_spectrum_rat"].permute(0, 2, 1)
+        predicted_spectra: list[torch.Tensor] = []
+        channel_mae: list[torch.Tensor] = []
+        predicted_material_ids: list[torch.Tensor] = []
+        predicted_thickness_nm: list[torch.Tensor] = []
         for _ in range(mc_samples):
             sampled = core.sample(
                 wavelengths_nm=batch["wavelengths_nm"],
@@ -482,21 +551,115 @@ def validate_tmm(
                 pad=pad_idx,
                 msk=msk_idx,
             )
-            target_full = raw_batch["target_spectrum"].permute(0, 2, 1).to(predicted.device)
-            batch_mae.append((predicted[:, (0, 2)] - target_full).abs().mean(dim=(1, 2)).cpu())
-        mae_values.append(torch.stack(batch_mae, dim=1).min(dim=1).values)
+            target_on_tmm = target_rat.to(predicted.device)
+            predicted_spectra.append(predicted.to(device="cpu", dtype=torch.float32))
+            channel_mae.append((predicted - target_on_tmm).abs().mean(dim=-1).to(device="cpu", dtype=torch.float32))
+
+            sampled_ids = sampled["material_ids"]
+            sampled_mask = sampled["layer_mask"]
+            global_ids = batch["candidate_global_ids"].gather(1, sampled_ids.clamp_min(0))
+            global_ids = torch.where(sampled_mask, global_ids, -torch.ones_like(global_ids))
+            max_layers = int(batch["layer_mask"].shape[1])
+            padded_ids = torch.full((keep, max_layers), -1, dtype=torch.long, device=global_ids.device)
+            padded_thickness = torch.zeros((keep, max_layers), dtype=torch.float32, device=global_ids.device)
+            sampled_layers = int(global_ids.shape[1])
+            padded_ids[:, :sampled_layers] = global_ids
+            padded_thickness[:, :sampled_layers] = sampled["thickness_nm"]
+            predicted_material_ids.append(padded_ids.cpu())
+            predicted_thickness_nm.append(padded_thickness.cpu())
+
+        batch_predicted = torch.stack(predicted_spectra, dim=1)
+        batch_channel_mae = torch.stack(channel_mae, dim=1)
+        channel_mae_chunks.append(batch_channel_mae)
+
+        target_local_ids = raw_batch["material_targets"]
+        target_layer_mask = raw_batch["layer_mask"] & target_local_ids.ge(0)
+        target_global_ids = raw_batch["candidate_global_ids"].gather(1, target_local_ids.clamp_min(0))
+        target_global_ids = torch.where(target_layer_mask, target_global_ids, -torch.ones_like(target_global_ids))
+        record_chunks.append(
+            {
+                "sample_indices": raw_batch["sample_indices"].cpu().numpy(),
+                "wavelengths_nm": raw_batch["wavelengths_nm"].to(torch.float32).cpu().numpy(),
+                "target_spectra": target_rat.to(torch.float32).cpu().numpy(),
+                "predicted_spectra": batch_predicted.numpy(),
+                "mae_per_channel": batch_channel_mae.numpy(),
+                "target_material_ids": target_global_ids.cpu().numpy(),
+                "target_thickness_nm": raw_batch["thickness_nm"].to(torch.float32).cpu().numpy(),
+                "predicted_material_ids": torch.stack(predicted_material_ids, dim=1).numpy(),
+                "predicted_thickness_nm": torch.stack(predicted_thickness_nm, dim=1).numpy(),
+                "layer_counts": layer_counts.to(device="cpu", dtype=torch.long).numpy(),
+            }
+        )
         processed += keep
-    local = torch.cat(mae_values) if mae_values else torch.empty(0)
+
+    local_channel_mae = (
+        torch.cat(channel_mae_chunks, dim=0)
+        if channel_mae_chunks
+        else torch.empty((0, mc_samples, 3), dtype=torch.float32)
+    )
+    local_records = concatenate_validation_records(record_chunks)
     if optollama.utils.is_ddp():
-        gathered: list[Any] = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, local.tolist())
-        local = torch.tensor([value for values in gathered for value in values], dtype=torch.float32)
-    if local.numel() == 0:
-        return {"rt_mae_mean": math.nan, "rt_mae_median": math.nan, "samples": 0}
+        gathered_errors: list[Any] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_errors, local_channel_mae.numpy())
+        local_channel_mae = torch.from_numpy(np.concatenate(gathered_errors, axis=0))
+        if save_spectra_path is not None:
+            gathered_records: list[Any] = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_records, local_records)
+            local_records = concatenate_validation_records(gathered_records)
+
+    if local_channel_mae.shape[0] == 0:
+        return {
+            "r_mae_mean": math.nan,
+            "a_mae_mean": math.nan,
+            "t_mae_mean": math.nan,
+            "rt_mae_mean": math.nan,
+            "rat_mae_mean": math.nan,
+            "samples": 0,
+            "mc_samples": mc_samples,
+        }
+
+    selected = select_mc_spectral_metrics(local_channel_mae)
+
+    def mean_median(values: torch.Tensor) -> tuple[float, float]:
+        return float(values.mean().item()), float(values.median().item())
+
+    r_mean, r_median = mean_median(selected["r_mae_at_best_rat"])
+    a_mean, a_median = mean_median(selected["a_mae_at_best_rat"])
+    t_mean, t_median = mean_median(selected["t_mae_at_best_rat"])
+    rt_mean, rt_median = mean_median(selected["best_rt_mae"])
+    rat_mean, rat_median = mean_median(selected["best_rat_mae"])
+    rt_at_rat_mean, rt_at_rat_median = mean_median(selected["rt_mae_at_best_rat"])
+    rat_at_rt_mean, rat_at_rt_median = mean_median(selected["rat_mae_at_best_rt"])
+
+    rank = torch.distributed.get_rank() if optollama.utils.is_ddp() else 0
+    if save_spectra_path is not None and rank == 0:
+        save_validation_spectra(
+            save_spectra_path,
+            local_records,
+            material_names=catalog.names,
+            sampling_steps=sampling_steps,
+        )
+        print(f"Saved open-layer validation spectra -> {save_spectra_path}")
+
     return {
-        "rt_mae_mean": float(local.mean().item()),
-        "rt_mae_median": float(local.median().item()),
-        "samples": int(local.numel()),
+        "r_mae_mean": r_mean,
+        "r_mae_median": r_median,
+        "a_mae_mean": a_mean,
+        "a_mae_median": a_median,
+        "t_mae_mean": t_mean,
+        "t_mae_median": t_median,
+        "rt_mae_mean": rt_mean,
+        "rt_mae_median": rt_median,
+        "rat_mae_mean": rat_mean,
+        "rat_mae_median": rat_median,
+        "rt_mae_at_best_rat_mean": rt_at_rat_mean,
+        "rt_mae_at_best_rat_median": rt_at_rat_median,
+        "rat_mae_at_best_rt_mean": rat_at_rt_mean,
+        "rat_mae_at_best_rt_median": rat_at_rt_median,
+        "channel_metrics_selection": "best_rat",
+        "samples": int(local_channel_mae.shape[0]),
+        "mc_samples": mc_samples,
+        "spectra_file": str(save_spectra_path) if save_spectra_path is not None else None,
     }
 
 
@@ -592,6 +755,7 @@ def main() -> None:
             f"points={query_cfg.get('MIN_POINTS', 64)}-{query_cfg.get('MAX_POINTS', len(cfg['WAVELENGTHS']))}, "
             f"sync_shapes_across_ranks={bool(query_cfg.get('SYNC_SHAPES_ACROSS_RANKS', True))}"
         )
+        print(f"Open-layer decoder conditioning: adaln_zero={model_config.adaln_zero}")
         print(
             f"Open-layer material process: {model_config.material_process}, "
             f"corruption={model_config.material_corruption_mode}, "
@@ -662,6 +826,13 @@ def main() -> None:
                 max_samples=int(eval_cfg.get("TMM_MAX_SAMPLES", 32)),
                 mc_samples=int(eval_cfg.get("MC_SAMPLES", 4)),
                 sampling_steps=int(eval_cfg.get("SAMPLING_STEPS", 32)),
+                save_spectra_path=(
+                    output_dir
+                    / str(eval_cfg.get("SPECTRA_DIR", "validation_spectra"))
+                    / f"epoch_{epoch + 1:04d}.npz"
+                    if bool(eval_cfg.get("RECORD_SPECTRA", True))
+                    else None
+                ),
             )
         history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics, "tmm": tmm_metrics})
         extra = {
@@ -688,7 +859,16 @@ def main() -> None:
                     extra=extra,
                 )
             optollama.utils.save_as_json(str(output_dir / "open-layer-history.json"), history)
-            tmm_note = "" if tmm_metrics is None else f", tmm_rt_mae={tmm_metrics['rt_mae_mean']:.6f}"
+            tmm_note = (
+                ""
+                if tmm_metrics is None
+                else (
+                    f", tmm_rt_mae={tmm_metrics['rt_mae_mean']:.6f}, "
+                    f"tmm_rat_mae={tmm_metrics['rat_mae_mean']:.6f}, "
+                    f"R/A/T@bestRAT={tmm_metrics['r_mae_mean']:.6f}/"
+                    f"{tmm_metrics['a_mae_mean']:.6f}/{tmm_metrics['t_mae_mean']:.6f}"
+                )
+            )
             print(f"Open-layer epoch {epoch + 1}: val_loss={val_metrics['loss']:.6f}{tmm_note}, best={best_loss:.6f}")
 
     if optollama.utils.is_ddp():

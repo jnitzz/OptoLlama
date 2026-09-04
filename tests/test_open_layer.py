@@ -14,8 +14,19 @@ from optollama.data.open_layer import (
     load_open_layer_target,
     sample_query_indices,
 )
-from optollama.model.open_layer_flow import OpenLayerFlow, OpenLayerFlowConfig, layer_slot_corruption_mask
-from scripts.train_open_layer_flow import averaged_metrics, make_loader, run_loss_epoch
+from optollama.model.open_layer_flow import (
+    OpenLayerDecoderBlock,
+    OpenLayerFlow,
+    OpenLayerFlowConfig,
+    layer_slot_corruption_mask,
+)
+from scripts.train_open_layer_flow import (
+    averaged_metrics,
+    make_loader,
+    run_loss_epoch,
+    save_validation_spectra,
+    select_mc_spectral_metrics,
+)
 
 # ruff: noqa: D103
 
@@ -117,11 +128,13 @@ def test_collator_builds_local_material_targets_and_merges_neighbors() -> None:
         query_sampling="full",
         randomize_candidates=False,
     )
-    batch = collator([(torch.rand(3, 3), torch.tensor([3, 4, 5, 2, 0]), 7)])
+    spectrum = torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+    batch = collator([(spectrum, torch.tensor([3, 4, 5, 2, 0]), 7)])
     assert batch["layer_mask"].tolist() == [[True, True, False, False]]
     assert batch["material_targets"][0, :2].tolist() == [0, 1]
     assert batch["thickness_nm"][0, :2].tolist() == [30.0, 30.0]
     assert batch["candidate_global_ids"].tolist() == [[0, 1, 2]]
+    assert torch.equal(batch["target_spectrum_rat"], spectrum.transpose(0, 1).unsqueeze(0))
 
 
 def test_collator_keeps_empty_stacks_batch_safe_but_unsupervised() -> None:
@@ -205,6 +218,43 @@ def test_candidate_permutation_only_permutes_pointer_logits() -> None:
         timesteps=timestep,
     )["material_logits"]
     assert torch.allclose(permuted, base[:, :, permutation], atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_adaln_zero_decoder_block_starts_as_identity() -> None:
+    config = OpenLayerFlowConfig(
+        d_model=32,
+        n_blocks=1,
+        n_heads=4,
+        query_encoder_blocks=1,
+        max_layers=4,
+        adaln_zero=True,
+    )
+    block = OpenLayerDecoderBlock(config).eval()
+    x = torch.randn(2, 4, 32)
+    output = block(
+        x,
+        time_embedding=torch.randn(2, 32),
+        layer_padding_mask=torch.zeros(2, 4, dtype=torch.bool),
+        target_memory=torch.randn(2, 3, 32),
+        query_padding_mask=torch.zeros(2, 3, dtype=torch.bool),
+        material_memory=torch.randn(2, 3, 32),
+        candidate_padding_mask=torch.zeros(2, 3, dtype=torch.bool),
+    )
+    assert torch.equal(output, x)
+    output.square().mean().backward()
+    modulation_output = block.time_modulation[-1]
+    assert isinstance(modulation_output, torch.nn.Linear)
+    assert modulation_output.weight.grad is not None
+    assert modulation_output.weight.grad[2 * config.d_model :].abs().sum() > 0
+
+
+def test_adaln_zero_uses_four_feature_wise_residual_gates() -> None:
+    legacy = tiny_model(n_blocks=2, adaln_zero=False)
+    stabilized = tiny_model(n_blocks=2, adaln_zero=True)
+    expected_extra = 2 * 4 * 32 * (32 + 1)
+    legacy_parameters = sum(parameter.numel() for parameter in legacy.parameters())
+    stabilized_parameters = sum(parameter.numel() for parameter in stabilized.parameters())
+    assert stabilized_parameters - legacy_parameters == expected_extra
 
 
 def test_training_loss_and_sampling_are_finite() -> None:
@@ -419,6 +469,39 @@ def test_averaged_metrics_are_sample_weighted() -> None:
         "loss": 2.5,
         "material_accuracy": 0.75,
     }
+
+
+def test_mc_spectral_metrics_keep_rt_and_rat_selection_distinct() -> None:
+    channel_mae = torch.tensor([[[0.0, 0.9, 0.0], [0.1, 0.0, 0.1]]])
+    selected = select_mc_spectral_metrics(channel_mae)
+    assert selected["best_rt_indices"].tolist() == [0]
+    assert selected["best_rat_indices"].tolist() == [1]
+    assert torch.allclose(selected["best_rt_mae"], torch.tensor([0.0]))
+    assert torch.allclose(selected["best_rat_mae"], torch.tensor([0.2 / 3.0]))
+    assert torch.allclose(selected["rat_mae_at_best_rt"], torch.tensor([0.3]))
+    assert torch.allclose(selected["r_mae_at_best_rat"], torch.tensor([0.1]))
+
+
+def test_validation_spectrum_bundle_records_every_mc_curve(tmp_path: Path) -> None:
+    records = {
+        "sample_indices": np.asarray([7]),
+        "wavelengths_nm": np.asarray([[400.0, 500.0]], dtype=np.float32),
+        "target_spectra": np.zeros((1, 3, 2), dtype=np.float32),
+        "predicted_spectra": np.zeros((1, 2, 3, 2), dtype=np.float32),
+        "mae_per_channel": np.zeros((1, 2, 3), dtype=np.float32),
+        "target_material_ids": np.asarray([[0, -1]]),
+        "target_thickness_nm": np.asarray([[10.0, 0.0]], dtype=np.float32),
+        "predicted_material_ids": np.asarray([[[0, -1], [0, -1]]]),
+        "predicted_thickness_nm": np.asarray([[[10.0, 0.0], [11.0, 0.0]]], dtype=np.float32),
+        "layer_counts": np.asarray([1]),
+    }
+    path = tmp_path / "validation.npz"
+    save_validation_spectra(path, records, material_names=("A",), sampling_steps=4)
+    with np.load(path) as bundle:
+        assert bundle["channel_order"].tolist() == ["R", "A", "T"]
+        assert bundle["predicted_spectra"].shape == (1, 2, 3, 2)
+        assert bundle["mae_rt"].shape == (1, 2)
+        assert bundle["best_rat_indices"].tolist() == [0]
 
 
 def test_open_layer_epoch_skips_nonfinite_gradient_without_poisoning_weights() -> None:
