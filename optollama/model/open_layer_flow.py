@@ -74,6 +74,9 @@ class OpenLayerFlowConfig:
     query_encoder_blocks: int = 2
     dropout: float = 0.0
     adaln_zero: bool = False
+    adaln_shift_limit: float | None = None
+    adaln_scale_limit: float | None = None
+    adaln_gate_limit: float | None = None
     wavelength_scale_nm: float = 1_000.0
     wavelength_fourier_bands: int = 4
     material_process: str = "monotonic"
@@ -104,6 +107,11 @@ class OpenLayerFlowConfig:
             raise ValueError(f"d_model={self.d_model} must be divisible by n_heads={self.n_heads}.")
         if self.ffn_multiplier <= 0 or self.wavelength_scale_nm <= 0 or self.wavelength_fourier_bands < 0:
             raise ValueError("FFN, wavelength scale, and Fourier-band settings are invalid.")
+        for name in ("adaln_shift_limit", "adaln_scale_limit", "adaln_gate_limit"):
+            value = getattr(self, name)
+            if value is not None and float(value) <= 0.0:
+                raise ValueError(f"{name} must be positive when enabled, got {value}.")
+            object.__setattr__(self, name, None if value is None else float(value))
         object.__setattr__(self, "material_process", _normalize_material_process(self.material_process))
         object.__setattr__(
             self,
@@ -373,6 +381,9 @@ class OpenLayerDecoderBlock(nn.Module):
     def __init__(self, config: OpenLayerFlowConfig) -> None:
         super().__init__()
         self.adaln_zero = bool(config.adaln_zero)
+        self.adaln_shift_limit = config.adaln_shift_limit
+        self.adaln_scale_limit = config.adaln_scale_limit
+        self.adaln_gate_limit = config.adaln_gate_limit
         self.self_norm = nn.LayerNorm(config.d_model)
         self.target_norm = nn.LayerNorm(config.d_model)
         self.material_norm = nn.LayerNorm(config.d_model)
@@ -403,6 +414,41 @@ class OpenLayerDecoderBlock(nn.Module):
     def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
 
+    @staticmethod
+    def _bounded(value: torch.Tensor, limit: float | None) -> torch.Tensor:
+        if limit is None:
+            return value
+        return float(limit) * torch.tanh(value / float(limit))
+
+    def raw_modulation_components(self, time_embedding: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return unbounded AdaLN projection outputs for diagnostics."""
+        modulation = self.time_modulation(time_embedding)
+        if self.adaln_zero:
+            shift, scale, self_gate, target_gate, material_gate, ffn_gate = modulation.chunk(6, dim=-1)
+            return {
+                "shift": shift,
+                "scale": scale,
+                "self_gate": self_gate,
+                "target_gate": target_gate,
+                "material_gate": material_gate,
+                "ffn_gate": ffn_gate,
+            }
+        shift, scale = modulation.chunk(2, dim=-1)
+        return {"shift": shift, "scale": scale}
+
+    def modulation_components(self, time_embedding: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return the effective, optionally bounded AdaLN modulation tensors."""
+        raw = self.raw_modulation_components(time_embedding)
+        return {
+            name: self._bounded(
+                value,
+                self.adaln_gate_limit
+                if name.endswith("_gate")
+                else (self.adaln_shift_limit if name == "shift" else self.adaln_scale_limit),
+            )
+            for name, value in raw.items()
+        }
+
     def forward(
         self,
         x: torch.Tensor,
@@ -415,12 +461,13 @@ class OpenLayerDecoderBlock(nn.Module):
         candidate_padding_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Apply one conditioned decoder block."""
-        modulation = self.time_modulation(time_embedding)
-        if self.adaln_zero:
-            shift, scale, self_gate, target_gate, material_gate, ffn_gate = modulation.chunk(6, dim=-1)
-        else:
-            shift, scale = modulation.chunk(2, dim=-1)
-            self_gate = target_gate = material_gate = ffn_gate = None
+        components = self.modulation_components(time_embedding)
+        shift = components["shift"]
+        scale = components["scale"]
+        self_gate = components.get("self_gate")
+        target_gate = components.get("target_gate")
+        material_gate = components.get("material_gate")
+        ffn_gate = components.get("ffn_gate")
 
         h = self._modulate(self.self_norm(x), shift, scale)
         h, _ = self.self_attention(h, h, h, key_padding_mask=layer_padding_mask, need_weights=False)
@@ -494,6 +541,36 @@ class OpenLayerFlow(nn.Module):
         """Initialize learned mask and layer-position states."""
         nn.init.normal_(self.mask_embedding, std=0.02)
         nn.init.normal_(self.position_embedding, std=0.02)
+
+    @torch.no_grad()
+    def adaln_modulation_stats(self, samples: int = 17) -> dict[str, float]:
+        """Summarize effective AdaLN values over a fixed continuous-time grid."""
+        if samples <= 0:
+            raise ValueError("samples must be positive.")
+        parameter = next(self.parameters())
+        timesteps = torch.linspace(0.0, 1.0, samples, device=parameter.device)
+        time = self.time_embedding(timesteps)
+        time_values = time.float().reshape(-1)
+        stats: dict[str, float] = {
+            "time_abs_mean": float(time_values.abs().mean().item()),
+            "time_abs_max": float(time_values.abs().max().item()),
+            "time_rms": float(time_values.square().mean().sqrt().item()),
+        }
+        grouped: dict[str, list[torch.Tensor]] = {}
+        raw_grouped: dict[str, list[torch.Tensor]] = {}
+        for block in self.blocks:
+            raw = block.raw_modulation_components(time)
+            for name, value in raw.items():
+                raw_grouped.setdefault(name, []).append(value.float())
+            for name, value in block.modulation_components(time).items():
+                grouped.setdefault(name, []).append(value.float())
+        for prefix, source in (("", grouped), ("raw_", raw_grouped)):
+            for name, values in source.items():
+                combined = torch.cat([value.reshape(-1) for value in values])
+                stats[f"{prefix}{name}_abs_mean"] = float(combined.abs().mean().item())
+                stats[f"{prefix}{name}_abs_max"] = float(combined.abs().max().item())
+                stats[f"{prefix}{name}_rms"] = float(combined.square().mean().sqrt().item())
+        return stats
 
     def _material_state(self, material_ids: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
         batch, layers = material_ids.shape

@@ -44,6 +44,62 @@ def nested(mapping: dict[str, Any], *path: str, default: Any = None) -> Any:
     return value
 
 
+def schedule_enabled(schedule: dict[str, Any] | None) -> bool:
+    """Return whether a configured learning-rate schedule is active."""
+    return bool(schedule and schedule.get("ENABLED", True))
+
+
+def scheduled_learning_rate(base_lr: float, schedule: dict[str, Any] | None, global_samples_seen: int) -> float:
+    """Evaluate a warmup/decay schedule in global-sample coordinates."""
+    if not schedule_enabled(schedule):
+        return float(base_lr)
+
+    schedule_type = str(schedule.get("TYPE", "cosine")).lower().replace("-", "_")
+    sample = max(0, int(global_samples_seen))
+    max_lr = float(schedule.get("MAX_LR", schedule.get("LR", base_lr)))
+    min_lr = float(schedule.get("MIN_LR", 0.0))
+    start_lr = float(schedule.get("START_LR", min_lr))
+    warmup_samples = max(0, int(schedule.get("WARMUP_SAMPLES", 0)))
+    total_samples = max(warmup_samples + 1, int(schedule.get("TOTAL_SAMPLES", warmup_samples + 1)))
+    if min(start_lr, min_lr, max_lr) < 0.0:
+        raise ValueError("Learning rates in OPEN_LAYER.TRAIN.LR_SCHEDULE must be non-negative.")
+
+    if warmup_samples > 0 and sample < warmup_samples:
+        progress = float(sample) / float(warmup_samples)
+        return start_lr + progress * (max_lr - start_lr)
+
+    progress = float(sample - warmup_samples) / float(max(total_samples - warmup_samples, 1))
+    progress = max(0.0, min(1.0, progress))
+    if schedule_type == "cosine":
+        return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+    if schedule_type == "linear":
+        return max_lr + progress * (min_lr - max_lr)
+    if schedule_type in {"constant", "flat"}:
+        return max_lr
+    raise ValueError(f"Unknown OPEN_LAYER.TRAIN.LR_SCHEDULE.TYPE={schedule_type!r}.")
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    """Apply one learning rate to every optimizer parameter group."""
+    for group in optimizer.param_groups:
+        group["lr"] = float(learning_rate)
+
+
+def resume_global_samples(history: list[dict[str, Any]], start_epoch: int, train_samples: int) -> int:
+    """Recover the absolute sample coordinate from new or legacy checkpoints."""
+    if history:
+        latest_train = history[-1].get("train") or {}
+        if "global_samples_seen" in latest_train:
+            return int(latest_train["global_samples_seen"])
+        recorded = [
+            int((item.get("train") or {}).get("samples_seen", (item.get("train") or {}).get("samples", 0)))
+            for item in history
+        ]
+        if any(recorded):
+            return sum(recorded)
+    return max(0, int(start_epoch)) * max(0, int(train_samples))
+
+
 def resolve_device(value: str | None) -> torch.device:
     """Resolve a single-process device override."""
     if value:
@@ -85,6 +141,18 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
+def batch_row_count(batch: dict[str, torch.Tensor]) -> int:
+    """Return the number of consumed dataset rows in a collated batch."""
+    for key in ("sample_mask", "layer_mask"):
+        value = batch.get(key)
+        if value is not None and value.ndim > 0:
+            return int(value.shape[0])
+    for value in batch.values():
+        if value.ndim > 0:
+            return int(value.shape[0])
+    raise ValueError("Cannot determine batch size from a tensor batch containing only scalars.")
+
+
 def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLayerFlowConfig:
     """Construct model metadata from ``OPEN_LAYER`` config."""
     model = nested(block, "MODEL", default={}) or {}
@@ -103,6 +171,13 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
         query_encoder_blocks=int(model.get("QUERY_ENCODER_BLOCKS", 2)),
         dropout=float(model.get("DROPOUT", 0.0)),
         adaln_zero=bool(model.get("ADALN_ZERO", False)),
+        adaln_shift_limit=(
+            None if model.get("ADALN_SHIFT_LIMIT") is None else float(model["ADALN_SHIFT_LIMIT"])
+        ),
+        adaln_scale_limit=(
+            None if model.get("ADALN_SCALE_LIMIT") is None else float(model["ADALN_SCALE_LIMIT"])
+        ),
+        adaln_gate_limit=(None if model.get("ADALN_GATE_LIMIT") is None else float(model["ADALN_GATE_LIMIT"])),
         wavelength_scale_nm=float(query.get("WAVELENGTH_SCALE_NM", 1_000.0)),
         wavelength_fourier_bands=int(query.get("FOURIER_BANDS", 4)),
         material_process=str(process.get("MATERIAL_PROCESS", "monotonic")),
@@ -365,6 +440,9 @@ def run_loss_epoch(
     epochs: int,
     max_steps: int | None = None,
     max_consecutive_nonfinite_steps: int = 8,
+    base_learning_rate: float | None = None,
+    lr_schedule: dict[str, Any] | None = None,
+    global_samples_seen: int = 0,
 ) -> dict[str, float]:
     """Train or validate the denoising objectives for one epoch."""
     train = optimizer is not None
@@ -383,6 +461,9 @@ def run_loss_epoch(
     totals = torch.zeros(len(metric_keys) + 1, dtype=torch.float64, device=device)
     stability = torch.zeros(4, dtype=torch.long, device=device)
     consecutive_nonfinite = 0
+    epoch_samples_seen = 0
+    current_learning_rate = float(optimizer.param_groups[0]["lr"]) if optimizer is not None else 0.0
+    world_size = torch.distributed.get_world_size() if optollama.utils.is_ddp() else 1
     show_progress = not (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0)
     progress = tqdm.tqdm(
         loader,
@@ -395,7 +476,15 @@ def run_loss_epoch(
         batch = move_batch(raw_batch, device)
         if train:
             assert optimizer is not None
+            if base_learning_rate is not None:
+                current_learning_rate = scheduled_learning_rate(
+                    base_learning_rate,
+                    lr_schedule,
+                    global_samples_seen + epoch_samples_seen,
+                )
+                set_optimizer_lr(optimizer, current_learning_rate)
             optimizer.zero_grad(set_to_none=True)
+            epoch_samples_seen += batch_row_count(batch) * world_size
         context = nullcontext() if train else torch.no_grad()
         with context, autocast_context(device, amp_dtype):
             outputs = compute_training_loss(model, batch)
@@ -471,6 +560,7 @@ def run_loss_epoch(
             grad=f"{float(norm):.2f}",
             nf=f"{int(stability[0].item() + stability[1].item())}",
             amp_skip=f"{int(stability[2].item())}",
+            lr=f"{current_learning_rate:.2e}" if train else "-",
         )
 
     totals = reduce_totals(totals)
@@ -484,6 +574,9 @@ def run_loss_epoch(
         "nonfinite_gradient_steps": int(stability[1].item()),
         "amp_skipped_steps": int(stability[2].item()),
         "optimizer_steps": int(stability[3].item()),
+        "samples_seen": int(epoch_samples_seen if train else samples),
+        "global_samples_seen": int(global_samples_seen + epoch_samples_seen if train else global_samples_seen),
+        "learning_rate": float(current_learning_rate),
     }
 
 
@@ -724,7 +817,16 @@ def main() -> None:
             device_ids=[local_rank] if device.type == "cuda" else None,
             output_device=local_rank if device.type == "cuda" else None,
         )
-    learning_rate = float(args.learning_rate or train_cfg.get("LEARNING_RATE", 1.0e-4))
+    learning_rate = float(
+        args.learning_rate if args.learning_rate is not None else train_cfg.get("LEARNING_RATE", 1.0e-4)
+    )
+    lr_schedule = train_cfg.get("LR_SCHEDULE")
+    if lr_schedule is not None and not isinstance(lr_schedule, dict):
+        raise ValueError("OPEN_LAYER.TRAIN.LR_SCHEDULE must be a mapping.")
+    if args.learning_rate is not None and isinstance(lr_schedule, dict):
+        lr_schedule = dict(lr_schedule)
+        lr_schedule["MAX_LR"] = learning_rate
+    scheduled_learning_rate(learning_rate, lr_schedule, 0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=float(train_cfg.get("WEIGHT_DECAY", 0.01)))
     amp_enabled = bool(train_cfg.get("AMP", True) and device.type == "cuda")
     amp_dtype = resolve_amp_dtype(amp_enabled, device, str(train_cfg.get("AMP_DTYPE", "auto")))
@@ -741,6 +843,8 @@ def main() -> None:
         )
         start_epoch = int(loaded_epoch or 0)
         history = list(((blob.get("extra") or {}).get("history") or []))
+    global_samples_seen = resume_global_samples(history, start_epoch, train_n)
+    set_optimizer_lr(optimizer, scheduled_learning_rate(learning_rate, lr_schedule, global_samples_seen))
 
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -755,7 +859,20 @@ def main() -> None:
             f"points={query_cfg.get('MIN_POINTS', 64)}-{query_cfg.get('MAX_POINTS', len(cfg['WAVELENGTHS']))}, "
             f"sync_shapes_across_ranks={bool(query_cfg.get('SYNC_SHAPES_ACROSS_RANKS', True))}"
         )
-        print(f"Open-layer decoder conditioning: adaln_zero={model_config.adaln_zero}")
+        print(
+            f"Open-layer decoder conditioning: adaln_zero={model_config.adaln_zero}, "
+            f"limits(shift/scale/gate)={model_config.adaln_shift_limit}/"
+            f"{model_config.adaln_scale_limit}/{model_config.adaln_gate_limit}"
+        )
+        if schedule_enabled(lr_schedule):
+            print(
+                f"Open-layer LR schedule: type={lr_schedule.get('TYPE', 'cosine')}, "
+                f"samples={global_samples_seen:,}/{int(lr_schedule.get('TOTAL_SAMPLES', 0)):,}, "
+                f"warmup={int(lr_schedule.get('WARMUP_SAMPLES', 0)):,}, "
+                f"current={optimizer.param_groups[0]['lr']:.3e}"
+            )
+        else:
+            print(f"Open-layer LR schedule: constant={learning_rate:.3e}")
         print(
             f"Open-layer material process: {model_config.material_process}, "
             f"corruption={model_config.material_corruption_mode}, "
@@ -799,7 +916,11 @@ def main() -> None:
             epochs=epochs,
             max_steps=args.max_train_steps,
             max_consecutive_nonfinite_steps=max_consecutive_nonfinite_steps,
+            base_learning_rate=learning_rate,
+            lr_schedule=lr_schedule,
+            global_samples_seen=global_samples_seen,
         )
+        global_samples_seen = int(train_metrics["global_samples_seen"])
         val_metrics = run_loss_epoch(
             model=model,
             loader=val_loader,
@@ -834,13 +955,18 @@ def main() -> None:
                     else None
                 ),
             )
-        history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics, "tmm": tmm_metrics})
+        adaln_stats = unwrap_model(model).adaln_modulation_stats()
+        history.append(
+            {"epoch": epoch, "train": train_metrics, "val": val_metrics, "tmm": tmm_metrics, "adaln": adaln_stats}
+        )
         extra = {
             "open_layer_config": model_config.to_dict(),
             "channels": list(nested(block, "QUERY", "CHANNELS", default=["R", "T"])),
             "training_material_names": list(material_names),
             "holdout_material_names": list(nested(block, "MATERIAL_BANK", "HOLDOUT_MATERIALS", default=[])),
             "config_path": str(args.config),
+            "lr_schedule": lr_schedule,
+            "global_samples_seen": global_samples_seen,
             "history": history,
         }
         if rank == 0:
@@ -869,7 +995,19 @@ def main() -> None:
                     f"{tmm_metrics['a_mae_mean']:.6f}/{tmm_metrics['t_mae_mean']:.6f}"
                 )
             )
-            print(f"Open-layer epoch {epoch + 1}: val_loss={val_metrics['loss']:.6f}{tmm_note}, best={best_loss:.6f}")
+            modulation_note = (
+                f", time_max={adaln_stats.get('time_abs_max', 0.0):.3f}, "
+                f"adaln_raw_max(shift/scale/gate)={adaln_stats.get('raw_shift_abs_max', 0.0):.3f}/"
+                f"{adaln_stats.get('raw_scale_abs_max', 0.0):.3f}/"
+                f"{max((value for key, value in adaln_stats.items() if key.startswith('raw_') and key.endswith('_gate_abs_max')), default=0.0):.3f}, "
+                f"bounded={adaln_stats.get('shift_abs_max', 0.0):.3f}/"
+                f"{adaln_stats.get('scale_abs_max', 0.0):.3f}/"
+                f"{max((value for key, value in adaln_stats.items() if not key.startswith('raw_') and key.endswith('_gate_abs_max')), default=0.0):.3f}"
+            )
+            print(
+                f"Open-layer epoch {epoch + 1}: val_loss={val_metrics['loss']:.6f}{tmm_note}, "
+                f"lr={train_metrics['learning_rate']:.3e}{modulation_note}, best={best_loss:.6f}"
+            )
 
     if optollama.utils.is_ddp():
         torch.distributed.barrier()

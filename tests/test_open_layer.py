@@ -23,8 +23,10 @@ from optollama.model.open_layer_flow import (
 from scripts.train_open_layer_flow import (
     averaged_metrics,
     make_loader,
+    resume_global_samples,
     run_loss_epoch,
     save_validation_spectra,
+    scheduled_learning_rate,
     select_mc_spectral_metrics,
 )
 
@@ -255,6 +257,58 @@ def test_adaln_zero_uses_four_feature_wise_residual_gates() -> None:
     legacy_parameters = sum(parameter.numel() for parameter in legacy.parameters())
     stabilized_parameters = sum(parameter.numel() for parameter in stabilized.parameters())
     assert stabilized_parameters - legacy_parameters == expected_extra
+
+
+def test_adaln_modulation_limits_bound_effective_values() -> None:
+    config = OpenLayerFlowConfig(
+        d_model=32,
+        n_blocks=1,
+        n_heads=4,
+        query_encoder_blocks=1,
+        max_layers=4,
+        adaln_zero=True,
+        adaln_shift_limit=2.0,
+        adaln_scale_limit=1.0,
+        adaln_gate_limit=0.5,
+    )
+    block = OpenLayerDecoderBlock(config)
+    output = block.time_modulation[-1]
+    assert isinstance(output, torch.nn.Linear)
+    with torch.no_grad():
+        output.bias.fill_(100.0)
+    components = block.modulation_components(torch.zeros(2, config.d_model))
+    raw_components = block.raw_modulation_components(torch.zeros(2, config.d_model))
+    assert raw_components["shift"].abs().max() > 2.0
+    assert components["shift"].abs().max() <= 2.0
+    assert components["scale"].abs().max() <= 1.0
+    assert components["self_gate"].abs().max() <= 0.5
+
+    model = OpenLayerFlow(config)
+    stats = model.adaln_modulation_stats(samples=3)
+    assert "scale_abs_max" in stats
+    assert "raw_scale_abs_max" in stats
+    assert "self_gate_abs_max" in stats
+
+
+def test_sample_based_learning_rate_schedule_and_resume_position() -> None:
+    schedule = {
+        "ENABLED": True,
+        "TYPE": "cosine",
+        "WARMUP_SAMPLES": 2_000_000,
+        "TOTAL_SAMPLES": 400_000_000,
+        "START_LR": 1.0e-6,
+        "MAX_LR": 5.0e-5,
+        "MIN_LR": 1.0e-6,
+    }
+    assert scheduled_learning_rate(1.0e-4, schedule, 0) == 1.0e-6
+    assert scheduled_learning_rate(1.0e-4, schedule, 2_000_000) == 5.0e-5
+    assert abs(scheduled_learning_rate(1.0e-4, schedule, 201_000_000) - 2.55e-5) < 1.0e-12
+    assert scheduled_learning_rate(1.0e-4, schedule, 400_000_000) == 1.0e-6
+
+    history = [{"train": {"global_samples_seen": 123_456}}]
+    assert resume_global_samples(history, start_epoch=7, train_samples=20_000_000) == 123_456
+    legacy = [{"train": {"samples": 100}}, {"train": {"samples": 90}}]
+    assert resume_global_samples(legacy, start_epoch=2, train_samples=100) == 190
 
 
 def test_training_loss_and_sampling_are_finite() -> None:
@@ -552,7 +606,20 @@ def test_open_layer_epoch_skips_nonfinite_gradient_without_poisoning_weights() -
             epoch=0,
             epochs=1,
             max_consecutive_nonfinite_steps=2,
+            base_learning_rate=3.0e-3,
+            lr_schedule={
+                "ENABLED": True,
+                "TYPE": "linear",
+                "WARMUP_SAMPLES": 4,
+                "TOTAL_SAMPLES": 8,
+                "START_LR": 1.0e-3,
+                "MAX_LR": 3.0e-3,
+                "MIN_LR": 1.0e-4,
+            },
         )
     assert metrics["nonfinite_gradient_steps"] == 1
     assert metrics["optimizer_steps"] == 1
+    assert metrics["samples_seen"] == 2
+    assert metrics["global_samples_seen"] == 2
+    assert metrics["learning_rate"] == 1.5e-3
     assert torch.isfinite(model.weight).all()
