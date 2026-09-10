@@ -160,6 +160,10 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
     process = nested(block, "DENOISING", default={}) or {}
     corruption = nested(process, "CORRUPTION", default={}) or {}
     thickness = nested(block, "THICKNESS", default={}) or {}
+    thickness_head = nested(model, "THICKNESS_HEAD", default={}) or {}
+    material_context = str(thickness_head.get("MATERIAL_CONTEXT", "none")).lower().replace("-", "_")
+    if material_context not in {"none", "predicted_soft"}:
+        raise ValueError("OPEN_LAYER.MODEL.THICKNESS_HEAD.MATERIAL_CONTEXT must be 'none' or 'predicted_soft'.")
     channels = tuple(str(value) for value in query.get("CHANNELS", ["R", "T"]))
     return optollama.model.OpenLayerFlowConfig(
         target_channels=len(channels),
@@ -178,6 +182,11 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
             None if model.get("ADALN_SCALE_LIMIT") is None else float(model["ADALN_SCALE_LIMIT"])
         ),
         adaln_gate_limit=(None if model.get("ADALN_GATE_LIMIT") is None else float(model["ADALN_GATE_LIMIT"])),
+        branch_specific_adaln=bool(model.get("BRANCH_SPECIFIC_ADALN", False)),
+        time_injection=str(model.get("TIME_INJECTION", "add_and_adaln")),
+        normalize_time_embedding=bool(model.get("NORMALIZE_TIME_EMBEDDING", False)),
+        material_conditioned_thickness=material_context == "predicted_soft",
+        thickness_material_context_gradient=bool(thickness_head.get("MATERIAL_CONTEXT_GRADIENT", False)),
         wavelength_scale_nm=float(query.get("WAVELENGTH_SCALE_NM", 1_000.0)),
         wavelength_fourier_bands=int(query.get("FOURIER_BANDS", 4)),
         material_process=str(process.get("MATERIAL_PROCESS", "monotonic")),
@@ -861,8 +870,15 @@ def main() -> None:
         )
         print(
             f"Open-layer decoder conditioning: adaln_zero={model_config.adaln_zero}, "
+            f"branch_specific={model_config.branch_specific_adaln}, "
+            f"time={model_config.time_injection}/norm={model_config.normalize_time_embedding}, "
             f"limits(shift/scale/gate)={model_config.adaln_shift_limit}/"
             f"{model_config.adaln_scale_limit}/{model_config.adaln_gate_limit}"
+        )
+        print(
+            "Open-layer output heads: "
+            f"material_conditioned_thickness={model_config.material_conditioned_thickness}, "
+            f"context_gradient={model_config.thickness_material_context_gradient}"
         )
         if schedule_enabled(lr_schedule):
             print(

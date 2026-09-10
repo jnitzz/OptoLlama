@@ -61,6 +61,23 @@ def _normalize_random_replace_schedule(value: str | None) -> str:
     return aliases[normalized]
 
 
+def _normalize_time_injection(value: str | None) -> str:
+    """Normalize decoder timestep-injection aliases."""
+    normalized = str(value or "add_and_adaln").lower().replace("-", "_")
+    aliases = {
+        "add_and_adaln": "add_and_adaln",
+        "add": "add_and_adaln",
+        "legacy": "add_and_adaln",
+        "adaln_only": "adaln_only",
+        "adaln": "adaln_only",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown time_injection={value!r}; expected 'add_and_adaln' or 'adaln_only'."
+        )
+    return aliases[normalized]
+
+
 @dataclass(frozen=True)
 class OpenLayerFlowConfig:
     """Architecture and process definition for the open-layer MVP."""
@@ -77,6 +94,11 @@ class OpenLayerFlowConfig:
     adaln_shift_limit: float | None = None
     adaln_scale_limit: float | None = None
     adaln_gate_limit: float | None = None
+    branch_specific_adaln: bool = False
+    time_injection: str = "add_and_adaln"
+    normalize_time_embedding: bool = False
+    material_conditioned_thickness: bool = False
+    thickness_material_context_gradient: bool = False
     wavelength_scale_nm: float = 1_000.0
     wavelength_fourier_bands: int = 4
     material_process: str = "monotonic"
@@ -112,6 +134,9 @@ class OpenLayerFlowConfig:
             if value is not None and float(value) <= 0.0:
                 raise ValueError(f"{name} must be positive when enabled, got {value}.")
             object.__setattr__(self, name, None if value is None else float(value))
+        object.__setattr__(self, "time_injection", _normalize_time_injection(self.time_injection))
+        if self.branch_specific_adaln and not self.adaln_zero:
+            raise ValueError("branch_specific_adaln requires adaln_zero=True.")
         object.__setattr__(self, "material_process", _normalize_material_process(self.material_process))
         object.__setattr__(
             self,
@@ -399,7 +424,8 @@ class OpenLayerDecoderBlock(nn.Module):
             nn.Linear(hidden, config.d_model),
         )
         self.dropout = nn.Dropout(config.dropout)
-        modulation_chunks = 6 if self.adaln_zero else 2
+        self.branch_specific_adaln = bool(config.branch_specific_adaln and self.adaln_zero)
+        modulation_chunks = 12 if self.branch_specific_adaln else (6 if self.adaln_zero else 2)
         self.time_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(config.d_model, modulation_chunks * config.d_model),
@@ -423,6 +449,22 @@ class OpenLayerDecoderBlock(nn.Module):
     def raw_modulation_components(self, time_embedding: torch.Tensor) -> dict[str, torch.Tensor]:
         """Return unbounded AdaLN projection outputs for diagnostics."""
         modulation = self.time_modulation(time_embedding)
+        if self.branch_specific_adaln:
+            names = (
+                "self_shift",
+                "self_scale",
+                "self_gate",
+                "target_shift",
+                "target_scale",
+                "target_gate",
+                "material_shift",
+                "material_scale",
+                "material_gate",
+                "ffn_shift",
+                "ffn_scale",
+                "ffn_gate",
+            )
+            return dict(zip(names, modulation.chunk(len(names), dim=-1), strict=True))
         if self.adaln_zero:
             shift, scale, self_gate, target_gate, material_gate, ffn_gate = modulation.chunk(6, dim=-1)
             return {
@@ -444,10 +486,24 @@ class OpenLayerDecoderBlock(nn.Module):
                 value,
                 self.adaln_gate_limit
                 if name.endswith("_gate")
-                else (self.adaln_shift_limit if name == "shift" else self.adaln_scale_limit),
+                else (self.adaln_shift_limit if name.endswith("shift") else self.adaln_scale_limit),
             )
             for name, value in raw.items()
         }
+
+    def _branch_modulation(
+        self,
+        components: dict[str, torch.Tensor],
+        branch: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Select shared or branch-local normalization and gate values."""
+        if self.branch_specific_adaln:
+            return (
+                components[f"{branch}_shift"],
+                components[f"{branch}_scale"],
+                components[f"{branch}_gate"],
+            )
+        return components["shift"], components["scale"], components.get(f"{branch}_gate")
 
     def forward(
         self,
@@ -462,12 +518,7 @@ class OpenLayerDecoderBlock(nn.Module):
     ) -> torch.Tensor:
         """Apply one conditioned decoder block."""
         components = self.modulation_components(time_embedding)
-        shift = components["shift"]
-        scale = components["scale"]
-        self_gate = components.get("self_gate")
-        target_gate = components.get("target_gate")
-        material_gate = components.get("material_gate")
-        ffn_gate = components.get("ffn_gate")
+        shift, scale, self_gate = self._branch_modulation(components, "self")
 
         h = self._modulate(self.self_norm(x), shift, scale)
         h, _ = self.self_attention(h, h, h, key_padding_mask=layer_padding_mask, need_weights=False)
@@ -475,6 +526,7 @@ class OpenLayerDecoderBlock(nn.Module):
             h = self_gate[:, None, :] * h
         x = x + self.dropout(h)
 
+        shift, scale, target_gate = self._branch_modulation(components, "target")
         h = self._modulate(self.target_norm(x), shift, scale)
         h, _ = self.target_attention(
             h,
@@ -487,6 +539,7 @@ class OpenLayerDecoderBlock(nn.Module):
             h = target_gate[:, None, :] * h
         x = x + self.dropout(h)
 
+        shift, scale, material_gate = self._branch_modulation(components, "material")
         h = self._modulate(self.material_norm(x), shift, scale)
         h, _ = self.material_attention(
             h,
@@ -498,6 +551,7 @@ class OpenLayerDecoderBlock(nn.Module):
         if material_gate is not None:
             h = material_gate[:, None, :] * h
         x = x + self.dropout(h)
+        shift, scale, ffn_gate = self._branch_modulation(components, "ffn")
         h = self.ffn(self._modulate(self.ffn_norm(x), shift, scale))
         if ffn_gate is not None:
             h = ffn_gate[:, None, :] * h
@@ -530,11 +584,28 @@ class OpenLayerFlow(nn.Module):
             nn.SiLU(),
             nn.Linear(config.d_model, config.d_model),
         )
+        self.time_output_norm = (
+            nn.LayerNorm(config.d_model, elementwise_affine=False)
+            if config.normalize_time_embedding
+            else nn.Identity()
+        )
         self.blocks = nn.ModuleList([OpenLayerDecoderBlock(config) for _ in range(config.n_blocks)])
         self.output_norm = nn.LayerNorm(config.d_model)
         self.pointer_query = nn.Linear(config.d_model, config.d_model, bias=False)
         self.pointer_key = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.thickness_velocity = nn.Linear(config.d_model, 1)
+        if config.material_conditioned_thickness:
+            self.thickness_output_norm = nn.LayerNorm(config.d_model)
+            self.thickness_material_projection = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.thickness_velocity = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.SiLU(),
+                nn.Linear(config.d_model, 1),
+            )
+            nn.init.zeros_(self.thickness_material_projection.weight)
+        else:
+            self.thickness_output_norm = nn.Identity()
+            self.thickness_material_projection = nn.Identity()
+            self.thickness_velocity = nn.Linear(config.d_model, 1)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -549,7 +620,7 @@ class OpenLayerFlow(nn.Module):
             raise ValueError("samples must be positive.")
         parameter = next(self.parameters())
         timesteps = torch.linspace(0.0, 1.0, samples, device=parameter.device)
-        time = self.time_embedding(timesteps)
+        time = self.time_output_norm(self.time_embedding(timesteps))
         time_values = time.float().reshape(-1)
         stats: dict[str, float] = {
             "time_abs_mean": float(time_values.abs().mean().item()),
@@ -570,6 +641,18 @@ class OpenLayerFlow(nn.Module):
                 stats[f"{prefix}{name}_abs_mean"] = float(combined.abs().mean().item())
                 stats[f"{prefix}{name}_abs_max"] = float(combined.abs().max().item())
                 stats[f"{prefix}{name}_rms"] = float(combined.square().mean().sqrt().item())
+            for component in ("shift", "scale"):
+                component_values = [
+                    value
+                    for name, values in source.items()
+                    if name == component or name.endswith(f"_{component}")
+                    for value in values
+                ]
+                if component_values:
+                    combined = torch.cat([value.reshape(-1) for value in component_values])
+                    stats[f"{prefix}{component}_abs_mean"] = float(combined.abs().mean().item())
+                    stats[f"{prefix}{component}_abs_max"] = float(combined.abs().max().item())
+                    stats[f"{prefix}{component}_rms"] = float(combined.square().mean().sqrt().item())
         return stats
 
     def _material_state(self, material_ids: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
@@ -633,6 +716,7 @@ class OpenLayerFlow(nn.Module):
         layer_mask: torch.Tensor,
         timesteps: torch.Tensor,
         encoded_condition: tuple[torch.Tensor, torch.Tensor] | None = None,
+        material_temperature: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         """Predict query-local material logits and normalized-thickness velocity."""
         if material_ids.shape != thickness_state.shape or material_ids.shape != layer_mask.shape:
@@ -653,10 +737,12 @@ class OpenLayerFlow(nn.Module):
             )
         else:
             target_memory, material_memory = encoded_condition
-        time = self.time_embedding(timesteps.reshape(-1))
+        time = self.time_output_norm(self.time_embedding(timesteps.reshape(-1)))
         x = self._material_state(material_ids, material_memory)
         x = x + self.thickness_embedding(thickness_state.unsqueeze(-1).to(dtype=torch.float32))
-        x = x + self.position_embedding[:layers].unsqueeze(0) + time.unsqueeze(1)
+        x = x + self.position_embedding[:layers].unsqueeze(0)
+        if self.config.time_injection == "add_and_adaln":
+            x = x + time.unsqueeze(1)
         layer_padding = ~layer_mask.to(dtype=torch.bool)
         for block in self.blocks:
             x = block(
@@ -668,13 +754,25 @@ class OpenLayerFlow(nn.Module):
                 material_memory=material_memory,
                 candidate_padding_mask=~candidate_mask.to(dtype=torch.bool),
             )
-        x = self.output_norm(x)
-        pointer_query = self.pointer_query(x)
+        material_features = self.output_norm(x)
+        pointer_query = self.pointer_query(material_features)
         pointer_key = self.pointer_key(material_memory)
         logits = torch.einsum("bld,bmd->blm", pointer_query, pointer_key) / math.sqrt(self.config.d_model)
         logits = logits.masked_fill(~candidate_mask[:, None, :].to(dtype=torch.bool), -torch.inf)
         logits = logits.masked_fill(layer_padding.unsqueeze(-1), 0.0)
-        velocity = self.thickness_velocity(x).squeeze(-1).masked_fill(layer_padding, 0.0)
+        if self.config.material_conditioned_thickness:
+            probabilities = torch.softmax(
+                logits / max(float(material_temperature), 1.0e-6),
+                dim=-1,
+            )
+            material_context = torch.einsum("blm,bmd->bld", probabilities, material_memory)
+            if not self.config.thickness_material_context_gradient:
+                material_context = material_context.detach()
+            thickness_features = x + self.thickness_material_projection(material_context)
+            thickness_features = self.thickness_output_norm(thickness_features)
+        else:
+            thickness_features = material_features
+        velocity = self.thickness_velocity(thickness_features).squeeze(-1).masked_fill(layer_padding, 0.0)
         return {"material_logits": logits, "thickness_velocity": velocity}
 
     def _random_replace_probability(self, timesteps: torch.Tensor) -> torch.Tensor:
@@ -920,8 +1018,8 @@ class OpenLayerFlow(nn.Module):
                 layer_mask=layer_mask,
                 timesteps=timesteps,
                 encoded_condition=encoded,
+                material_temperature=temperature,
             )
-            thickness_state = thickness_state - (current_t - next_t) * outputs["thickness_velocity"]
             probabilities = torch.softmax(outputs["material_logits"] / max(float(temperature), 1.0e-6), dim=-1)
             confidence, greedy = probabilities.max(dim=-1)
             proposals = (
@@ -933,6 +1031,10 @@ class OpenLayerFlow(nn.Module):
                     generator=generator,
                 ).reshape(batch, layers)
             )
+
+            # The velocity already uses the soft material proposal from this same
+            # forward pass, so material and thickness can move together.
+            thickness_state = thickness_state - (current_t - next_t) * outputs["thickness_velocity"]
 
             if self.config.material_process == "full_remask":
                 material_ids = torch.where(layer_mask, proposals, torch.full_like(proposals, self.MASK_MATERIAL))

@@ -259,6 +259,60 @@ def test_adaln_zero_uses_four_feature_wise_residual_gates() -> None:
     assert stabilized_parameters - legacy_parameters == expected_extra
 
 
+def test_branch_specific_adaln_zero_starts_as_identity() -> None:
+    config = OpenLayerFlowConfig(
+        d_model=32,
+        n_blocks=1,
+        n_heads=4,
+        query_encoder_blocks=1,
+        max_layers=4,
+        adaln_zero=True,
+        branch_specific_adaln=True,
+    )
+    block = OpenLayerDecoderBlock(config).eval()
+    x = torch.randn(2, 4, 32)
+    output = block(
+        x,
+        time_embedding=torch.randn(2, 32),
+        layer_padding_mask=torch.zeros(2, 4, dtype=torch.bool),
+        target_memory=torch.randn(2, 3, 32),
+        query_padding_mask=torch.zeros(2, 3, dtype=torch.bool),
+        material_memory=torch.randn(2, 3, 32),
+        candidate_padding_mask=torch.zeros(2, 3, dtype=torch.bool),
+    )
+    assert torch.equal(output, x)
+    assert set(block.modulation_components(torch.randn(2, 32))) == {
+        f"{branch}_{component}"
+        for branch in ("self", "target", "material", "ffn")
+        for component in ("shift", "scale", "gate")
+    }
+
+
+def test_adaln_only_time_is_normalized_and_material_context_is_detached() -> None:
+    model = tiny_model(
+        adaln_zero=True,
+        branch_specific_adaln=True,
+        time_injection="adaln_only",
+        normalize_time_embedding=True,
+        material_conditioned_thickness=True,
+        thickness_material_context_gradient=False,
+    )
+    stats = model.adaln_modulation_stats(samples=5)
+    assert abs(stats["time_rms"] - 1.0) < 5.0e-4
+
+    condition = synthetic_condition(batch=1)
+    outputs = model(
+        **condition,
+        material_ids=torch.full((1, 3), -1, dtype=torch.long),
+        thickness_state=torch.zeros(1, 3),
+        layer_mask=torch.ones(1, 3, dtype=torch.bool),
+        timesteps=torch.tensor([0.5]),
+    )
+    outputs["thickness_velocity"].sum().backward()
+    assert model.thickness_material_projection.weight.grad is not None
+    assert model.pointer_query.weight.grad is None
+
+
 def test_adaln_modulation_limits_bound_effective_values() -> None:
     config = OpenLayerFlowConfig(
         d_model=32,
