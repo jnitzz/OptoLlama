@@ -322,11 +322,7 @@ def reduce_totals(totals: torch.Tensor) -> torch.Tensor:
 
 def synchronized_finite(value: torch.Tensor) -> bool:
     """Return whether a tensor is finite on every distributed rank."""
-    finite = torch.tensor(
-        int(bool(torch.isfinite(value.detach()).all().item())),
-        dtype=torch.int32,
-        device=value.device,
-    )
+    finite = torch.isfinite(value.detach()).all().to(dtype=torch.int32)
     if optollama.utils.is_ddp():
         torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
     return bool(finite.item())

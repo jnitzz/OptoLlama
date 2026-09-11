@@ -6,7 +6,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as functional
@@ -43,8 +43,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenVocabularyDepthFieldDiffusion:
-    """Return the underlying model when DDP is active."""
-    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model  # type: ignore[return-value]
+    """Return the underlying model when DDP and/or torch.compile are active."""
+    core = model
+    while True:
+        if isinstance(core, torch.nn.parallel.DistributedDataParallel):
+            core = core.module
+            continue
+        original = getattr(core, "_orig_mod", None)
+        if isinstance(original, torch.nn.Module):
+            core = original
+            continue
+        return core  # type: ignore[return-value]
 
 
 class ModelEma:
@@ -62,11 +71,12 @@ class ModelEma:
         }
 
     @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
+    def update(self, model: torch.nn.Module, *, decay: float | None = None) -> None:
         """Update shadow tensors after one successful optimizer step."""
+        effective_decay = self.decay if decay is None else float(decay)
         for name, value in unwrap_model(model).state_dict().items():
             if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+                self.shadow[name].mul_(effective_decay).add_(value.detach(), alpha=1.0 - effective_decay)
         self.updates += 1
 
     def state_dict(self) -> dict[str, Any]:
@@ -269,6 +279,11 @@ def run_epoch(
     lr_schedule: dict[str, Any] | None,
     global_samples_seen: int,
     ema: ModelEma | None = None,
+    global_optimizer_steps: int = 0,
+    log_every_steps: int = 50,
+    ema_update_every_steps: int = 1,
+    eval_every_steps: int | None = None,
+    on_evaluation_step: Callable[[int, int, dict[str, float]], None] | None = None,
 ) -> dict[str, float]:
     """Train or validate one epoch and aggregate metrics over all ranks."""
     training = optimizer is not None
@@ -276,10 +291,18 @@ def run_epoch(
     keys = ("loss", "accuracy", "corrupted_accuracy", "noise_probability", "corrupted_fraction", "condition_dropped")
     totals = torch.zeros(len(keys) + 1, dtype=torch.float64, device=device)
     local_rows = 0
+    optimizer_steps = 0
+    log_every_steps = max(1, int(log_every_steps))
+    ema_update_every_steps = max(1, int(ema_update_every_steps))
+    eval_every_steps = None if not eval_every_steps else max(1, int(eval_every_steps))
     world = torch.distributed.get_world_size() if optollama.utils.is_ddp() else 1
     show = not optollama.utils.is_ddp() or torch.distributed.get_rank() == 0
     progress = tqdm.tqdm(
-        loader, desc=f"Epoch {epoch + 1}/{epochs} open-vocab depth {'train' if training else 'val'}", disable=not show
+        loader,
+        desc=f"Epoch {epoch + 1}/{epochs} open-vocab depth {'train' if training else 'val'}",
+        disable=not show,
+        miniters=log_every_steps,
+        mininterval=5.0,
     )
     for step, raw in enumerate(progress):
         if max_steps is not None and step >= max_steps:
@@ -297,7 +320,7 @@ def run_epoch(
         context = torch.enable_grad() if training else torch.no_grad()
         with context, autocast_context(device, amp_dtype):
             output = compute_loss(model, batch, train_cfg, corruption)
-        if not synchronized_finite(output["loss"]):
+        if not training and not synchronized_finite(output["loss"]):
             raise FloatingPointError(f"Non-finite open-vocabulary depth loss at epoch={epoch + 1}, step={step}.")
         if training:
             assert optimizer is not None
@@ -306,21 +329,47 @@ def run_epoch(
             norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), float(train_cfg.get("GRAD_CLIP", 1.0)), error_if_nonfinite=False
             )
-            if not synchronized_finite(norm):
+            if not synchronized_finite(torch.stack((output["loss"].detach().float(), norm.detach().float()))):
                 optimizer.zero_grad(set_to_none=True)
-                raise FloatingPointError(f"Non-finite gradient at epoch={epoch + 1}, step={step}.")
+                raise FloatingPointError(f"Non-finite loss or gradient at epoch={epoch + 1}, step={step}.")
             scaler.step(optimizer)
             scaler.update()
-            if ema is not None:
-                ema.update(model)
             local_rows += rows
-        totals += torch.tensor([float(output[key].detach()) * rows for key in keys] + [rows], dtype=torch.float64, device=device)
-        running = {key: float(totals[index] / totals[-1]) for index, key in enumerate(keys)}
-        progress.set_postfix(
-            loss=f"{running['loss']:.4f}",
-            acc=f"{100 * running['accuracy']:.1f}%",
-            corr=f"{100 * running['corrupted_accuracy']:.1f}%",
-        )
+            optimizer_steps += 1
+            current_global_step = global_optimizer_steps + optimizer_steps
+            if ema is not None and current_global_step % ema_update_every_steps == 0:
+                ema.update(model, decay=ema.decay**ema_update_every_steps)
+        metric_values = torch.stack([output[key].detach().to(dtype=torch.float64) for key in keys])
+        totals[:-1].add_(metric_values * rows)
+        totals[-1].add_(rows)
+        display_step = optimizer_steps if training else step + 1
+        if display_step == 1 or display_step % log_every_steps == 0:
+            running = {key: float((totals[index] / totals[-1]).item()) for index, key in enumerate(keys)}
+            progress.set_postfix(
+                loss=f"{running['loss']:.4f}",
+                acc=f"{100 * running['accuracy']:.1f}%",
+                corr=f"{100 * running['corrupted_accuracy']:.1f}%",
+                refresh=False,
+            )
+        if (
+            training
+            and eval_every_steps is not None
+            and on_evaluation_step is not None
+            and current_global_step % eval_every_steps == 0
+        ):
+            snapshot_totals = totals.clone()
+            if optollama.utils.is_ddp():
+                torch.distributed.all_reduce(snapshot_totals)
+            snapshot = {
+                key: float((snapshot_totals[index] / snapshot_totals[-1]).item()) for index, key in enumerate(keys)
+            }
+            snapshot["samples"] = int(snapshot_totals[-1].item())
+            on_evaluation_step(
+                current_global_step,
+                global_samples_seen + local_rows * world,
+                snapshot,
+            )
+            model.train(True)
     if optollama.utils.is_ddp():
         torch.distributed.all_reduce(totals)
     if totals[-1] <= 0:
@@ -329,6 +378,8 @@ def run_epoch(
     metrics["samples"] = int(totals[-1].item())
     metrics["samples_seen"] = local_rows * world if training else int(totals[-1].item())
     metrics["global_samples_seen"] = global_samples_seen + int(metrics["samples_seen"]) if training else global_samples_seen
+    metrics["optimizer_steps"] = optimizer_steps
+    metrics["global_optimizer_steps"] = global_optimizer_steps + optimizer_steps
     metrics["learning_rate"] = float(optimizer.param_groups[0]["lr"]) if optimizer is not None else 0.0
     return metrics
 
@@ -352,6 +403,10 @@ def main() -> None:
 
     setup_device, local_rank, rank, world = optollama.utils.setup_run(cfg, make_dirs=False)
     device = torch.device(args.device or setup_device)
+    if device.type == "cuda":
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
     material_names = optollama.data.material_names_from_tokens(tokens)
     catalog = optollama.data.load_material_catalog(cfg["MATERIALS_PATH"], material_names)
@@ -384,11 +439,21 @@ def main() -> None:
             spectrum_encoder_blocks=1,
             spectrum_encoder_heads=4,
         )
-    model: torch.nn.Module = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device)
-    if optollama.utils.is_ddp():
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+    raw_model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device)
     base_lr = float(train_cfg.get("LEARNING_RATE", 5.0e-5))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=float(train_cfg.get("WEIGHT_DECAY", 0.01)))
+    optimizer_cfg = train_cfg.get("OPTIMIZER") or {}
+    fused_optimizer = bool(optimizer_cfg.get("FUSED", True)) and device.type == "cuda"
+    optimizer_kwargs = {
+        "lr": base_lr,
+        "weight_decay": float(train_cfg.get("WEIGHT_DECAY", 0.01)),
+    }
+    try:
+        optimizer = torch.optim.AdamW(raw_model.parameters(), **optimizer_kwargs, fused=fused_optimizer)
+    except (RuntimeError, TypeError):
+        if not fused_optimizer:
+            raise
+        fused_optimizer = False
+        optimizer = torch.optim.AdamW(raw_model.parameters(), **optimizer_kwargs)
     amp_dtype = resolve_amp_dtype(bool(train_cfg.get("AMP", True)), device, str(train_cfg.get("AMP_DTYPE", "auto")))
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     lr_schedule = train_cfg.get("LR_SCHEDULE")
@@ -399,18 +464,54 @@ def main() -> None:
     epochs = 1 if args.smoke_test else int(args.epochs or train_cfg.get("EPOCHS", 20))
     start_epoch = 0
     history: list[dict[str, Any]] = []
+    step_evaluations: list[dict[str, Any]] = []
     ema_cfg = train_cfg.get("EMA") or {}
-    ema = ModelEma(model, float(ema_cfg.get("DECAY", 0.9998))) if bool(ema_cfg.get("ENABLED", True)) else None
+    ema = ModelEma(raw_model, float(ema_cfg.get("DECAY", 0.9998))) if bool(ema_cfg.get("ENABLED", True)) else None
     resume = args.resume or nested(cfg, "CHECKPOINT", "RESUME")
+    checkpoint_extra: dict[str, Any] = {}
     if resume:
         loaded_epoch, blob = optollama.utils.load_checkpoint(
-            str(resume), model, optimizer=optimizer, scaler=scaler, map_location="cpu"
+            str(resume), raw_model, optimizer=optimizer, scaler=scaler, map_location="cpu"
         )
         start_epoch = int(loaded_epoch or 0)
-        history = list(((blob.get("extra") or {}).get("history") or []))
-        if ema is not None and isinstance((blob.get("extra") or {}).get("ema"), dict):
-            ema.load_state_dict((blob.get("extra") or {})["ema"], model)
+        checkpoint_extra = blob.get("extra") or {}
+        history = list(checkpoint_extra.get("history") or [])
+        step_evaluations = list(checkpoint_extra.get("step_evaluations") or [])
+        if ema is not None and isinstance(checkpoint_extra.get("ema"), dict):
+            ema.load_state_dict(checkpoint_extra["ema"], raw_model)
+
+    model: torch.nn.Module = raw_model
+    compile_cfg = train_cfg.get("COMPILE") or {}
+    compile_enabled = bool(compile_cfg.get("ENABLED", False)) and device.type == "cuda" and not args.smoke_test
+    if compile_enabled:
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            raise RuntimeError("OPEN_VOCAB_DEPTH_FIELD.TRAIN.COMPILE is enabled, but this PyTorch has no torch.compile.")
+        if bool(compile_cfg.get("SUPPRESS_ERRORS", True)):
+            torch._dynamo.config.suppress_errors = True
+        model = compile_fn(
+            model,
+            mode=str(compile_cfg.get("MODE", "default")),
+            fullgraph=bool(compile_cfg.get("FULLGRAPH", False)),
+            dynamic=bool(compile_cfg.get("DYNAMIC", False)),
+        )
+    ddp_cfg = train_cfg.get("DDP") or {}
+    if optollama.utils.is_ddp():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            static_graph=bool(ddp_cfg.get("STATIC_GRAPH", True)),
+            gradient_as_bucket_view=bool(ddp_cfg.get("GRADIENT_AS_BUCKET_VIEW", True)),
+        )
     global_seen = resume_global_samples(history, start_epoch, train_n)
+    global_steps = int(
+        checkpoint_extra.get("global_optimizer_steps", 0)
+        or global_seen // max(1, int(cfg["TRAIN_BATCH_SIZE"]) * world)
+    )
+    log_every_steps = max(1, int(train_cfg.get("LOG_EVERY_STEPS", 50)))
+    eval_every_steps = max(0, int(train_cfg.get("EVAL_EVERY_STEPS", 0)))
+    ema_update_every_steps = max(1, int(ema_cfg.get("UPDATE_EVERY_STEPS", 1)))
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         print(
@@ -422,11 +523,58 @@ def main() -> None:
         print(
             f"Optical condition: angle={nested(block, 'OPTICAL_CONDITION', 'ANGLE_DEG', default=0.0)}deg, polarization={nested(block, 'OPTICAL_CONDITION', 'POLARIZATION', default='s')}"
         )
+        print(
+            "Optimizations: "
+            f"compile={compile_enabled}, fused_adamw={fused_optimizer}, "
+            f"log_every={log_every_steps}, eval_every={eval_every_steps or 'epoch'}, "
+            f"ema_every={ema_update_every_steps}"
+        )
     best = min((float(item["val"]["loss"]) for item in history), default=math.inf)
     for epoch in range(start_epoch, epochs):
         if hasattr(train_dataset, "set_epoch"):
             train_dataset.set_epoch(epoch)
         max_train_steps = 1 if args.smoke_test else args.max_train_steps
+
+        def evaluate_at_step(step: int, samples_seen: int, train_running: dict[str, float]) -> None:
+            """Run and persist lightweight validation at a global optimizer-step boundary."""
+            validate_ema = bool(ema is not None and ema_cfg.get("VALIDATE", True))
+            validation_context = ema.apply(model) if validate_ema and ema is not None else nullcontext()
+            with validation_context:
+                interval_val = run_epoch(
+                    model,
+                    val_loader,
+                    device,
+                    train_cfg,
+                    corruption,
+                    optimizer=None,
+                    scaler=scaler,
+                    amp_dtype=amp_dtype,
+                    epoch=epoch,
+                    epochs=epochs,
+                    max_steps=None,
+                    base_lr=base_lr,
+                    lr_schedule=lr_schedule,
+                    global_samples_seen=samples_seen,
+                    global_optimizer_steps=step,
+                    log_every_steps=log_every_steps,
+                )
+            record = {
+                "epoch": epoch + 1,
+                "global_step": step,
+                "global_samples_seen": samples_seen,
+                "train_running": train_running,
+                "val": interval_val,
+            }
+            step_evaluations.append(record)
+            if rank == 0:
+                optollama.utils.save_as_json(
+                    str(output_dir / "open-vocab-depth-step-evaluations.json"), step_evaluations
+                )
+                print(
+                    f"Open-vocab depth step {step:,}: val_loss={interval_val['loss']:.6f}, "
+                    f"val_acc={100 * interval_val['accuracy']:.2f}%"
+                )
+
         train = run_epoch(
             model,
             train_loader,
@@ -443,27 +591,38 @@ def main() -> None:
             lr_schedule=lr_schedule,
             global_samples_seen=global_seen,
             ema=ema,
+            global_optimizer_steps=global_steps,
+            log_every_steps=log_every_steps,
+            ema_update_every_steps=ema_update_every_steps,
+            eval_every_steps=eval_every_steps,
+            on_evaluation_step=evaluate_at_step if eval_every_steps else None,
         )
         global_seen = int(train["global_samples_seen"])
+        global_steps = int(train["global_optimizer_steps"])
         validate_ema = bool(ema is not None and ema_cfg.get("VALIDATE", True))
-        validation_context = ema.apply(model) if validate_ema and ema is not None else nullcontext()
-        with validation_context:
-            val = run_epoch(
-                model,
-                val_loader,
-                device,
-                train_cfg,
-                corruption,
-                optimizer=None,
-                scaler=scaler,
-                amp_dtype=amp_dtype,
-                epoch=epoch,
-                epochs=epochs,
-                max_steps=None,
-                base_lr=base_lr,
-                lr_schedule=lr_schedule,
-                global_samples_seen=global_seen,
-            )
+        if step_evaluations and int(step_evaluations[-1]["global_step"]) == global_steps:
+            val = dict(step_evaluations[-1]["val"])
+        else:
+            validation_context = ema.apply(model) if validate_ema and ema is not None else nullcontext()
+            with validation_context:
+                val = run_epoch(
+                    model,
+                    val_loader,
+                    device,
+                    train_cfg,
+                    corruption,
+                    optimizer=None,
+                    scaler=scaler,
+                    amp_dtype=amp_dtype,
+                    epoch=epoch,
+                    epochs=epochs,
+                    max_steps=None,
+                    base_lr=base_lr,
+                    lr_schedule=lr_schedule,
+                    global_samples_seen=global_seen,
+                    global_optimizer_steps=global_steps,
+                    log_every_steps=log_every_steps,
+                )
         history.append({"epoch": epoch + 1, "train": train, "val": val})
         if rank == 0:
             extra = {
@@ -471,12 +630,14 @@ def main() -> None:
                 "material_names": list(catalog.names),
                 "config_path": args.config,
                 "history": history,
+                "step_evaluations": step_evaluations,
+                "global_optimizer_steps": global_steps,
                 "continuous_time": True,
                 "ema": ema.state_dict() if ema is not None else None,
             }
             optollama.utils.save_checkpoint(
                 str(output_dir / "open-vocab-depth-last.pt"),
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 scaler=scaler,
                 epoch=epoch,
@@ -486,7 +647,7 @@ def main() -> None:
                 best = val["loss"]
                 optollama.utils.save_checkpoint(
                     str(output_dir / "open-vocab-depth-best.pt"),
-                    model=model,
+                    model=raw_model,
                     optimizer=optimizer,
                     scaler=scaler,
                     epoch=epoch,
