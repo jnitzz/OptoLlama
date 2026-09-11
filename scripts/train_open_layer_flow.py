@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from collections.abc import Sized
 from contextlib import AbstractContextManager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -92,8 +94,7 @@ def resume_global_samples(history: list[dict[str, Any]], start_epoch: int, train
         if "global_samples_seen" in latest_train:
             return int(latest_train["global_samples_seen"])
         recorded = [
-            int((item.get("train") or {}).get("samples_seen", (item.get("train") or {}).get("samples", 0)))
-            for item in history
+            int((item.get("train") or {}).get("samples_seen", (item.get("train") or {}).get("samples", 0))) for item in history
         ]
         if any(recorded):
             return sum(recorded)
@@ -175,12 +176,8 @@ def model_config_from_mapping(block: dict[str, Any]) -> optollama.model.OpenLaye
         query_encoder_blocks=int(model.get("QUERY_ENCODER_BLOCKS", 2)),
         dropout=float(model.get("DROPOUT", 0.0)),
         adaln_zero=bool(model.get("ADALN_ZERO", False)),
-        adaln_shift_limit=(
-            None if model.get("ADALN_SHIFT_LIMIT") is None else float(model["ADALN_SHIFT_LIMIT"])
-        ),
-        adaln_scale_limit=(
-            None if model.get("ADALN_SCALE_LIMIT") is None else float(model["ADALN_SCALE_LIMIT"])
-        ),
+        adaln_shift_limit=(None if model.get("ADALN_SHIFT_LIMIT") is None else float(model["ADALN_SHIFT_LIMIT"])),
+        adaln_scale_limit=(None if model.get("ADALN_SCALE_LIMIT") is None else float(model["ADALN_SCALE_LIMIT"])),
         adaln_gate_limit=(None if model.get("ADALN_GATE_LIMIT") is None else float(model["ADALN_GATE_LIMIT"])),
         branch_specific_adaln=bool(model.get("BRANCH_SPECIFIC_ADALN", False)),
         time_injection=str(model.get("TIME_INJECTION", "add_and_adaln")),
@@ -418,7 +415,182 @@ def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenLayerFlow:
     return cast(optollama.model.OpenLayerFlow, model)
 
 
-def compute_training_loss(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def diagnostic_parameter_groups(model: torch.nn.Module) -> dict[str, list[torch.nn.Parameter]]:
+    """Partition parameters into non-overlapping groups for replay diagnostics."""
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "target_encoder": [],
+        "material_encoder": [],
+        "time_conditioning": [],
+        "decoder": [],
+        "material_head": [],
+        "thickness_head": [],
+        "input_embeddings": [],
+    }
+    for name, parameter in unwrap_model(model).named_parameters():
+        if name.startswith("target_encoder."):
+            group = "target_encoder"
+        elif name.startswith("material_encoder."):
+            group = "material_encoder"
+        elif name.startswith("time_embedding.") or name.startswith("time_output_norm.") or ".time_modulation." in name:
+            group = "time_conditioning"
+        elif name.startswith("blocks."):
+            group = "decoder"
+        elif name.startswith("pointer_") or name.startswith("output_norm."):
+            group = "material_head"
+        elif (
+            name.startswith("thickness_output_norm.")
+            or name.startswith("thickness_material_projection.")
+            or name.startswith("thickness_velocity.")
+        ):
+            group = "thickness_head"
+        else:
+            group = "input_embeddings"
+        groups[group].append(parameter)
+    return groups
+
+
+@torch.no_grad()
+def parameter_group_stats(groups: dict[str, list[torch.nn.Parameter]]) -> dict[str, float]:
+    """Return parameter RMS and maximum magnitude for each diagnostic group."""
+    stats: dict[str, float] = {}
+    for name, parameters in groups.items():
+        square_sum = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
+        absolute_max = torch.zeros((), dtype=torch.float32, device=parameters[0].device)
+        count = 0
+        for parameter in parameters:
+            values = parameter.detach().float()
+            square_sum += values.double().square().sum()
+            absolute_max = torch.maximum(absolute_max, values.abs().max())
+            count += parameter.numel()
+        stats[f"parameter/{name}/rms"] = float((square_sum / max(count, 1)).sqrt().item())
+        stats[f"parameter/{name}/abs_max"] = float(absolute_max.item())
+    return stats
+
+
+@torch.no_grad()
+def attention_projection_stats(model: torch.nn.Module) -> dict[str, float]:
+    """Summarize unnormalized Q/K projection weights across attention modules."""
+    core = unwrap_model(model)
+    totals = {
+        "q_square": torch.zeros((), dtype=torch.float64, device=next(core.parameters()).device),
+        "k_square": torch.zeros((), dtype=torch.float64, device=next(core.parameters()).device),
+    }
+    counts = {"q": 0, "k": 0}
+    maxima = {
+        "q": torch.zeros((), dtype=torch.float32, device=next(core.parameters()).device),
+        "k": torch.zeros((), dtype=torch.float32, device=next(core.parameters()).device),
+    }
+    for module in core.modules():
+        if not isinstance(module, torch.nn.MultiheadAttention) or module.in_proj_weight is None:
+            continue
+        width = module.embed_dim
+        q_weight = module.in_proj_weight[:width].detach().float()
+        k_weight = module.in_proj_weight[width : 2 * width].detach().float()
+        for name, weight in (("q", q_weight), ("k", k_weight)):
+            totals[f"{name}_square"] += weight.double().square().sum()
+            counts[name] += weight.numel()
+            maxima[name] = torch.maximum(maxima[name], weight.abs().max())
+    return {
+        f"attention/{name}_weight_rms": float((totals[f"{name}_square"] / max(counts[name], 1)).sqrt().item())
+        for name in ("q", "k")
+    } | {f"attention/{name}_weight_abs_max": float(maxima[name].item()) for name in ("q", "k")}
+
+
+def gradient_group_norms(groups: dict[str, list[torch.nn.Parameter]]) -> dict[str, float]:
+    """Measure pre-clipping L2 gradient norms by parameter ownership group."""
+    stats: dict[str, float] = {}
+    for name, parameters in groups.items():
+        square_sum = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
+        for parameter in parameters:
+            if parameter.grad is not None:
+                square_sum += parameter.grad.detach().double().square().sum()
+        stats[f"gradient/{name}/preclip_l2"] = float(square_sum.sqrt().item())
+    return stats
+
+
+@torch.no_grad()
+def adaln_batch_stats(model: torch.nn.Module, timesteps: torch.Tensor) -> dict[str, float]:
+    """Measure raw AdaLN magnitude and effective-bound saturation on the current batch."""
+    core = unwrap_model(model)
+    time = core.time_output_norm(core.time_embedding(timesteps))
+    grouped: dict[str, list[torch.Tensor]] = {"shift": [], "scale": [], "gate": []}
+    for block in core.blocks:
+        for name, values in block.raw_modulation_components(time).items():
+            component = "gate" if name.endswith("gate") else ("shift" if name.endswith("shift") else "scale")
+            grouped[component].append(values.detach().float())
+    limits = {
+        "shift": core.config.adaln_shift_limit,
+        "scale": core.config.adaln_scale_limit,
+        "gate": core.config.adaln_gate_limit,
+    }
+    stats: dict[str, float] = {}
+    for name, values in grouped.items():
+        combined = torch.cat([value.reshape(-1) for value in values])
+        stats[f"adaln/{name}_raw_rms"] = float(combined.square().mean().sqrt().item())
+        stats[f"adaln/{name}_raw_abs_max"] = float(combined.abs().max().item())
+        limit = limits[name]
+        if limit is not None:
+            effective = float(limit) * torch.tanh(combined / float(limit))
+            stats[f"adaln/{name}_saturation_fraction_95"] = float((effective.abs() >= 0.95 * float(limit)).float().mean().item())
+    return stats
+
+
+def masked_values_stats(values: torch.Tensor, mask: torch.Tensor, prefix: str) -> dict[str, float]:
+    """Return finite RMS and max diagnostics for masked model outputs."""
+    selected = values.detach().float().masked_select(mask)
+    finite = selected[torch.isfinite(selected)]
+    if finite.numel() == 0:
+        return {f"{prefix}/rms": math.nan, f"{prefix}/abs_max": math.nan}
+    return {
+        f"{prefix}/rms": float(finite.square().mean().sqrt().item()),
+        f"{prefix}/abs_max": float(finite.abs().max().item()),
+    }
+
+
+def binned_loss_stats(
+    values: torch.Tensor,
+    material_loss: torch.Tensor,
+    thickness_loss: torch.Tensor,
+    edges: tuple[float, ...],
+    prefix: str,
+) -> dict[str, Any]:
+    """Aggregate per-sample objective components over fixed diagnostic bins."""
+    result: dict[str, Any] = {}
+    values = values.detach().float()
+    for index, (low, high) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
+        selected = (values >= low) & (values <= high if index == len(edges) - 2 else values < high)
+        key = f"{low:g}-{high:g}"
+        count = int(selected.sum().item())
+        result[key] = {
+            "count": count,
+            "material_loss": float(material_loss[selected].mean().item()) if count else None,
+            "thickness_loss": float(thickness_loss[selected].mean().item()) if count else None,
+        }
+    return {prefix: result}
+
+
+def append_diagnostic_record(path: Path, record: dict[str, Any]) -> None:
+    """Append one self-contained diagnostic record to a rank-local JSONL file."""
+    def json_safe(value: Any) -> Any:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, dict):
+            return {key: json_safe(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [json_safe(item) for item in value]
+        return value
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(json_safe(record), sort_keys=True, allow_nan=False) + "\n")
+
+
+def compute_training_loss(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    *,
+    diagnostics: bool = False,
+) -> dict[str, Any]:
     """Compute the joint objective through the DDP wrapper when present."""
     core = unwrap_model(model)
     state = core.prepare_training_state(batch)
@@ -432,8 +604,58 @@ def compute_training_loss(model: torch.nn.Module, batch: dict[str, torch.Tensor]
         thickness_state=state["thickness_state"],
         layer_mask=state["layer_mask"],
         timesteps=state["timesteps"],
+        return_diagnostics=diagnostics,
     )
-    return core.loss_from_training_state(outputs, state)
+    losses: dict[str, Any] = core.loss_from_training_state(outputs, state)
+    if diagnostics:
+        active = state["supervised_layers"].to(dtype=torch.bool)
+        valid_logits = active.unsqueeze(-1) & batch["candidate_mask"].unsqueeze(1).to(dtype=torch.bool)
+        diagnostic: dict[str, Any] = {
+            "timestep_min": float(state["timesteps"].min().item()),
+            "timestep_mean": float(state["timesteps"].mean().item()),
+            "timestep_max": float(state["timesteps"].max().item()),
+            "layer_count_min": int(active.sum(dim=1).min().item()),
+            "layer_count_mean": float(active.sum(dim=1).float().mean().item()),
+            "layer_count_max": int(active.sum(dim=1).max().item()),
+            "query_count_min": int(batch["query_mask"].sum(dim=1).min().item()),
+            "query_count_mean": float(batch["query_mask"].sum(dim=1).float().mean().item()),
+            "query_count_max": int(batch["query_mask"].sum(dim=1).max().item()),
+            "candidate_count_mean": float(batch["candidate_mask"].sum(dim=1).float().mean().item()),
+        }
+        diagnostic.update(masked_values_stats(outputs["material_logits"], valid_logits, "output/material_logits"))
+        diagnostic.update(masked_values_stats(outputs["thickness_velocity"], active, "output/thickness_velocity"))
+        diagnostic.update(masked_values_stats(state["target_velocity"], active, "target/thickness_velocity"))
+        for key, value in outputs.items():
+            if key.startswith("diagnostic_"):
+                if value.ndim == 0:
+                    diagnostic[f"forward/{key.removeprefix('diagnostic_')}"] = float(value.item())
+                else:
+                    diagnostic[f"forward/{key.removeprefix('diagnostic_')}"] = [
+                        float(item) for item in value.detach().float().cpu().tolist()
+                    ]
+        material_per_sample = losses["diagnostic_material_loss_per_sample"]
+        thickness_per_sample = losses["diagnostic_thickness_loss_per_sample"]
+        diagnostic.update(
+            binned_loss_stats(
+                state["timesteps"],
+                material_per_sample,
+                thickness_per_sample,
+                (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+                "loss_by_timestep",
+            )
+        )
+        diagnostic.update(
+            binned_loss_stats(
+                active.sum(dim=1),
+                material_per_sample,
+                thickness_per_sample,
+                (0.0, 20.0, 40.0, 60.0, 80.0, 100.0),
+                "loss_by_layer_count",
+            )
+        )
+        diagnostic["timesteps"] = state["timesteps"].detach()
+        losses["diagnostics"] = diagnostic
+    return losses
 
 
 def run_loss_epoch(
@@ -452,6 +674,8 @@ def run_loss_epoch(
     base_learning_rate: float | None = None,
     lr_schedule: dict[str, Any] | None = None,
     global_samples_seen: int = 0,
+    diagnostic_config: dict[str, Any] | None = None,
+    diagnostic_path: Path | None = None,
 ) -> dict[str, float]:
     """Train or validate the denoising objectives for one epoch."""
     train = optimizer is not None
@@ -473,7 +697,11 @@ def run_loss_epoch(
     epoch_samples_seen = 0
     current_learning_rate = float(optimizer.param_groups[0]["lr"]) if optimizer is not None else 0.0
     world_size = torch.distributed.get_world_size() if optollama.utils.is_ddp() else 1
+    rank = torch.distributed.get_rank() if optollama.utils.is_ddp() else 0
     show_progress = not (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0)
+    diagnostics_enabled = bool(train and diagnostic_config and diagnostic_config.get("ENABLED", True))
+    diagnostic_every = max(1, int((diagnostic_config or {}).get("EVERY_N_STEPS", 100)))
+    parameter_groups = diagnostic_parameter_groups(model) if diagnostics_enabled else {}
     progress = tqdm.tqdm(
         loader,
         desc=f"Epoch {epoch + 1}/{epochs} open-layer {'train' if train else 'val'}",
@@ -494,9 +722,15 @@ def run_loss_epoch(
                 set_optimizer_lr(optimizer, current_learning_rate)
             optimizer.zero_grad(set_to_none=True)
             epoch_samples_seen += batch_row_count(batch) * world_size
+        capture_diagnostics = diagnostics_enabled and (
+            step % diagnostic_every == 0 or (max_steps is not None and step + 1 == max_steps)
+        )
         context = nullcontext() if train else torch.no_grad()
         with context, autocast_context(device, amp_dtype):
-            outputs = compute_training_loss(model, batch)
+            if capture_diagnostics:
+                outputs = compute_training_loss(model, batch, diagnostics=True)
+            else:
+                outputs = compute_training_loss(model, batch)
             loss = outputs["loss"]
         if not synchronized_finite(loss):
             if not train:
@@ -521,6 +755,7 @@ def run_loss_epoch(
             assert optimizer is not None
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            group_gradients = gradient_group_norms(parameter_groups) if capture_diagnostics else {}
             clip_limit = float(grad_clip) if grad_clip > 0.0 else float("inf")
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit, error_if_nonfinite=False)
             if not synchronized_finite(norm):
@@ -552,6 +787,52 @@ def run_loss_epoch(
             else:
                 stability[3] += 1
                 consecutive_nonfinite = 0
+            if capture_diagnostics and diagnostic_path is not None:
+                clip_scale = min(1.0, clip_limit / (float(norm) + 1.0e-6))
+                diagnostic = dict(outputs.get("diagnostics") or {})
+                diagnostic_timesteps = diagnostic.pop("timesteps")
+                batch_metrics = {
+                    key: float(outputs[key].detach().item())
+                    for key in (
+                        "loss",
+                        "material_loss",
+                        "thickness_loss",
+                        "material_accuracy",
+                        "full_material_accuracy",
+                        "mean_timestep",
+                        "corrupted_fraction",
+                        "masked_fraction",
+                        "replaced_fraction",
+                    )
+                }
+                record: dict[str, Any] = {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "epoch": epoch + 1,
+                    "step": step,
+                    "rank": rank,
+                    "global_samples_seen": global_samples_seen + epoch_samples_seen,
+                    "learning_rate": current_learning_rate,
+                    "global_gradient_preclip_l2": float(norm),
+                    "global_clip_scale": clip_scale,
+                    "batch": batch_metrics,
+                    "model": diagnostic,
+                }
+                record.update(group_gradients)
+                record.update(
+                    {key.replace("preclip_l2", "postclip_l2"): value * clip_scale for key, value in group_gradients.items()}
+                )
+                record.update(parameter_group_stats(parameter_groups))
+                record.update(attention_projection_stats(model))
+                record.update(adaln_batch_stats(model, diagnostic_timesteps))
+                append_diagnostic_record(diagnostic_path, record)
+                if show_progress:
+                    dominant_group = max(group_gradients, key=group_gradients.get, default="gradient/none/preclip_l2")
+                    print(
+                        f"Open-layer diagnostic epoch={epoch + 1} step={step} "
+                        f"loss={batch_metrics['loss']:.6g} material={batch_metrics['material_loss']:.6g} "
+                        f"thickness={batch_metrics['thickness_loss']:.6g} grad={float(norm):.6g} "
+                        f"dominant={dominant_group.removeprefix('gradient/').removesuffix('/preclip_l2')}"
+                    )
         else:
             norm = torch.zeros((), device=device)
 
@@ -564,6 +845,8 @@ def run_loss_epoch(
         running = averaged_metrics(totals, metric_keys)
         progress.set_postfix(
             loss=f"{running['loss']:.4f}",
+            mloss=f"{running['material_loss']:.4f}",
+            tloss=f"{running['thickness_loss']:.4f}",
             mat=f"{100.0 * running['material_accuracy']:.1f}%",
             full=f"{100.0 * running['full_material_accuracy']:.1f}%",
             grad=f"{float(norm):.2f}",
@@ -695,9 +978,7 @@ def validate_tmm(
         processed += keep
 
     local_channel_mae = (
-        torch.cat(channel_mae_chunks, dim=0)
-        if channel_mae_chunks
-        else torch.empty((0, mc_samples, 3), dtype=torch.float32)
+        torch.cat(channel_mae_chunks, dim=0) if channel_mae_chunks else torch.empty((0, mc_samples, 3), dtype=torch.float32)
     )
     local_records = concatenate_validation_records(record_chunks)
     if optollama.utils.is_ddp():
@@ -826,9 +1107,7 @@ def main() -> None:
             device_ids=[local_rank] if device.type == "cuda" else None,
             output_device=local_rank if device.type == "cuda" else None,
         )
-    learning_rate = float(
-        args.learning_rate if args.learning_rate is not None else train_cfg.get("LEARNING_RATE", 1.0e-4)
-    )
+    learning_rate = float(args.learning_rate if args.learning_rate is not None else train_cfg.get("LEARNING_RATE", 1.0e-4))
     lr_schedule = train_cfg.get("LR_SCHEDULE")
     if lr_schedule is not None and not isinstance(lr_schedule, dict):
         raise ValueError("OPEN_LAYER.TRAIN.LR_SCHEDULE must be a mapping.")
@@ -842,6 +1121,20 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     grad_clip = float(train_cfg.get("GRAD_CLIP", 1.0))
     max_consecutive_nonfinite_steps = int(train_cfg.get("MAX_CONSECUTIVE_NONFINITE_STEPS", 8))
+    diagnostic_config = train_cfg.get("DIAGNOSTICS") or {}
+    if not isinstance(diagnostic_config, dict):
+        raise ValueError("OPEN_LAYER.TRAIN.DIAGNOSTICS must be a mapping.")
+    diagnostics_enabled = bool(diagnostic_config.get("ENABLED", False))
+    diagnostic_path = (
+        output_dir
+        / str(diagnostic_config.get("DIR", "diagnostics"))
+        / f"{diagnostic_config.get('FILE_PREFIX', 'training')}-rank{rank:03d}.jsonl"
+        if diagnostics_enabled
+        else None
+    )
+    configured_max_steps = train_cfg.get("MAX_TRAIN_STEPS")
+    max_train_steps = args.max_train_steps if args.max_train_steps is not None else configured_max_steps
+    max_train_steps = None if max_train_steps is None else int(max_train_steps)
     epochs = int(args.epochs or train_cfg.get("EPOCHS", 10))
     start_epoch = 0
     history: list[dict[str, Any]] = []
@@ -899,6 +1192,12 @@ def main() -> None:
             f"loss_weights={model_config.material_corrupted_loss_weight:g}/"
             f"{model_config.material_uncorrupted_loss_weight:g}"
         )
+        if diagnostics_enabled:
+            print(
+                f"Open-layer diagnostics: every={int(diagnostic_config.get('EVERY_N_STEPS', 100))} steps, "
+                f"max_train_steps={max_train_steps}, files={diagnostic_path.parent}/"
+                f"{diagnostic_config.get('FILE_PREFIX', 'training')}-rank*.jsonl"
+            )
     if optollama.utils.is_ddp():
         torch.distributed.barrier()
 
@@ -930,11 +1229,13 @@ def main() -> None:
             grad_clip=grad_clip,
             epoch=epoch,
             epochs=epochs,
-            max_steps=args.max_train_steps,
+            max_steps=max_train_steps,
             max_consecutive_nonfinite_steps=max_consecutive_nonfinite_steps,
             base_learning_rate=learning_rate,
             lr_schedule=lr_schedule,
             global_samples_seen=global_samples_seen,
+            diagnostic_config=diagnostic_config,
+            diagnostic_path=diagnostic_path,
         )
         global_samples_seen = int(train_metrics["global_samples_seen"])
         val_metrics = run_loss_epoch(
@@ -964,17 +1265,13 @@ def main() -> None:
                 mc_samples=int(eval_cfg.get("MC_SAMPLES", 4)),
                 sampling_steps=int(eval_cfg.get("SAMPLING_STEPS", 32)),
                 save_spectra_path=(
-                    output_dir
-                    / str(eval_cfg.get("SPECTRA_DIR", "validation_spectra"))
-                    / f"epoch_{epoch + 1:04d}.npz"
+                    output_dir / str(eval_cfg.get("SPECTRA_DIR", "validation_spectra")) / f"epoch_{epoch + 1:04d}.npz"
                     if bool(eval_cfg.get("RECORD_SPECTRA", True))
                     else None
                 ),
             )
         adaln_stats = unwrap_model(model).adaln_modulation_stats()
-        history.append(
-            {"epoch": epoch, "train": train_metrics, "val": val_metrics, "tmm": tmm_metrics, "adaln": adaln_stats}
-        )
+        history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics, "tmm": tmm_metrics, "adaln": adaln_stats})
         extra = {
             "open_layer_config": model_config.to_dict(),
             "channels": list(nested(block, "QUERY", "CHANNELS", default=["R", "T"])),

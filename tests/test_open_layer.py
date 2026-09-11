@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -384,6 +385,54 @@ def test_training_loss_and_sampling_are_finite() -> None:
     assert torch.all(sampled["material_ids"][sampled["layer_mask"]] >= 0)
     assert torch.all(sampled["thickness_nm"][sampled["layer_mask"]] >= 5.0)
     assert torch.all(sampled["thickness_nm"].sum(dim=1) <= 10_000.001)
+
+
+def test_replay_diagnostics_record_component_and_group_metrics(tmp_path: Path) -> None:
+    torch.manual_seed(9)
+    model = tiny_model(
+        adaln_zero=True,
+        branch_specific_adaln=True,
+        normalize_time_embedding=True,
+        time_injection="adaln_only",
+        adaln_shift_limit=2.0,
+        adaln_scale_limit=1.0,
+        adaln_gate_limit=1.0,
+        material_conditioned_thickness=True,
+    )
+    condition = synthetic_condition(batch=2)
+    batch = {
+        **condition,
+        "material_targets": torch.tensor([[0, 1, -100], [2, 1, 0]]),
+        "thickness_targets": torch.tensor([[-0.5, 0.2, -1.0], [-0.2, 0.1, 0.5]]),
+        "layer_mask": torch.tensor([[True, True, False], [True, True, True]]),
+        "sample_mask": torch.ones(2, dtype=torch.bool),
+    }
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    path = tmp_path / "replay-rank000.jsonl"
+    run_loss_epoch(
+        model=model,
+        loader=[batch],  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        scaler=scaler,
+        amp_dtype=None,
+        grad_clip=1.0,
+        epoch=7,
+        epochs=8,
+        max_steps=1,
+        base_learning_rate=1.0e-4,
+        diagnostic_config={"ENABLED": True, "EVERY_N_STEPS": 1},
+        diagnostic_path=path,
+    )
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["epoch"] == 8
+    assert record["batch"]["material_loss"] >= 0.0
+    assert record["batch"]["thickness_loss"] >= 0.0
+    assert "gradient/decoder/preclip_l2" in record
+    assert "parameter/material_encoder/rms" in record
+    assert len(record["model"]["forward/block_rms"]) == model.config.n_blocks
+    assert "loss_by_timestep" in record["model"]
 
 
 def test_hybrid_layer_corruption_respects_budget_and_builds_spans() -> None:

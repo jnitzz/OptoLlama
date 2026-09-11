@@ -72,9 +72,7 @@ def _normalize_time_injection(value: str | None) -> str:
         "adaln": "adaln_only",
     }
     if normalized not in aliases:
-        raise ValueError(
-            f"Unknown time_injection={value!r}; expected 'add_and_adaln' or 'adaln_only'."
-        )
+        raise ValueError(f"Unknown time_injection={value!r}; expected 'add_and_adaln' or 'adaln_only'.")
     return aliases[normalized]
 
 
@@ -585,9 +583,7 @@ class OpenLayerFlow(nn.Module):
             nn.Linear(config.d_model, config.d_model),
         )
         self.time_output_norm = (
-            nn.LayerNorm(config.d_model, elementwise_affine=False)
-            if config.normalize_time_embedding
-            else nn.Identity()
+            nn.LayerNorm(config.d_model, elementwise_affine=False) if config.normalize_time_embedding else nn.Identity()
         )
         self.blocks = nn.ModuleList([OpenLayerDecoderBlock(config) for _ in range(config.n_blocks)])
         self.output_norm = nn.LayerNorm(config.d_model)
@@ -717,6 +713,7 @@ class OpenLayerFlow(nn.Module):
         timesteps: torch.Tensor,
         encoded_condition: tuple[torch.Tensor, torch.Tensor] | None = None,
         material_temperature: float = 1.0,
+        return_diagnostics: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Predict query-local material logits and normalized-thickness velocity."""
         if material_ids.shape != thickness_state.shape or material_ids.shape != layer_mask.shape:
@@ -744,6 +741,7 @@ class OpenLayerFlow(nn.Module):
         if self.config.time_injection == "add_and_adaln":
             x = x + time.unsqueeze(1)
         layer_padding = ~layer_mask.to(dtype=torch.bool)
+        block_rms: list[torch.Tensor] = []
         for block in self.blocks:
             x = block(
                 x,
@@ -754,6 +752,9 @@ class OpenLayerFlow(nn.Module):
                 material_memory=material_memory,
                 candidate_padding_mask=~candidate_mask.to(dtype=torch.bool),
             )
+            if return_diagnostics:
+                active = x.masked_select(layer_mask.unsqueeze(-1)).float()
+                block_rms.append(active.square().mean().sqrt().detach())
         material_features = self.output_norm(x)
         pointer_query = self.pointer_query(material_features)
         pointer_key = self.pointer_key(material_memory)
@@ -773,7 +774,16 @@ class OpenLayerFlow(nn.Module):
         else:
             thickness_features = material_features
         velocity = self.thickness_velocity(thickness_features).squeeze(-1).masked_fill(layer_padding, 0.0)
-        return {"material_logits": logits, "thickness_velocity": velocity}
+        result = {"material_logits": logits, "thickness_velocity": velocity}
+        if return_diagnostics:
+            target_values = target_memory.masked_select(query_mask.unsqueeze(-1)).float()
+            material_values = material_memory.masked_select(candidate_mask.unsqueeze(-1)).float()
+            result["diagnostic_block_rms"] = torch.stack(block_rms)
+            result["diagnostic_target_memory_rms"] = target_values.square().mean().sqrt().detach()
+            result["diagnostic_target_memory_abs_max"] = target_values.abs().max().detach()
+            result["diagnostic_material_memory_rms"] = material_values.square().mean().sqrt().detach()
+            result["diagnostic_material_memory_abs_max"] = material_values.abs().max().detach()
+        return result
 
     def _random_replace_probability(self, timesteps: torch.Tensor) -> torch.Tensor:
         """Return replacement probability among selected material corruptions."""
@@ -936,6 +946,18 @@ class OpenLayerFlow(nn.Module):
         total = material_loss + self.config.thickness_loss_weight * thickness_loss
         supervised_count = supervised_layers.sum().clamp_min(1)
         masked = corrupted & ~replaced
+        material_weight_per_sample = material_weights.sum(dim=1)
+        material_loss_per_sample = (loss_per_layer * material_weights).sum(dim=1) / material_weight_per_sample.clamp_min(1.0)
+        thickness_loss_per_layer = functional.smooth_l1_loss(
+            outputs["thickness_velocity"],
+            state["target_velocity"],
+            beta=self.config.thickness_huber_delta,
+            reduction="none",
+        )
+        active_per_sample = supervised_layers.sum(dim=1)
+        thickness_loss_per_sample = (thickness_loss_per_layer * supervised_layers.to(dtype=thickness_loss_per_layer.dtype)).sum(
+            dim=1
+        ) / active_per_sample.clamp_min(1)
         return {
             "loss": total,
             "material_loss": material_loss.detach(),
@@ -950,6 +972,8 @@ class OpenLayerFlow(nn.Module):
             "noised_materials": state["noised_materials"],
             "corrupted": corrupted,
             "replaced": replaced,
+            "diagnostic_material_loss_per_sample": material_loss_per_sample.detach(),
+            "diagnostic_thickness_loss_per_sample": thickness_loss_per_sample.detach(),
         }
 
     def training_loss(
