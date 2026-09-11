@@ -59,7 +59,8 @@ def load_open_layer_target(
             first_line = handle.readline()
         has_header = any(character.isalpha() for character in first_line)
         if has_header:
-            table: Any = np.genfromtxt(target_path, delimiter=",", names=True, dtype=np.float64)
+            with target_path.open("r", encoding="utf-8-sig") as handle:
+                table: Any = np.genfromtxt(handle, delimiter=",", names=True, dtype=np.float64)
             names = tuple(table.dtype.names or ())
             lowered = {name.lower(): name for name in names}
             wavelength_key = next(
@@ -77,7 +78,8 @@ def load_open_layer_target(
             else:
                 spectra = _normalize_target_spectrum(np.stack((reflectance, transmittance), axis=0))
         else:
-            spectra = _normalize_target_spectrum(np.loadtxt(target_path, delimiter=",", dtype=np.float32))
+            with target_path.open("r", encoding="utf-8-sig") as handle:
+                spectra = _normalize_target_spectrum(np.loadtxt(handle, delimiter=",", dtype=np.float32))
 
     if wavelengths is None:
         if fallback_wavelengths_nm is None:
@@ -521,6 +523,59 @@ class OpenLayerBatchCollator:
             "sample_indices": sample_indices,
             "sample_mask": sample_mask,
         }
+
+
+class OpenVocabularyDepthFieldCollator(OpenLayerBatchCollator):
+    """Rasterize query-local material banks onto a fixed physical-depth grid."""
+
+    def __init__(
+        self,
+        *args: Any,
+        dz_nm: float = 5.0,
+        max_total_nm: float = 10_000.0,
+        incidence_angle_deg: float = 0.0,
+        polarization: str = "s",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.dz_nm = float(dz_nm)
+        self.max_total_nm = float(max_total_nm)
+        if self.dz_nm <= 0.0 or self.max_total_nm <= 0.0:
+            raise ValueError("dz_nm and max_total_nm must be positive.")
+        self.depth_bins = int(round(self.max_total_nm / self.dz_nm))
+        if self.depth_bins <= 0:
+            raise ValueError("The configured depth range contains no bins.")
+        self.incidence_angle_deg = float(incidence_angle_deg)
+        normalized_polarization = str(polarization).lower()
+        if normalized_polarization not in {"s", "p"}:
+            raise ValueError("polarization must be 's' or 'p'.")
+        self.polarization_id = 0 if normalized_polarization == "s" else 1
+
+    def __call__(self, samples: Sequence[tuple[torch.Tensor, torch.Tensor, int]]) -> dict[str, torch.Tensor]:
+        """Return candidate-local clean fields plus wavelength/material conditions."""
+        batch = super().__call__(samples)
+        batch_size = int(batch["material_targets"].shape[0])
+        void_id = self.max_candidates
+        fields = torch.full((batch_size, self.depth_bins), void_id, dtype=torch.long)
+
+        for row in range(batch_size):
+            cursor = 0
+            targets = batch["material_targets"][row]
+            thicknesses = batch["thickness_nm"][row]
+            for material_id, thickness_nm in zip(targets.tolist(), thicknesses.tolist(), strict=True):
+                if int(material_id) < 0 or float(thickness_nm) <= 0.0:
+                    continue
+                layer_bins = max(1, int(round(float(thickness_nm) / self.dz_nm)))
+                stop = min(cursor + layer_bins, self.depth_bins)
+                fields[row, cursor:stop] = int(material_id)
+                cursor = stop
+                if cursor >= self.depth_bins:
+                    break
+
+        batch["clean_fields"] = fields
+        batch["incidence_angle_deg"] = torch.full((batch_size,), self.incidence_angle_deg, dtype=torch.float32)
+        batch["polarization_id"] = torch.full((batch_size,), self.polarization_id, dtype=torch.long)
+        return batch
 
 
 def make_open_layer_condition(

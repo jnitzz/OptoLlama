@@ -113,6 +113,16 @@ def test_coordinate_target_loader_accepts_long_form_csv(tmp_path: Path) -> None:
     assert torch.allclose(spectra[2], torch.tensor([0.7, 0.1]))
 
 
+def test_legacy_target_loader_accepts_utf8_bom(tmp_path: Path) -> None:
+    """Strip a UTF-8 BOM from headerless legacy target rows."""
+    path = tmp_path / "target.csv"
+    path.write_text("\ufeff0.2,0.8\n0.7,0.1\n", encoding="utf-8")
+    spectra, wavelengths = load_open_layer_target(path, torch.tensor([300.0, 700.0]))
+    assert wavelengths.tolist() == [300.0, 700.0]
+    assert torch.allclose(spectra[0], torch.tensor([0.2, 0.8]))
+    assert torch.allclose(spectra[2], torch.tensor([0.7, 0.1]))
+
+
 def test_collator_builds_local_material_targets_and_merges_neighbors() -> None:
     catalog = synthetic_catalog()
     tokens = ["<PAD>", "<MSK>", "<EOS>", "A_10", "A_20", "B_30"]

@@ -1,0 +1,150 @@
+EXPERIMENT:
+  MODEL: open_vocab_depth_field
+  RUN: DF_OPEN_VOCAB_01
+  SEED: 3
+
+PATHS:
+  DATA_PATH: E:/repos/OptoLlama/data # /scratch/htc/jschaibl/repos/OptoLlama/data
+  MATERIALS_PATH: ${PATHS.DATA_PATH}/materials/
+  TOKENS_PATH: ${PATHS.DATA_PATH}/realistic_02_test/tokens.json
+  OUTPUT_PATH: ${PATHS.DATA_PATH}/output_${EXPERIMENT.RUN}
+  TRAIN:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/00
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/01
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/02
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_train/03
+  TEST:
+    - ${PATHS.DATA_PATH}/realistic_10um_20M_test
+
+DATA_LOADING:
+  NUM_WORKERS: 0
+  SHARDED_LOADING: true
+  NUM_SAMPLES_TRAIN: 20000000
+  NUM_SAMPLES_TEST: 512
+  TRAIN_BATCH_SIZE: 64
+  TEST_BATCH_SIZE: 16
+
+SPECTRAL_GRID:
+  WAVELENGTH_MIN: 300
+  WAVELENGTH_MAX: 1700
+  WAVELENGTH_STEPS: 5
+
+CHECKPOINT:
+  RESUME: null
+
+OPEN_VOCAB_DEPTH_FIELD:
+  OUT_DIR: ${PATHS.OUTPUT_PATH}
+  MAX_LAYERS: 100
+
+  GRID:
+    DZ_NM: 5
+    MAX_THICKNESS_NM: 10000
+
+  MATERIAL_BANK:
+    MAX_CANDIDATES: 24
+    RANDOMIZE_ORDER: true
+    RANDOM_DISTRACTORS: true
+    HOLDOUT_MATERIALS: [] # e.g. [TiO2] for an unseen-material fine-tuning test
+    MATERIAL_COVERAGE_TOLERANCE_NM: 100
+
+  # Existing data were generated at normal incidence with s polarization.
+  # These values are embedded now; future mixed-angle/polarization data can vary per sample.
+  OPTICAL_CONDITION:
+    ANGLE_DEG: 0.0
+    POLARIZATION: s # s | p
+
+  MODEL:
+    D_MODEL: 896
+    N_BLOCKS: 8
+    N_HEADS: 8
+    FFN_MULTIPLIER: 4.0
+    SPECTRUM_PATCH_SIZE: 4
+    SPECTRUM_PATCH_STRIDE: 2
+    SPECTRUM_ENCODER_BLOCKS: 4
+    SPECTRUM_ENCODER_HEADS: 8
+    SPECTRUM_FFN_MULTIPLIER: 2.0
+    WAVELENGTH_SCALE_NM: 1000
+    WAVELENGTH_FOURIER_BANDS: 4
+    KERNEL_SIZE: 7
+    CONV_TYPE: separable # full | separable
+    HYBRID_DILATIONS: [1, 2, 4, 8, 16, 32, 64, 64]
+    HYBRID_RESIDUAL_INIT: 0.001
+    DROPOUT: 0.0
+
+  DENOISING:
+    # Training time is continuous: t ~ Uniform(0,1), p(corrupt|t) = t^2.
+    # There is deliberately no TRAIN_TIMESTEPS parameter.
+    CORRUPTION:
+      MODE: hybrid # iid | hybrid
+      IID_FRACTION: 0.20
+      SPAN_FRACTION: 0.50
+      LAYER_FRACTION: 0.30
+      SPAN_MIN_BINS: 4
+      SPAN_MAX_BINS: 128
+      SPAN_SCALE_WITH_NOISE: true
+      RANDOM_REPLACE_SCHEDULE: noise_complement # constant | noise_complement
+      RANDOM_REPLACE_POWER: 1.0
+
+  TRAIN:
+    EPOCHS: 20
+    LEARNING_RATE: 0.00005
+    WEIGHT_DECAY: 0.01
+    GRAD_CLIP: 1.0
+    AMP: true
+    AMP_DTYPE: auto # auto | float16 | bfloat16
+    VOID_LOSS_WEIGHT: 0.10
+    RANDOM_REPLACE_PROB: 0.10
+    LOSS_ON_CORRUPTED_ONLY: false
+    CORRUPTED_LOSS_WEIGHT: 1.0
+    UNCORRUPTED_LOSS_WEIGHT: 0.1
+    CONDITION_DROPOUT_PROB: 0.10
+    BOUNDARY_LOSS:
+      ENABLED: true
+      RADIUS_BINS: 2
+      WEIGHT: 2.0
+    LR_SCHEDULE:
+      ENABLED: true
+      TYPE: cosine
+      WARMUP_SAMPLES: 2000000
+      TOTAL_SAMPLES: 400000000
+      START_LR: 0.000001
+      MAX_LR: 0.00005
+      MIN_LR: 0.000001
+    EMA:
+      ENABLED: true
+      DECAY: 0.9998
+      VALIDATE: true
+
+  EVAL:
+    # This is only the numerical integration budget; it is not part of training.
+    SAMPLING_STEPS: 64
+    STEP_SWEEP: [32, 64, 100, 200]
+    MC_SAMPLES: 10
+    TEMPERATURE: 1.0
+    REMASK_STRATEGY: random # random | confidence
+
+EVALUATION:
+  INCIDENCE_ANGLE: 0
+
+TARGET_SELECTION:
+  TARGET: ${PATHS.DATA_PATH}/targets/target_R_BR_realistic.csv
+  TARGETS: []
+  TARGET_GLOB: null
+  N_TARGETS: 1
+
+TARGET_PREPROCESS:
+  MISMATCH_FILL_ORDER: R>T>A
+  NOISE:
+    ENABLED: false
+  SMOOTH:
+    ENABLED: false
+  FILL_OUTSIDE_ROI:
+    ENABLED: false
+
+REALISTIC_TMM:
+  ENABLED: true
+  ANGLES: [0.0]
+  ANGLE_WEIGHTS: [1.0]
+  POLARIZATIONS: [s]
+  JITTER_REALIZATIONS: 1
+  THICKNESS_JITTER_NM: 0.0
