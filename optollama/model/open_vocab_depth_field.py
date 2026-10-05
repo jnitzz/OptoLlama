@@ -49,6 +49,8 @@ class OpenVocabularyDepthFieldConfig:
     spectrum_ffn_multiplier: float = 2.0
     wavelength_scale_nm: float = 1_000.0
     wavelength_fourier_bands: int = 4
+    query_spectrum: bool = False
+    candidate_cross_attention: bool = False
 
     def __post_init__(self) -> None:
         """Normalize dilation defaults and validate structural dimensions."""
@@ -143,6 +145,21 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         )
         self.pointer_query = nn.Linear(config.d_model, config.d_model, bias=False)
         self.pointer_key = nn.Linear(config.d_model, config.d_model, bias=False)
+        if config.query_spectrum:
+            self.query_coordinates = WavelengthFeatures(config.wavelength_scale_nm, config.wavelength_fourier_bands)
+            self.query_projection = nn.Conv1d(
+                self.query_coordinates.output_dim,
+                config.d_model,
+                kernel_size=config.spectrum_patch_size,
+                stride=config.spectrum_patch_stride,
+            )
+        if config.candidate_cross_attention:
+            self.candidate_attn_norms = nn.ModuleList(nn.LayerNorm(config.d_model) for _ in range(config.n_blocks))
+            self.candidate_attn = nn.ModuleList(
+                nn.MultiheadAttention(config.d_model, config.n_heads, dropout=config.dropout, batch_first=True)
+                for _ in range(config.n_blocks)
+            )
+            self.candidate_attn_gates = nn.Parameter(torch.full((config.n_blocks,), 1.0e-2))
         del self.input_embedding
         del self.output
         nn.init.normal_(self.special_embeddings, mean=0.0, std=0.02)
@@ -180,6 +197,52 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         safe = fields.long().clamp(0, self.mask_id)
         return states.gather(1, safe.unsqueeze(-1).expand(batch, depth, self.d_model))
 
+    def _query_spectrum_tokens(self, spectra: torch.Tensor, wavelengths_nm: torch.Tensor) -> torch.Tensor:
+        if not self.open_vocab_config.query_spectrum:
+            return self._spectrum_tokens(spectra)
+        tokens = self.spectrum_embedding(spectra.float())
+        coordinates = self.query_coordinates(wavelengths_nm).transpose(1, 2)
+        if self.spectrum_embedding.right_padding:
+            coordinates = functional.pad(coordinates, (0, self.spectrum_embedding.right_padding), mode="replicate")
+        tokens = tokens + self.query_projection(coordinates).transpose(1, 2)
+        for block in self.spectrum_blocks:
+            tokens = block(tokens)
+        tokens = self.spectrum_output_norm(tokens)
+        global_token = self.global_spectrum_condition(tokens.mean(dim=1)).unsqueeze(1)
+        return torch.cat((tokens, global_token), dim=1)
+
+    def _run_candidate_conditioned_blocks(
+        self,
+        depth_tokens: torch.Tensor,
+        spectrum_tokens: torch.Tensor,
+        condition: torch.Tensor,
+        material_memory: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.open_vocab_config.candidate_cross_attention:
+            return self._run_depth_blocks(depth_tokens, spectrum_tokens, condition)
+        time_condition = self.conv_time_condition(condition).to(dtype=depth_tokens.dtype)
+        spectrum_condition = self.conv_spectrum_condition(spectrum_tokens[:, -1]).to(dtype=depth_tokens.dtype)
+        for block, conv, norm, attention, gate in zip(
+            self.blocks,
+            self.conv_blocks,
+            self.candidate_attn_norms,
+            self.candidate_attn,
+            self.candidate_attn_gates,
+            strict=True,
+        ):
+            depth_tokens = block(depth_tokens, spectrum_tokens, condition)
+            candidate_update, _ = attention(
+                query=norm(depth_tokens),
+                key=material_memory,
+                value=material_memory,
+                key_padding_mask=~candidate_mask,
+                need_weights=False,
+            )
+            depth_tokens = depth_tokens + torch.tanh(gate) * candidate_update
+            depth_tokens = conv(depth_tokens, time_condition, spectrum_condition)
+        return depth_tokens
+
     def forward(
         self,
         spectra: torch.Tensor,
@@ -200,13 +263,15 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
             raise ValueError(f"Expected fields [B,{self.depth_bins}], got {tuple(noised_fields.shape)}")
         if candidate_mask.shape != (spectra.size(0), self.max_candidates):
             raise ValueError(f"Expected candidate_mask [B,{self.max_candidates}], got {tuple(candidate_mask.shape)}")
+        if wavelengths_nm.shape != (spectra.size(0), spectra.size(-1)):
+            raise ValueError("Wavelength coordinates must match the batch and spectrum width.")
         if not torch.all(candidate_mask.any(dim=1)):
             raise ValueError("Each sample requires at least one candidate material.")
 
         material_memory = (
             self.encode_materials(wavelengths_nm, candidate_nk, candidate_mask) if encoded_materials is None else encoded_materials
         )
-        spectrum_tokens = self._spectrum_tokens(spectra)
+        spectrum_tokens = self._query_spectrum_tokens(spectra, wavelengths_nm)
         optical = self.optical_condition(self._optical_features(incidence_angle_deg, polarization_id)).to(
             dtype=spectrum_tokens.dtype
         )
@@ -221,7 +286,9 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         time_token = self.time_embedding(timesteps.reshape(-1)).unsqueeze(1)
         depth_tokens = depth_tokens + time_token.to(dtype=depth_tokens.dtype)
         cond = self._block_condition(spectrum_tokens, time_token).to(dtype=depth_tokens.dtype)
-        depth_tokens = self._run_depth_blocks(depth_tokens, spectrum_tokens, cond)
+        depth_tokens = self._run_candidate_conditioned_blocks(
+            depth_tokens, spectrum_tokens, cond, material_memory, candidate_mask
+        )
         features = self.final_depth_norm(depth_tokens)
 
         query = self.pointer_query(features)

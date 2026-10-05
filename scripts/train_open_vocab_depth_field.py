@@ -144,6 +144,8 @@ def model_config_from_mapping(
         spectrum_ffn_multiplier=float(model.get("SPECTRUM_FFN_MULTIPLIER", 2.0)),
         wavelength_scale_nm=float(model.get("WAVELENGTH_SCALE_NM", 1_000.0)),
         wavelength_fourier_bands=int(model.get("WAVELENGTH_FOURIER_BANDS", 4)),
+        query_spectrum=bool(model.get("QUERY_SPECTRUM", False)),
+        candidate_cross_attention=bool(model.get("CANDIDATE_CROSS_ATTENTION", False)),
     )
 
 
@@ -159,11 +161,15 @@ def make_collator(
     train: bool,
     seed: int,
 ) -> optollama.data.OpenVocabularyDepthFieldCollator:
-    """Build a deterministic full-grid validation or randomized training collator."""
+    """Build a full-grid or coordinate-query training/validation collator."""
     bank = nested(block, "MATERIAL_BANK", default={}) or {}
     grid = nested(block, "GRID", default={}) or {}
     optical = nested(block, "OPTICAL_CONDITION", default={}) or {}
+    query = nested(block, "QUERY", default={}) or {}
     wavelengths = cfg["WAVELENGTHS"]
+    coordinate_query = bool(query.get("ENABLED", False))
+    query_points = int(query.get("POINTS", len(wavelengths))) if coordinate_query else len(wavelengths)
+    query_mode = str(query.get("TRAIN_MODE" if train else "VAL_MODE", "mixed" if train else "full"))
     return optollama.data.OpenVocabularyDepthFieldCollator(
         wavelengths_nm=wavelengths,
         catalog=catalog,
@@ -174,11 +180,19 @@ def make_collator(
         channels=("R", "A", "T"),
         max_layers=int(block.get("MAX_LAYERS", 100)),
         max_candidates=int(bank.get("MAX_CANDIDATES", 24)),
-        min_query_points=len(wavelengths),
-        max_query_points=len(wavelengths),
-        query_sampling="full",
+        min_query_points=query_points,
+        max_query_points=query_points,
+        query_sampling=f"coordinate_{query_mode}" if coordinate_query else "full",
+        query_band_min_nm=float(query.get("MIN_BAND_NM", 100.0)),
+        query_band_max_nm=float(query.get("MAX_BAND_NM", 900.0)),
         randomize_candidates=bool(bank.get("RANDOMIZE_ORDER", True) if train else False),
         random_distractors=bool(bank.get("RANDOM_DISTRACTORS", True)),
+        max_random_distractors=(
+            int(bank["MAX_RANDOM_DISTRACTORS"])
+            if train and bank.get("MAX_RANDOM_DISTRACTORS") is not None
+            else None
+        ),
+        full_bank_probability=float(bank.get("FULL_BANK_PROBABILITY", 0.0)) if train else 0.0,
         holdout_materials=bank.get("HOLDOUT_MATERIALS", []) if train else (),
         merge_adjacent=True,
         coverage_tolerance_nm=float(bank.get("MATERIAL_COVERAGE_TOLERANCE_NM", 100.0)),
@@ -426,7 +440,15 @@ def main() -> None:
     )
     _, val_loader = make_loader(cfg, split="test", collator=val_collator, subset_n=val_n, rank=rank, world_size=world)
 
-    model_config = model_config_from_mapping(block, (3, len(cfg["WAVELENGTHS"])))
+    query_cfg = nested(block, "QUERY", default={}) or {}
+    query_points = (
+        int(query_cfg.get("POINTS", len(cfg["WAVELENGTHS"])))
+        if query_cfg.get("ENABLED", False)
+        else len(cfg["WAVELENGTHS"])
+    )
+    model_config = model_config_from_mapping(block, (3, query_points))
+    if model_config.query_spectrum != bool(query_cfg.get("ENABLED", False)):
+        raise ValueError("MODEL.QUERY_SPECTRUM and QUERY.ENABLED must agree.")
     if args.smoke_test:
         model_config = replace(
             model_config,

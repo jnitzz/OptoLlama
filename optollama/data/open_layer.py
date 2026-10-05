@@ -336,6 +336,92 @@ def sample_query_indices(
     return torch.randperm(width, generator=generator)[:count].sort().values
 
 
+def coordinate_query_wavelengths(
+    source_wavelengths_nm: torch.Tensor,
+    *,
+    points: int,
+    mode: str,
+    generator: torch.Generator | None = None,
+    min_band_nm: float = 100.0,
+    max_band_nm: float = 900.0,
+    bands: Sequence[tuple[float, float]] = (),
+) -> torch.Tensor:
+    """Sample a fixed-size, inverse-wavelength-uniform query on selected bands."""
+    source = source_wavelengths_nm.reshape(-1).to(dtype=torch.float32)
+    if source.numel() < 2 or not bool(torch.all(source[1:] > source[:-1])):
+        raise ValueError("Source wavelengths must contain at least two increasing points.")
+    if points < 4:
+        raise ValueError("Coordinate queries require at least four points.")
+    lower, upper = float(source[0]), float(source[-1])
+    span = upper - lower
+    if min_band_nm <= 0 or max_band_nm < min_band_nm:
+        raise ValueError("Invalid coordinate-query band width limits.")
+
+    def draw(start: float, stop: float) -> float:
+        return start + (stop - start) * float(torch.rand((), generator=generator))
+
+    selected_mode = mode.lower().removeprefix("coordinate_")
+    if selected_mode == "mixed":
+        selected_mode = ("full", "window", "dual")[int(torch.randint(0, 3, (), generator=generator))]
+    if selected_mode == "full":
+        selected_bands = ((lower, upper),)
+    elif selected_mode == "window":
+        width = draw(min_band_nm, min(max_band_nm, span))
+        start = draw(lower, upper - width)
+        selected_bands = ((start, start + width),)
+    elif selected_mode == "dual":
+        width_limit = min(max_band_nm, 350.0, (span - 100.0) / 2.0)
+        if width_limit < min_band_nm:
+            raise ValueError("The source wavelength span cannot contain two requested bands.")
+        first_width = draw(min_band_nm, width_limit)
+        second_width = draw(min_band_nm, width_limit)
+        gap = draw(100.0, min(500.0, span - first_width - second_width))
+        start = draw(lower, upper - first_width - gap - second_width)
+        selected_bands = (
+            (start, start + first_width),
+            (start + first_width + gap, start + first_width + gap + second_width),
+        )
+    elif selected_mode == "custom":
+        selected_bands = tuple((float(start), float(stop)) for start, stop in bands)
+    else:
+        raise ValueError(f"Unknown coordinate query mode {mode!r}.")
+    if not selected_bands or any(not lower <= start < stop <= upper for start, stop in selected_bands):
+        raise ValueError("Query bands must lie within the available wavelength support.")
+    if any(left[1] >= right[0] for left, right in zip(selected_bands, selected_bands[1:])):
+        raise ValueError("Query bands must be ordered and disjoint.")
+    counts = (points,) if len(selected_bands) == 1 else (points // 2, points - points // 2)
+    if len(counts) != len(selected_bands):
+        raise ValueError("Coordinate queries currently support one or two bands.")
+    return torch.cat(
+        tuple(
+            torch.linspace(1.0 / start, 1.0 / stop, count, dtype=torch.float32).reciprocal()
+            for (start, stop), count in zip(selected_bands, counts, strict=True)
+        )
+    )
+
+
+def interpolate_query_spectra(
+    spectra: torch.Tensor,
+    source_wavelengths_nm: torch.Tensor,
+    query_wavelengths_nm: torch.Tensor,
+) -> torch.Tensor:
+    """Interpolate [B,C,W] spectra only at supplied query coordinates."""
+    source = source_wavelengths_nm.reshape(-1).to(device=spectra.device, dtype=torch.float32)
+    query = query_wavelengths_nm.reshape(-1).to(device=spectra.device, dtype=torch.float32)
+    if spectra.ndim != 3 or spectra.shape[-1] != source.numel():
+        raise ValueError("Spectra must have shape [B,C,W] matching source wavelengths.")
+    if source.numel() < 2 or not bool(torch.all(source[1:] > source[:-1])):
+        raise ValueError("Source wavelengths must be strictly increasing.")
+    if query.numel() == 0 or not bool(torch.all(query[1:] > query[:-1])):
+        raise ValueError("Query wavelengths must be nonempty and strictly increasing.")
+    if float(query[0]) < float(source[0]) - 1.0e-3 or float(query[-1]) > float(source[-1]) + 1.0e-3:
+        raise ValueError("Query wavelengths extend beyond the available target spectrum.")
+    right = torch.searchsorted(source.contiguous(), query.contiguous()).clamp(1, source.numel() - 1)
+    left = right - 1
+    fraction = ((query - source[left]) / (source[right] - source[left])).clamp(0.0, 1.0)
+    return spectra.index_select(-1, left) * (1.0 - fraction) + spectra.index_select(-1, right) * fraction
+
+
 class OpenLayerBatchCollator:
     """Convert existing spectrum/token samples into query-local open-layer batches."""
 
@@ -354,8 +440,13 @@ class OpenLayerBatchCollator:
         min_query_points: int = 64,
         max_query_points: int | None = None,
         query_sampling: str = "mixed",
+        query_band_min_nm: float = 100.0,
+        query_band_max_nm: float = 900.0,
+        query_bands: Sequence[tuple[float, float]] = (),
         randomize_candidates: bool = True,
         random_distractors: bool = True,
+        max_random_distractors: int | None = None,
+        full_bank_probability: float = 0.0,
         holdout_materials: Sequence[str] = (),
         merge_adjacent: bool = True,
         thickness_transform: ThicknessTransform | None = None,
@@ -378,8 +469,17 @@ class OpenLayerBatchCollator:
         self.min_query_points = int(min_query_points)
         self.max_query_points = int(max_query_points or len(self.wavelengths_nm))
         self.query_sampling = str(query_sampling)
+        self.query_band_min_nm = float(query_band_min_nm)
+        self.query_band_max_nm = float(query_band_max_nm)
+        self.query_bands = tuple((float(start), float(stop)) for start, stop in query_bands)
         self.randomize_candidates = bool(randomize_candidates)
         self.random_distractors = bool(random_distractors)
+        self.max_random_distractors = None if max_random_distractors is None else int(max_random_distractors)
+        self.full_bank_probability = float(full_bank_probability)
+        if self.max_random_distractors is not None and self.max_random_distractors < 0:
+            raise ValueError("max_random_distractors must be nonnegative.")
+        if not 0.0 <= self.full_bank_probability <= 1.0:
+            raise ValueError("full_bank_probability must be in [0,1].")
         unknown_holdouts = set(str(value) for value in holdout_materials) - set(self.catalog.names)
         if unknown_holdouts:
             raise ValueError(f"Unknown holdout materials: {sorted(unknown_holdouts)}")
@@ -421,7 +521,15 @@ class OpenLayerBatchCollator:
             distractors = [distractors[idx] for idx in order]
         selected = unique_true
         if self.random_distractors:
-            selected += distractors[: self.max_candidates - len(unique_true)]
+            available = min(len(distractors), self.max_candidates - len(unique_true))
+            count = available
+            if (
+                self.max_random_distractors is not None
+                and float(torch.rand((), generator=generator)) >= self.full_bank_probability
+            ):
+                maximum = min(available, self.max_random_distractors)
+                count = int(torch.randint(0, maximum + 1, (), generator=generator))
+            selected += distractors[:count]
         if not selected:
             # Empty stacks are unsupervised, but still need a non-empty bank so
             # their placeholder layer can pass safely through attention.
@@ -439,22 +547,40 @@ class OpenLayerBatchCollator:
         width = int(samples[0][0].shape[-1])
         if width != len(self.wavelengths_nm):
             raise ValueError(f"Dataset spectrum width {width} does not match wavelength grid {len(self.wavelengths_nm)}.")
-        query_indices = sample_query_indices(
-            width,
-            min_points=self.min_query_points,
-            max_points=self.max_query_points,
-            mode=self.query_sampling,
-            generator=generator,
-            shape_generator=shape_generator,
-        )
-        query_wavelengths = self.wavelengths_nm[query_indices]
+        coordinate_query = self.query_sampling.startswith("coordinate_")
+        if coordinate_query:
+            query_wavelengths = coordinate_query_wavelengths(
+                self.wavelengths_nm,
+                points=self.max_query_points,
+                mode=self.query_sampling,
+                generator=generator,
+                min_band_nm=self.query_band_min_nm,
+                max_band_nm=self.query_band_max_nm,
+                bands=self.query_bands,
+            )
+        else:
+            query_indices = sample_query_indices(
+                width,
+                min_points=self.min_query_points,
+                max_points=self.max_query_points,
+                mode=self.query_sampling,
+                generator=generator,
+                shape_generator=shape_generator,
+            )
+            query_wavelengths = self.wavelengths_nm[query_indices]
         all_curves = self.catalog.interpolate(
             query_wavelengths,
             coverage_tolerance_nm=self.coverage_tolerance_nm,
         )
 
+        selected_spectra = None
+        if coordinate_query:
+            selected_spectra = interpolate_query_spectra(
+                torch.stack([sample[0] for sample in samples]), self.wavelengths_nm, query_wavelengths
+            )
+
         batch_size = len(samples)
-        query_count = len(query_indices)
+        query_count = len(query_wavelengths)
         channel_indices = torch.tensor([CHANNEL_TO_INDEX[channel] for channel in self.channels], dtype=torch.long)
         target = torch.empty((batch_size, query_count, len(self.channels)), dtype=torch.float32)
         target_rat = torch.empty((batch_size, query_count, 3), dtype=torch.float32)
@@ -496,7 +622,11 @@ class OpenLayerBatchCollator:
             active_layer_count = max(physical_layer_count, 1)
             candidate_count = len(candidates)
 
-            selected_spectrum = spectrum.index_select(1, query_indices)
+            selected_spectrum = (
+                selected_spectra[batch_idx]
+                if selected_spectra is not None
+                else spectrum.index_select(1, query_indices)
+            )
             target[batch_idx] = selected_spectrum.index_select(0, channel_indices).transpose(0, 1)
             target_rat[batch_idx] = selected_spectrum.transpose(0, 1)
             candidate_nk[batch_idx, :candidate_count] = all_curves.index_select(0, candidates)

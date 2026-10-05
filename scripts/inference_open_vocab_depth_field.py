@@ -33,6 +33,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate-materials", default=None, help="Comma-separated material names; default is the training catalog."
     )
+    parser.add_argument(
+        "--query-bands",
+        default=None,
+        help="Observed wavelength bands in nm, for example 400:700,900:1100; required for a disjoint target.",
+    )
+    parser.add_argument(
+        "--query-mode", choices=("full", "window", "dual"), default=None, help="Split-evaluation query mode."
+    )
     parser.add_argument("--angle-deg", type=float, default=None)
     parser.add_argument("--polarization", choices=("s", "p"), default=None)
     parser.add_argument("--steps", type=int, default=None)
@@ -71,6 +79,50 @@ def nested(mapping: dict[str, Any], *path: str, default: Any = None) -> Any:
             return default
         value = value[key]
     return value
+
+
+def parse_query_bands(value: str | None) -> tuple[tuple[float, float], ...]:
+    """Parse one or two ordered, disjoint wavelength intervals."""
+    if value is None:
+        return ()
+    try:
+        bands = tuple(tuple(float(part) for part in item.split(":")) for item in value.split(","))
+    except ValueError as error:
+        raise ValueError("--query-bands must use start:stop[,start:stop] in nm.") from error
+    if not 1 <= len(bands) <= 2 or any(len(band) != 2 for band in bands):
+        raise ValueError("--query-bands requires one or two start:stop intervals.")
+    if any(not (math.isfinite(start) and math.isfinite(stop)) or start <= 0 or start >= stop for start, stop in bands):
+        raise ValueError("Query bands must have positive, increasing endpoints.")
+    if len(bands) == 2 and bands[0][1] >= bands[1][0]:
+        raise ValueError("Query bands must be ordered and disjoint.")
+    return bands
+
+
+def target_query(
+    target_rat: torch.Tensor,
+    target_wavelengths: torch.Tensor,
+    *,
+    points: int,
+    bands: tuple[tuple[float, float], ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resample only observed bands, never an unmeasured gap."""
+    if not bands:
+        gaps = torch.diff(target_wavelengths)
+        if gaps.numel() and float(gaps.max()) > max(20.0, 4.0 * float(gaps.median())):
+            raise ValueError("Target has a wavelength gap; specify its observed intervals with --query-bands.")
+        bands = ((float(target_wavelengths[0]), float(target_wavelengths[-1])),)
+    for start, stop in bands:
+        inside = (target_wavelengths >= start) & (target_wavelengths <= stop)
+        if int(inside.sum()) < 2:
+            raise ValueError(f"Query band {start:g}:{stop:g} nm needs at least two target measurements.")
+        measured = target_wavelengths[inside]
+        if float(measured[0]) > start + 1.0e-3 or float(measured[-1]) < stop - 1.0e-3:
+            raise ValueError(f"Query band {start:g}:{stop:g} nm extends beyond its measured target points.")
+    query_wavelengths = optollama.data.coordinate_query_wavelengths(
+        target_wavelengths, points=points, mode="coordinate_custom", bands=bands
+    )
+    query_rat = optollama.data.interpolate_query_spectra(target_rat.unsqueeze(0), target_wavelengths, query_wavelengths)[0]
+    return query_rat, query_wavelengths
 
 
 def local_fields_to_runs(
@@ -127,6 +179,7 @@ def apply_fixed_candidate_bank(
     candidate_curves: torch.Tensor,
     *,
     max_candidates: int,
+    selected_global_ids: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Remap collated fields and conditions to one catalog-ordered material bank."""
     candidate_count = int(candidate_curves.shape[0])
@@ -137,6 +190,15 @@ def apply_fixed_candidate_bank(
     is_material = old_fields < max_candidates
     old_local_ids = old_fields.clamp(min=0, max=max_candidates - 1)
     remapped = old_global_ids.gather(1, old_local_ids)
+    if selected_global_ids is not None:
+        selected = selected_global_ids.long().reshape(-1)
+        if len(selected) != candidate_count:
+            raise ValueError("Selected global IDs must match the fixed candidate bank.")
+        lookup_size = max(int(old_global_ids.max()), int(selected.max())) + 1
+        lookup = torch.full((lookup_size,), -1, dtype=torch.long, device=old_fields.device)
+        present = selected >= 0
+        lookup[selected[present]] = torch.arange(candidate_count, device=old_fields.device)[present]
+        remapped = lookup[remapped.clamp_min(0)]
     if bool((is_material & (remapped < 0)).any()):
         raise ValueError("A clean field points to padding in its collated candidate bank.")
     remapped_fields = torch.where(is_material, remapped, torch.full_like(remapped, max_candidates))
@@ -233,7 +295,12 @@ def make_split_loader(
     bank = nested(block, "MATERIAL_BANK", default={}) or {}
     grid = nested(block, "GRID", default={}) or {}
     optical = nested(block, "OPTICAL_CONDITION", default={}) or {}
+    query = nested(block, "QUERY", default={}) or {}
     wavelengths = cfg["WAVELENGTHS"]
+    coordinate_query = bool(query.get("ENABLED", False))
+    query_points = int(query.get("POINTS", len(wavelengths))) if coordinate_query else len(wavelengths)
+    query_bands = parse_query_bands(args.query_bands) if coordinate_query else ()
+    query_mode = "custom" if query_bands else str(args.query_mode or "full")
     collator = optollama.data.OpenVocabularyDepthFieldCollator(
         wavelengths_nm=wavelengths,
         catalog=catalog,
@@ -244,9 +311,12 @@ def make_split_loader(
         channels=RAT_CHANNELS,
         max_layers=int(block.get("MAX_LAYERS", 100)),
         max_candidates=int(bank.get("MAX_CANDIDATES", 24)),
-        min_query_points=len(wavelengths),
-        max_query_points=len(wavelengths),
-        query_sampling="full",
+        min_query_points=query_points,
+        max_query_points=query_points,
+        query_sampling=f"coordinate_{query_mode}" if coordinate_query else "full",
+        query_band_min_nm=float(query.get("MIN_BAND_NM", 100.0)),
+        query_band_max_nm=float(query.get("MAX_BAND_NM", 900.0)),
+        query_bands=query_bands,
         randomize_candidates=False,
         random_distractors=bool(bank.get("RANDOM_DISTRACTORS", True)),
         holdout_materials=(),
@@ -305,6 +375,7 @@ def evaluate_split(
     model: optollama.model.OpenVocabularyDepthFieldDiffusion,
     model_config: optollama.model.OpenVocabularyDepthFieldConfig,
     catalog: optollama.data.MaterialCatalog,
+    source_catalog: optollama.data.MaterialCatalog,
     candidate_names: Sequence[str],
     tokens: Sequence[str],
     wavelengths: torch.Tensor,
@@ -333,19 +404,23 @@ def evaluate_split(
     evaluation_seed = int(args.seed if args.seed is not None else cfg.get("SEED", 0))
     mc_batch = max(1, int(args.mc_batch_size or args.mc_samples))
 
-    loader, dataset_size = make_split_loader(args, cfg, block, catalog, idx_to_token, eos_idx, pad_idx, msk_idx)
+    loader, dataset_size = make_split_loader(args, cfg, block, source_catalog, idx_to_token, eos_idx, pad_idx, msk_idx)
     token_materials = set(optollama.data.material_names_from_tokens(tokens))
     unsupported = sorted(set(candidate_names) - token_materials)
     if unsupported:
         raise ValueError(f"Exact TMM split scoring cannot map these candidates to tokens: {unsupported}")
     depth_vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
     material_to_token_id = {name: depth_vocab.token_options[name][0].token_id for name in candidate_names}
-    candidate_curves = catalog.interpolate(
-        wavelengths,
-        coverage_tolerance_nm=float(
-            nested(block, "MATERIAL_BANK", "MATERIAL_COVERAGE_TOLERANCE_NM", default=100.0)
-        ),
-    )
+    coordinate_query = model_config.query_spectrum
+    query_mode = "custom" if args.query_bands else str(args.query_mode or "full")
+    query_bands = parse_query_bands(args.query_bands)
+    if not coordinate_query and (args.query_bands or args.query_mode):
+        raise ValueError("This checkpoint does not support wavelength queries.")
+    coverage_tolerance = float(nested(block, "MATERIAL_BANK", "MATERIAL_COVERAGE_TOLERANCE_NM", default=100.0))
+    source_name_to_id = source_catalog.name_to_index
+    selected_global_ids = torch.tensor([source_name_to_id.get(name, -1) for name in candidate_names], dtype=torch.long)
+    source_allowed = torch.zeros(len(source_catalog.names), dtype=torch.bool)
+    source_allowed[selected_global_ids[selected_global_ids >= 0]] = True
     cfg["INCIDENCE_ANGLE"] = angle
     cfg["REALISTIC_TMM"] = {
         "ENABLED": True,
@@ -355,7 +430,16 @@ def evaluate_split(
         "JITTER_REALIZATIONS": 1,
         "THICKNESS_JITTER_NM": 0.0,
     }
-    tmm_ctx = optollama.evaluation.simulation.TMMContext.make(cfg, idx_to_token, device)
+    query_cache: dict[tuple[float, ...], tuple[torch.Tensor, optollama.evaluation.simulation.TMMContext]] = {}
+
+    def query_context(query_wavelengths: torch.Tensor):
+        key = tuple(float(value) for value in query_wavelengths.tolist())
+        if key not in query_cache:
+            curves = catalog.interpolate(query_wavelengths, coverage_tolerance_nm=coverage_tolerance)
+            cfg["WAVELENGTHS"] = query_wavelengths
+            context = optollama.evaluation.simulation.TMMContext.make(cfg, idx_to_token, device)
+            query_cache[key] = (curves, context)
+        return query_cache[key]
 
     output_dir = Path(block.get("OUT_DIR") or cfg["OUTPUT_PATH"])
     save_path = (
@@ -389,6 +473,8 @@ def evaluate_split(
             "seed": evaluation_seed,
             "dataset_size": dataset_size,
         }
+        if coordinate_query:
+            expected_settings.update({"query_mode": query_mode, "query_bands": [list(band) for band in query_bands]})
         changed = [key for key, value in expected_settings.items() if previous.get(key) != value]
         if changed:
             raise ValueError(f"Cannot resume {save_path}: evaluation settings changed: {changed}")
@@ -418,7 +504,9 @@ def evaluate_split(
             "angle_deg": angle,
             "polarization": polarization,
             "rat_channel_order": list(RAT_CHANNELS),
-            "wavelengths_nm": wavelengths.tolist(),
+            "wavelengths_nm": None if coordinate_query else wavelengths.tolist(),
+            "query_mode": query_mode if coordinate_query else None,
+            "query_bands": [list(band) for band in query_bands] if coordinate_query else None,
             "candidate_materials": list(candidate_names),
             "candidate_bank_mode": "fixed catalog order",
             "record_spectra": bool(args.record_spectra),
@@ -430,26 +518,37 @@ def evaluate_split(
             "samples": ordered,
         }
 
+
     saved_count = len(records)
     progress = tqdm.tqdm(loader, total=math.ceil(dataset_size / int(args.batch_size)), desc=f"RAT {args.split}")
     for raw in progress:
         raw_indices = raw["sample_indices"].tolist()
-        for sample_index, valid in zip(raw_indices, raw["sample_mask"].tolist(), strict=True):
+        raw_fields = raw["clean_fields"].long()
+        material_bins = raw_fields < model_config.max_candidates
+        global_fields = raw["candidate_global_ids"].gather(
+            1, raw_fields.clamp(max=model_config.max_candidates - 1)
+        )
+        supported = (~material_bins | source_allowed[global_fields.clamp_min(0)]).all(dim=1)
+        valid_rows = raw["sample_mask"] & supported
+        for sample_index, valid in zip(raw_indices, valid_rows.tolist(), strict=True):
             if not bool(valid):
                 known_invalid.add(int(sample_index))
         keep = torch.tensor(
             [
                 bool(valid) and int(sample_index) not in completed
-                for sample_index, valid in zip(raw_indices, raw["sample_mask"].tolist(), strict=True)
+                for sample_index, valid in zip(raw_indices, valid_rows.tolist(), strict=True)
             ],
             dtype=torch.bool,
         )
         if not bool(keep.any()):
             continue
+        batch_wavelengths = raw["wavelengths_nm"][0]
+        candidate_curves, tmm_ctx = query_context(batch_wavelengths)
         batch = apply_fixed_candidate_bank(
             {key: value[keep] for key, value in raw.items()},
             candidate_curves,
             max_candidates=model_config.max_candidates,
+            selected_global_ids=selected_global_ids,
         )
         batch_size = int(batch["sample_indices"].shape[0])
         batch_seed = evaluation_seed + int(batch["sample_indices"][0]) * 1_000_003
@@ -536,6 +635,8 @@ def evaluate_split(
                     _channel_mapping(channel_mae_grid[row, mc_index]) for mc_index in range(args.mc_samples)
                 ],
             }
+            if coordinate_query:
+                record["wavelengths_nm"] = batch_wavelengths.tolist()
             if args.record_fields:
                 record["target_field_runs"] = target_runs[row]
                 record["best_field_runs"] = runs_by_target[row][best_index]
@@ -589,6 +690,8 @@ def main() -> None:
     if not isinstance(model_metadata, dict):
         raise ValueError("Checkpoint has no open_vocab_depth_field_config metadata.")
     model_config = optollama.model.OpenVocabularyDepthFieldConfig.from_dict(model_metadata)
+    if model_config.query_spectrum != bool(nested(block, "QUERY", "ENABLED", default=False)):
+        raise ValueError("Checkpoint query-spectrum mode and config QUERY.ENABLED disagree.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device).eval()
     optollama.utils.load_checkpoint(args.checkpoint, model, map_location="cpu")
@@ -621,6 +724,7 @@ def main() -> None:
     materials_dir = args.materials_dir or cfg["MATERIALS_PATH"]
     cfg["MATERIALS_PATH"] = materials_dir
     catalog = optollama.data.load_material_catalog(materials_dir, candidate_names)
+    source_catalog = optollama.data.load_material_catalog(materials_dir, training_names) if args.split else catalog
 
     optical = nested(block, "OPTICAL_CONDITION", default={}) or {}
     angle = float(args.angle_deg if args.angle_deg is not None else optical.get("ANGLE_DEG", 0.0))
@@ -637,6 +741,7 @@ def main() -> None:
             model=model,
             model_config=model_config,
             catalog=catalog,
+            source_catalog=source_catalog,
             candidate_names=candidate_names,
             tokens=tokens,
             wavelengths=wavelengths,
@@ -657,8 +762,16 @@ def main() -> None:
 
     target_path = Path(args.target or cfg["TARGET"])
     target_rat, target_wavelengths = optollama.data.load_open_layer_target(target_path, wavelengths)
-    if target_wavelengths.shape != wavelengths.shape or not torch.allclose(target_wavelengths, wavelengths):
-        raise ValueError("The first open-vocabulary depth-field package requires the configured fixed wavelength grid.")
+    query_bands = parse_query_bands(args.query_bands)
+    if model_config.query_spectrum:
+        target_rat, wavelengths = target_query(
+            target_rat,
+            target_wavelengths,
+            points=model_config.spectrum_shape[-1],
+            bands=query_bands,
+        )
+    elif query_bands or target_wavelengths.shape != wavelengths.shape or not torch.allclose(target_wavelengths, wavelengths):
+        raise ValueError("This checkpoint requires the configured fixed wavelength grid.")
     curves = catalog.interpolate(
         wavelengths, coverage_tolerance_nm=float(nested(block, "MATERIAL_BANK", "MATERIAL_COVERAGE_TOLERANCE_NM", default=100.0))
     )
@@ -698,6 +811,7 @@ def main() -> None:
         depth_vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
         material_to_token_id = {name: depth_vocab.token_options[name][0].token_id for name in candidate_names}
         cfg["MATERIALS_PATH"] = materials_dir
+        cfg["WAVELENGTHS"] = wavelengths
         cfg["INCIDENCE_ANGLE"] = angle
         cfg["REALISTIC_TMM"] = {
             "ENABLED": True,
@@ -736,6 +850,8 @@ def main() -> None:
         "angle_deg": angle,
         "polarization": polarization,
         "candidate_materials": list(candidate_names),
+        "wavelengths_nm": wavelengths.tolist(),
+        "query_bands": [list(band) for band in query_bands] if query_bands else None,
         "target_spectra": target_rat.tolist(),
         "samples": records,
     }

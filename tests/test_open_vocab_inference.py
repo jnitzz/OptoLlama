@@ -45,6 +45,24 @@ def test_fixed_candidate_bank_remaps_local_fields_to_catalog_order() -> None:
     torch.testing.assert_close(fixed["candidate_nk"][0], curves)
 
 
+def test_restricted_bank_remaps_from_full_catalog_ids() -> None:
+    """Eligible split targets keep their materials under a smaller selected bank."""
+    batch = {
+        "clean_fields": torch.tensor([[0, 0, 1, 1, 3]]),
+        "candidate_global_ids": torch.tensor([[2, 0, -1]]),
+        "candidate_mask": torch.tensor([[True, True, False]]),
+        "candidate_nk": torch.zeros((1, 3, 4, 2)),
+    }
+    fixed = apply_fixed_candidate_bank(
+        batch,
+        torch.rand(2, 4, 2),
+        max_candidates=3,
+        selected_global_ids=torch.tensor([0, 2]),
+    )
+    assert fixed["clean_fields"].tolist() == [[1, 1, 0, 0, 3]]
+    assert fixed["candidate_mask"].tolist() == [[True, True, False]]
+
+
 def test_split_summary_distinguishes_single_mean_and_best_of_mc() -> None:
     """Report single-draw and oracle MC metrics separately."""
     records = [
