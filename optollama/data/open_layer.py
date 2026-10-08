@@ -665,6 +665,7 @@ class OpenVocabularyDepthFieldCollator(OpenLayerBatchCollator):
         max_total_nm: float = 10_000.0,
         incidence_angle_deg: float = 0.0,
         polarization: str = "s",
+        include_source_spectrum: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -680,6 +681,7 @@ class OpenVocabularyDepthFieldCollator(OpenLayerBatchCollator):
         if normalized_polarization not in {"s", "p"}:
             raise ValueError("polarization must be 's' or 'p'.")
         self.polarization_id = 0 if normalized_polarization == "s" else 1
+        self.include_source_spectrum = bool(include_source_spectrum)
 
     def __call__(self, samples: Sequence[tuple[torch.Tensor, torch.Tensor, int]]) -> dict[str, torch.Tensor]:
         """Return candidate-local clean fields plus wavelength/material conditions."""
@@ -703,6 +705,8 @@ class OpenVocabularyDepthFieldCollator(OpenLayerBatchCollator):
                     break
 
         batch["clean_fields"] = fields
+        if self.include_source_spectrum:
+            batch["source_spectrum_rat"] = torch.stack([spectrum.transpose(0, 1) for spectrum, _, _ in samples])
         batch["incidence_angle_deg"] = torch.full((batch_size,), self.incidence_angle_deg, dtype=torch.float32)
         batch["polarization_id"] = torch.full((batch_size,), self.polarization_id, dtype=torch.long)
         return batch

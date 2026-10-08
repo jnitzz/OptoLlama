@@ -127,6 +127,7 @@ def model_config_from_mapping(
     return optollama.model.OpenVocabularyDepthFieldConfig(
         spectrum_shape=spectrum_shape,
         depth_bins=int(round(float(grid.get("MAX_THICKNESS_NM", 10_000.0)) / float(grid.get("DZ_NM", 5.0)))),
+        depth_patch_size=int(model.get("DEPTH_PATCH_SIZE", 1)),
         max_candidates=int(bank.get("MAX_CANDIDATES", 24)),
         d_model=d_model,
         n_blocks=n_blocks,

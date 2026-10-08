@@ -89,3 +89,8 @@ def test_split_summary_distinguishes_single_mean_and_best_of_mc() -> None:
     assert math.isclose(summary["rat_mae"]["mean_candidate"]["mean"], 0.3)
     assert math.isclose(summary["rat_mae"]["best_of_mc"]["mean"], 0.15)
     assert math.isclose(summary["channel_mae_mean"]["best"]["T"], 0.225, rel_tol=1e-6)
+    for record in records:
+        record["full_grid"] = {**record, "query_selected_mae": record["best_mae"]}
+    full_summary = summarize_split_records(records)
+    assert math.isclose(full_summary["full_grid"]["rat_mae"]["best_of_mc"]["mean"], 0.15)
+    assert math.isclose(full_summary["full_grid"]["query_selected_mae"]["mean"], 0.15)

@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         help="For split evaluation, save target and best-candidate material runs.",
     )
     parser.add_argument(
+        "--full-grid-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Also score split samples on the original wavelength grid (defaults to EVAL.FULL_GRID_METRICS).",
+    )
+    parser.add_argument(
         "--save-every", type=int, default=10, help="Checkpoint split results after this many new targets; 0 disables."
     )
     parser.add_argument("--resume-output", action="store_true", help="Resume split evaluation from an existing --save JSON.")
@@ -250,6 +256,10 @@ def summarize_split_records(records: Sequence[dict[str, Any]]) -> dict[str, Any]
             )
             for channel in RAT_CHANNELS
         }
+    if records and all("full_grid" in record for record in records):
+        summary["full_grid"] = summarize_split_records([record["full_grid"] for record in records])
+    if records and all("query_selected_mae" in record for record in records):
+        summary["query_selected_mae"] = _distribution([float(record["query_selected_mae"]) for record in records])
     return summary
 
 
@@ -296,6 +306,11 @@ def make_split_loader(
     grid = nested(block, "GRID", default={}) or {}
     optical = nested(block, "OPTICAL_CONDITION", default={}) or {}
     query = nested(block, "QUERY", default={}) or {}
+    score_full_grid = (
+        bool(args.full_grid_metrics)
+        if args.full_grid_metrics is not None
+        else bool(nested(block, "EVAL", "FULL_GRID_METRICS", default=False))
+    )
     wavelengths = cfg["WAVELENGTHS"]
     coordinate_query = bool(query.get("ENABLED", False))
     query_points = int(query.get("POINTS", len(wavelengths))) if coordinate_query else len(wavelengths)
@@ -327,6 +342,7 @@ def make_split_loader(
         max_total_nm=float(grid.get("MAX_THICKNESS_NM", 10_000.0)),
         incidence_angle_deg=float(optical.get("ANGLE_DEG", 0.0)),
         polarization=str(optical.get("POLARIZATION", "s")),
+        include_source_spectrum=score_full_grid,
     )
     paths = split_paths(cfg, args.split)
     workers = int(args.num_workers if args.num_workers is not None else cfg.get("NUM_WORKERS", 0))
@@ -403,6 +419,11 @@ def evaluate_split(
         raise ValueError("--resume-output requires an explicit --save path.")
     evaluation_seed = int(args.seed if args.seed is not None else cfg.get("SEED", 0))
     mc_batch = max(1, int(args.mc_batch_size or args.mc_samples))
+    score_full_grid = (
+        bool(args.full_grid_metrics)
+        if args.full_grid_metrics is not None
+        else bool(nested(block, "EVAL", "FULL_GRID_METRICS", default=False))
+    )
 
     loader, dataset_size = make_split_loader(args, cfg, block, source_catalog, idx_to_token, eos_idx, pad_idx, msk_idx)
     token_materials = set(optollama.data.material_names_from_tokens(tokens))
@@ -441,6 +462,11 @@ def evaluate_split(
             query_cache[key] = (curves, context)
         return query_cache[key]
 
+    full_tmm_ctx = None
+    if score_full_grid:
+        cfg["WAVELENGTHS"] = wavelengths
+        full_tmm_ctx = optollama.evaluation.simulation.TMMContext.make(cfg, idx_to_token, device)
+
     output_dir = Path(block.get("OUT_DIR") or cfg["OUTPUT_PATH"])
     save_path = (
         Path(args.save)
@@ -476,6 +502,8 @@ def evaluate_split(
         if coordinate_query:
             expected_settings.update({"query_mode": query_mode, "query_bands": [list(band) for band in query_bands]})
         changed = [key for key, value in expected_settings.items() if previous.get(key) != value]
+        if bool(previous.get("full_grid_metrics", False)) != score_full_grid:
+            changed.append("full_grid_metrics")
         if changed:
             raise ValueError(f"Cannot resume {save_path}: evaluation settings changed: {changed}")
         records = list(previous.get("samples") or [])
@@ -505,6 +533,8 @@ def evaluate_split(
             "polarization": polarization,
             "rat_channel_order": list(RAT_CHANNELS),
             "wavelengths_nm": None if coordinate_query else wavelengths.tolist(),
+            "full_grid_metrics": score_full_grid,
+            "full_grid_wavelengths_nm": wavelengths.tolist() if score_full_grid else None,
             "query_mode": query_mode if coordinate_query else None,
             "query_bands": [list(band) for band in query_bands] if coordinate_query else None,
             "candidate_materials": list(candidate_names),
@@ -512,6 +542,7 @@ def evaluate_split(
             "record_spectra": bool(args.record_spectra),
             "record_fields": bool(args.record_fields),
             "best_of_mc_selection": "oracle exact-TMM minimum RAT MAE",
+            "full_grid_best_of_mc_selection": "oracle full-grid exact-TMM minimum RAT MAE" if score_full_grid else None,
             "dataset_size": dataset_size,
             "invalid_sample_indices": sorted(known_invalid),
             "summary": summarize_split_records(ordered),
@@ -557,6 +588,7 @@ def evaluate_split(
             torch.cuda.manual_seed_all(batch_seed)
         banks = [tuple(candidate_names)] * batch_size
         target_rat = batch["target_spectrum_rat"].transpose(1, 2).contiguous().cpu()
+        full_target_rat = batch["source_spectrum_rat"].transpose(1, 2).contiguous().cpu() if score_full_grid else None
         target_runs = (
             [
                 local_fields_to_runs(
@@ -573,6 +605,9 @@ def evaluate_split(
         mae_chunks: list[torch.Tensor] = []
         channel_mae_chunks: list[torch.Tensor] = []
         predicted_chunks: list[torch.Tensor] = []
+        full_mae_chunks: list[torch.Tensor] = []
+        full_channel_mae_chunks: list[torch.Tensor] = []
+        full_predicted_chunks: list[torch.Tensor] = []
         runs_by_target: list[list[list[dict[str, float | str]]]] = [[] for _ in range(batch_size)]
 
         for mc_start in range(0, args.mc_samples, mc_batch):
@@ -614,10 +649,27 @@ def evaluate_split(
             channel_mae_chunks.append(absolute_error.mean(dim=3))
             if args.record_spectra:
                 predicted_chunks.append(predicted)
+            if full_tmm_ctx is not None and full_target_rat is not None:
+                full_predicted = optollama.evaluation.simulation.simulate_material_runs(
+                    chunk_runs,
+                    full_tmm_ctx,
+                    material_to_token_id=material_to_token_id,
+                    eos=eos_idx,
+                    pad=pad_idx,
+                    msk=msk_idx,
+                ).cpu().reshape(batch_size, count, 3, -1)
+                full_error = (full_predicted - full_target_rat.unsqueeze(1)).abs()
+                full_mae_chunks.append(full_error.mean(dim=(2, 3)))
+                full_channel_mae_chunks.append(full_error.mean(dim=3))
+                if args.record_spectra:
+                    full_predicted_chunks.append(full_predicted)
 
         mae_grid = torch.cat(mae_chunks, dim=1)
         channel_mae_grid = torch.cat(channel_mae_chunks, dim=1)
         predicted_grid = torch.cat(predicted_chunks, dim=1) if predicted_chunks else None
+        full_mae_grid = torch.cat(full_mae_chunks, dim=1) if full_mae_chunks else None
+        full_channel_mae_grid = torch.cat(full_channel_mae_chunks, dim=1) if full_channel_mae_chunks else None
+        full_predicted_grid = torch.cat(full_predicted_chunks, dim=1) if full_predicted_chunks else None
         for row in range(batch_size):
             sample_index = int(batch["sample_indices"][row])
             best_index = int(mae_grid[row].argmin())
@@ -643,6 +695,23 @@ def evaluate_split(
             if predicted_grid is not None:
                 record["target_spectra"] = target_rat[row].tolist()
                 record["best_pred_spectra"] = predicted_grid[row, best_index].tolist()
+            if full_mae_grid is not None and full_channel_mae_grid is not None and full_target_rat is not None:
+                full_best_index = int(full_mae_grid[row].argmin())
+                full_record = {
+                    "single_draw_mae": float(full_mae_grid[row, 0]),
+                    "mean_candidate_mae": float(full_mae_grid[row].mean()),
+                    "best_mae": float(full_mae_grid[row, full_best_index]),
+                    "best_mc_index": full_best_index,
+                    "query_selected_mae": float(full_mae_grid[row, best_index]),
+                    "candidate_mae": full_mae_grid[row].tolist(),
+                    "single_draw_channel_mae": _channel_mapping(full_channel_mae_grid[row, 0]),
+                    "mean_candidate_channel_mae": _channel_mapping(full_channel_mae_grid[row].mean(dim=0)),
+                    "best_channel_mae": _channel_mapping(full_channel_mae_grid[row, full_best_index]),
+                }
+                if full_predicted_grid is not None:
+                    full_record["target_spectra"] = full_target_rat[row].tolist()
+                    full_record["best_pred_spectra"] = full_predicted_grid[row, full_best_index].tolist()
+                record["full_grid"] = full_record
             records.append(record)
             completed.add(sample_index)
         progress.set_postfix(best=f"{summarize_split_records(records)['rat_mae']['best_of_mc']['mean']:.4f}")
@@ -667,6 +736,14 @@ def evaluate_split(
         "Best-of-MC channel MAE: "
         + ", ".join(f"{channel}={best_channels[channel]:.6f}" for channel in RAT_CHANNELS)
     )
+    if score_full_grid:
+        full_metrics = final_payload["summary"]["full_grid"]
+        full_summary = full_metrics["rat_mae"]
+        print(
+            f"Full-grid RAT MAE: single-draw mean={full_summary['single_draw']['mean']:.6f}, "
+            f"query-selected mean={full_metrics['query_selected_mae']['mean']:.6f}, "
+            f"best-of-{args.mc_samples} mean={full_summary['best_of_mc']['mean']:.6f}"
+        )
     return save_path
 
 
@@ -692,6 +769,12 @@ def main() -> None:
     model_config = optollama.model.OpenVocabularyDepthFieldConfig.from_dict(model_metadata)
     if model_config.query_spectrum != bool(nested(block, "QUERY", "ENABLED", default=False)):
         raise ValueError("Checkpoint query-spectrum mode and config QUERY.ENABLED disagree.")
+    configured_points = int(nested(block, "QUERY", "POINTS", default=len(cfg["WAVELENGTHS"])))
+    if model_config.query_spectrum and configured_points != model_config.spectrum_shape[-1]:
+        raise ValueError("Checkpoint spectrum width and config QUERY.POINTS disagree.")
+    configured_patch = int(nested(block, "MODEL", "DEPTH_PATCH_SIZE", default=1))
+    if configured_patch != model_config.depth_patch_size:
+        raise ValueError("Checkpoint depth patch size and config MODEL.DEPTH_PATCH_SIZE disagree.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device).eval()
     optollama.utils.load_checkpoint(args.checkpoint, model, map_location="cpu")

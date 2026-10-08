@@ -32,6 +32,7 @@ class OpenVocabularyDepthFieldConfig:
 
     spectrum_shape: tuple[int, ...]
     depth_bins: int
+    depth_patch_size: int = 1
     max_candidates: int = 24
     d_model: int = 896
     n_blocks: int = 8
@@ -58,6 +59,8 @@ class OpenVocabularyDepthFieldConfig:
             raise ValueError("max_candidates must be positive.")
         if self.depth_bins <= 0:
             raise ValueError("depth_bins must be positive.")
+        if self.depth_patch_size <= 0 or self.depth_bins % self.depth_patch_size:
+            raise ValueError("depth_patch_size must divide depth_bins exactly.")
         if not self.hybrid_dilations:
             base = (1, 2, 4, 8, 16, 32, 64)
             object.__setattr__(
@@ -145,6 +148,17 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         )
         self.pointer_query = nn.Linear(config.d_model, config.d_model, bias=False)
         self.pointer_key = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.depth_patch_size = int(config.depth_patch_size)
+        if self.depth_patch_size > 1:
+            self.depth_patch_input = nn.Linear(config.d_model * self.depth_patch_size, config.d_model)
+            self.depth_patch_output = nn.Linear(config.d_model, config.d_model * self.depth_patch_size)
+            self.depth_patch_refine_norm = nn.LayerNorm(config.d_model)
+            self.depth_patch_refine = nn.Sequential(
+                nn.Conv1d(config.d_model, config.d_model, kernel_size=3, padding=1, groups=config.d_model),
+                nn.SiLU(),
+                nn.Conv1d(config.d_model, config.d_model, kernel_size=1),
+            )
+            self.depth_patch_refine_scale = nn.Parameter(torch.tensor(float(config.hybrid_residual_init)))
         if config.query_spectrum:
             self.query_coordinates = WavelengthFeatures(config.wavelength_scale_nm, config.wavelength_fourier_bands)
             self.query_projection = nn.Conv1d(
@@ -163,6 +177,11 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         del self.input_embedding
         del self.output
         nn.init.normal_(self.special_embeddings, mean=0.0, std=0.02)
+
+    @property
+    def convolution_receptive_field_bins(self) -> int:
+        """Report the receptive field in physical depth bins, not patch tokens."""
+        return super().convolution_receptive_field_bins * self.depth_patch_size
 
     def noise_probability(self, timesteps: torch.Tensor) -> torch.Tensor:
         """Map normalized continuous time to the legacy quadratic noise level."""
@@ -282,6 +301,10 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         spectrum_tokens = torch.cat((spectrum_tokens[:, :-1], candidate_token, spectrum_tokens[:, -1:]), dim=1)
 
         depth_tokens = self._material_state(noised_fields, material_memory)
+        if self.depth_patch_size > 1:
+            depth_tokens = self.depth_patch_input(
+                depth_tokens.reshape(spectra.size(0), self.depth_bins // self.depth_patch_size, -1)
+            )
         depth_tokens = depth_tokens + self.positional_encoding(depth_tokens).to(dtype=depth_tokens.dtype)
         time_token = self.time_embedding(timesteps.reshape(-1)).unsqueeze(1)
         depth_tokens = depth_tokens + time_token.to(dtype=depth_tokens.dtype)
@@ -289,6 +312,12 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         depth_tokens = self._run_candidate_conditioned_blocks(
             depth_tokens, spectrum_tokens, cond, material_memory, candidate_mask
         )
+        if self.depth_patch_size > 1:
+            depth_tokens = self.depth_patch_output(depth_tokens).reshape(spectra.size(0), self.depth_bins, self.d_model)
+            local = self.depth_patch_refine(
+                self.depth_patch_refine_norm(depth_tokens).transpose(1, 2).contiguous()
+            ).transpose(1, 2)
+            depth_tokens = depth_tokens + self.depth_patch_refine_scale.to(dtype=local.dtype) * local
         features = self.final_depth_norm(depth_tokens)
 
         query = self.pointer_query(features)
