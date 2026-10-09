@@ -307,6 +307,12 @@ def run_epoch(
     totals = torch.zeros(len(keys) + 1, dtype=torch.float64, device=device)
     local_rows = 0
     optimizer_steps = 0
+    nonfinite_skips = 0
+    nonfinite_loss_skips = 0
+    nonfinite_grad_skips = 0
+    consecutive_nonfinite_skips = 0
+    max_nonfinite_steps = max(0, int(train_cfg.get("MAX_NONFINITE_STEPS_PER_EPOCH", 0)))
+    max_consecutive_nonfinite_steps = max(0, int(train_cfg.get("MAX_CONSECUTIVE_NONFINITE_STEPS", 0)))
     log_every_steps = max(1, int(log_every_steps))
     ema_update_every_steps = max(1, int(ema_update_every_steps))
     eval_every_steps = None if not eval_every_steps else max(1, int(eval_every_steps))
@@ -339,14 +345,60 @@ def run_epoch(
             raise FloatingPointError(f"Non-finite open-vocabulary depth loss at epoch={epoch + 1}, step={step}.")
         if training:
             assert optimizer is not None
+            # Complete DDP backward even for a bad loss so the next forward is safe.
             scaler.scale(output["loss"]).backward()
             scaler.unscale_(optimizer)
             norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), float(train_cfg.get("GRAD_CLIP", 1.0)), error_if_nonfinite=False
             )
-            if not synchronized_finite(torch.stack((output["loss"].detach().float(), norm.detach().float()))):
+            finite = torch.stack(
+                (torch.isfinite(output["loss"].detach()).all(), torch.isfinite(norm.detach()).all())
+            ).to(dtype=torch.int32)
+            if optollama.utils.is_ddp():
+                torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
+            loss_finite, gradient_finite = (bool(value) for value in finite.tolist())
+            failure = "loss" if not loss_finite else ("gradient" if not gradient_finite else None)
+            if failure is not None:
+                local_bad = (
+                    not bool(torch.isfinite(output["loss"]).all().item())
+                    if failure == "loss"
+                    else not bool(torch.isfinite(norm).all().item())
+                )
+                if local_bad:
+                    sample_ids = batch.get("sample_indices")
+                    indices = sample_ids.tolist() if sample_ids is not None else []
+                    rank = torch.distributed.get_rank() if optollama.utils.is_ddp() else 0
+                    print(
+                        f"[rank{rank}] Non-finite {failure} at epoch={epoch + 1}, step={step}, "
+                        f"loss={float(output['loss'].detach()):.6g}, "
+                        f"grad_norm={float(norm):.6g}, sample_indices={indices}",
+                        flush=True,
+                    )
                 optimizer.zero_grad(set_to_none=True)
-                raise FloatingPointError(f"Non-finite loss or gradient at epoch={epoch + 1}, step={step}.")
+                if scaler.is_enabled():
+                    scaler.update()
+                nonfinite_skips += 1
+                consecutive_nonfinite_skips += 1
+                if failure == "loss":
+                    nonfinite_loss_skips += 1
+                else:
+                    nonfinite_grad_skips += 1
+                if nonfinite_skips > max_nonfinite_steps or (
+                    max_consecutive_nonfinite_steps > 0 and consecutive_nonfinite_skips > max_consecutive_nonfinite_steps
+                ):
+                    raise FloatingPointError(
+                        f"Non-finite {failure} at epoch={epoch + 1}, step={step}; "
+                        f"skipped {nonfinite_skips} steps this epoch "
+                        f"({consecutive_nonfinite_skips} consecutive)."
+                    )
+                if show:
+                    print(
+                        f"Skipped non-finite {failure} step {step} in epoch {epoch + 1} "
+                        f"({nonfinite_skips}/{max_nonfinite_steps} this epoch).",
+                        flush=True,
+                    )
+                continue
+            consecutive_nonfinite_skips = 0
             scaler.step(optimizer)
             scaler.update()
             local_rows += rows
@@ -395,6 +447,9 @@ def run_epoch(
     metrics["global_samples_seen"] = global_samples_seen + int(metrics["samples_seen"]) if training else global_samples_seen
     metrics["optimizer_steps"] = optimizer_steps
     metrics["global_optimizer_steps"] = global_optimizer_steps + optimizer_steps
+    metrics["nonfinite_skips"] = nonfinite_skips
+    metrics["nonfinite_loss_skips"] = nonfinite_loss_skips
+    metrics["nonfinite_grad_skips"] = nonfinite_grad_skips
     metrics["learning_rate"] = float(optimizer.param_groups[0]["lr"]) if optimizer is not None else 0.0
     return metrics
 
