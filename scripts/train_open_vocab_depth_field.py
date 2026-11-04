@@ -265,7 +265,7 @@ def compute_loss(
         loss_on_corrupted_only=bool(train_cfg.get("LOSS_ON_CORRUPTED_ONLY", False)),
     )
     prediction = logits.argmax(dim=-1)
-    return {
+    result = {
         "loss": loss,
         "accuracy": (prediction == clean).float().mean(),
         "corrupted_accuracy": (prediction[corrupted] == clean[corrupted]).float().mean()
@@ -275,6 +275,39 @@ def compute_loss(
         "corrupted_fraction": corrupted.float().mean(),
         "condition_dropped": dropped.float().mean(),
     }
+    if isinstance(core, optollama.model.OpenVocabularyDepthFieldDFM):
+        with torch.no_grad():
+            correct = prediction == clean
+            source_groups = (
+                noised == core.mask_id,
+                (noised < core.void_id) & (noised != clean),
+                (noised == core.void_id) & (noised != clean),
+                noised == clean,
+            )
+            time_groups = tuple(
+                ((timesteps >= index / 4) & (timesteps < (index + 1) / 4 if index < 3 else timesteps <= 1))[:, None]
+                .expand_as(clean)
+                for index in range(4)
+            )
+            result["flow_diagnostics"] = torch.stack(
+                [
+                    torch.stack((per_bin[mask].sum(), correct[mask].sum(), mask.sum()))
+                    for mask in (*source_groups, *time_groups)
+                ]
+            )
+    return result
+
+
+def flow_diagnostic_metrics(totals: torch.Tensor) -> dict[str, float]:
+    """Convert summed source-state and time-band counts to mean metrics."""
+    labels = ("mask", "wrong_material", "wrong_void", "visible", "t_0_25", "t_25_50", "t_50_75", "t_75_100")
+    result: dict[str, float] = {}
+    for index, label in enumerate(labels):
+        count = max(1.0, float(totals[index, 2].item()))
+        result[f"{label}_loss"] = float(totals[index, 0].item()) / count
+        result[f"{label}_accuracy"] = float(totals[index, 1].item()) / count
+        result[f"{label}_bins"] = int(totals[index, 2].item())
+    return result
 
 
 def run_epoch(
@@ -305,6 +338,11 @@ def run_epoch(
     model.train(training)
     keys = ("loss", "accuracy", "corrupted_accuracy", "noise_probability", "corrupted_fraction", "condition_dropped")
     totals = torch.zeros(len(keys) + 1, dtype=torch.float64, device=device)
+    flow_totals = (
+        torch.zeros((8, 3), dtype=torch.float64, device=device)
+        if isinstance(unwrap_model(model), optollama.model.OpenVocabularyDepthFieldDFM)
+        else None
+    )
     local_rows = 0
     optimizer_steps = 0
     nonfinite_skips = 0
@@ -409,6 +447,8 @@ def run_epoch(
         metric_values = torch.stack([output[key].detach().to(dtype=torch.float64) for key in keys])
         totals[:-1].add_(metric_values * rows)
         totals[-1].add_(rows)
+        if flow_totals is not None:
+            flow_totals.add_(output["flow_diagnostics"].to(dtype=torch.float64))
         display_step = optimizer_steps if training else step + 1
         if display_step == 1 or display_step % log_every_steps == 0:
             running = {key: float((totals[index] / totals[-1]).item()) for index, key in enumerate(keys)}
@@ -431,6 +471,11 @@ def run_epoch(
                 key: float((snapshot_totals[index] / snapshot_totals[-1]).item()) for index, key in enumerate(keys)
             }
             snapshot["samples"] = int(snapshot_totals[-1].item())
+            if flow_totals is not None:
+                flow_snapshot = flow_totals.clone()
+                if optollama.utils.is_ddp():
+                    torch.distributed.all_reduce(flow_snapshot)
+                snapshot.update(flow_diagnostic_metrics(flow_snapshot))
             on_evaluation_step(
                 current_global_step,
                 global_samples_seen + local_rows * world,
@@ -439,9 +484,13 @@ def run_epoch(
             model.train(True)
     if optollama.utils.is_ddp():
         torch.distributed.all_reduce(totals)
+        if flow_totals is not None:
+            torch.distributed.all_reduce(flow_totals)
     if totals[-1] <= 0:
         raise RuntimeError("No valid samples were processed.")
     metrics = {key: float(totals[index] / totals[-1]) for index, key in enumerate(keys)}
+    if flow_totals is not None:
+        metrics.update(flow_diagnostic_metrics(flow_totals))
     metrics["samples"] = int(totals[-1].item())
     metrics["samples_seen"] = local_rows * world if training else int(totals[-1].item())
     metrics["global_samples_seen"] = global_samples_seen + int(metrics["samples_seen"]) if training else global_samples_seen
@@ -517,7 +566,23 @@ def main() -> None:
             spectrum_encoder_blocks=1,
             spectrum_encoder_heads=4,
         )
-    raw_model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device)
+    process = str(nested(block, "DENOISING", "PROCESS", default="remask"))
+    if process not in {"remask", "discrete_flow"}:
+        raise ValueError(f"Unknown open-vocabulary depth process: {process}")
+    flow_config = None
+    if process == "discrete_flow":
+        flow_config = optollama.model.DiscreteFlowConfig.from_dict(nested(block, "DENOISING", "FLOW", default={}))
+        if float(train_cfg.get("RANDOM_REPLACE_PROB", 0.0)) != 0.0:
+            raise ValueError("DFM requires TRAIN.RANDOM_REPLACE_PROB: 0.")
+        if any(float(train_cfg.get(key, 1.0)) != 1.0 for key in (
+            "VOID_LOSS_WEIGHT", "CORRUPTED_LOSS_WEIGHT", "UNCORRUPTED_LOSS_WEIGHT"
+        )) or bool(nested(train_cfg, "BOUNDARY_LOSS", "ENABLED", default=False)) or bool(
+            train_cfg.get("LOSS_ON_CORRUPTED_ONLY", False)
+        ):
+            raise ValueError("DFM clean-field posterior training requires unweighted cross-entropy.")
+        raw_model = optollama.model.OpenVocabularyDepthFieldDFM(model_config, flow_config).to(device)
+    else:
+        raw_model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device)
     base_lr = float(train_cfg.get("LEARNING_RATE", 5.0e-5))
     optimizer_cfg = train_cfg.get("OPTIMIZER") or {}
     fused_optimizer = bool(optimizer_cfg.get("FUSED", True)) and device.type == "cuda"
@@ -553,6 +618,11 @@ def main() -> None:
         )
         start_epoch = int(loaded_epoch or 0)
         checkpoint_extra = blob.get("extra") or {}
+        saved_process = checkpoint_extra.get("denoising_process", "remask")
+        if saved_process != process or (
+            flow_config is not None and checkpoint_extra.get("discrete_flow_config") != flow_config.to_dict()
+        ):
+            raise ValueError("Checkpoint denoising process or discrete-flow source differs from this config.")
         history = list(checkpoint_extra.get("history") or [])
         step_evaluations = list(checkpoint_extra.get("step_evaluations") or [])
         if ema is not None and isinstance(checkpoint_extra.get("ema"), dict):
@@ -598,6 +668,7 @@ def main() -> None:
         print(
             f"Continuous time: t~Uniform(0,1), noise_probability=t^2; validation sampling steps={nested(block, 'EVAL', 'SAMPLING_STEPS', default=64)}"
         )
+        print(f"Denoising process: {process}" + (f", source={flow_config.to_dict()}" if flow_config else ""))
         print(
             f"Optical condition: angle={nested(block, 'OPTICAL_CONDITION', 'ANGLE_DEG', default=0.0)}deg, polarization={nested(block, 'OPTICAL_CONDITION', 'POLARIZATION', default='s')}"
         )
@@ -705,6 +776,8 @@ def main() -> None:
         if rank == 0:
             extra = {
                 "open_vocab_depth_field_config": model_config.to_dict(),
+                "denoising_process": process,
+                "discrete_flow_config": flow_config.to_dict() if flow_config is not None else None,
                 "material_names": list(catalog.names),
                 "config_path": args.config,
                 "history": history,

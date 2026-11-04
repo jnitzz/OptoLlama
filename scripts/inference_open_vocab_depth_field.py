@@ -482,6 +482,7 @@ def evaluate_split(
         if str(previous.get("checkpoint")) != str(args.checkpoint):
             raise ValueError(f"Cannot resume {save_path}: checkpoint path differs from --checkpoint.")
         expected_settings = {
+            "denoising_process": "discrete_flow" if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else "remask",
             "weights": args.weights,
             "sampling_steps": steps,
             "mc_samples": int(args.mc_samples),
@@ -501,7 +502,10 @@ def evaluate_split(
         }
         if coordinate_query:
             expected_settings.update({"query_mode": query_mode, "query_bands": [list(band) for band in query_bands]})
-        changed = [key for key, value in expected_settings.items() if previous.get(key) != value]
+        changed = [
+            key for key, value in expected_settings.items()
+            if previous.get(key, "remask" if key == "denoising_process" else None) != value
+        ]
         if bool(previous.get("full_grid_metrics", False)) != score_full_grid:
             changed.append("full_grid_metrics")
         if changed:
@@ -520,6 +524,8 @@ def evaluate_split(
             "checkpoint": str(args.checkpoint),
             "weights": args.weights,
             "continuous_time": True,
+            "denoising_process": "discrete_flow" if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else "remask",
+            "discrete_flow_source": model.flow_config.to_dict() if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else None,
             "sampling_steps": steps,
             "mc_samples": int(args.mc_samples),
             "mc_batch_size": mc_batch,
@@ -775,8 +781,20 @@ def main() -> None:
     configured_patch = int(nested(block, "MODEL", "DEPTH_PATCH_SIZE", default=1))
     if configured_patch != model_config.depth_patch_size:
         raise ValueError("Checkpoint depth patch size and config MODEL.DEPTH_PATCH_SIZE disagree.")
+    process = str(nested(block, "DENOISING", "PROCESS", default="remask"))
+    saved_process = str(extra.get("denoising_process", "remask"))
+    if process != saved_process:
+        raise ValueError(f"Config process {process} does not match checkpoint process {saved_process}.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device).eval()
+    if process == "discrete_flow":
+        flow_config = optollama.model.DiscreteFlowConfig.from_dict(nested(block, "DENOISING", "FLOW", default={}))
+        if extra.get("discrete_flow_config") != flow_config.to_dict():
+            raise ValueError("Config discrete-flow source differs from checkpoint metadata.")
+        model = optollama.model.OpenVocabularyDepthFieldDFM(model_config, flow_config).to(device).eval()
+    elif process == "remask":
+        model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device).eval()
+    else:
+        raise ValueError(f"Unknown open-vocabulary depth process: {process}")
     optollama.utils.load_checkpoint(args.checkpoint, model, map_location="cpu")
     ema_state = extra.get("ema") if args.weights == "ema" else None
     if isinstance(ema_state, dict) and isinstance(ema_state.get("shadow"), dict):
@@ -927,6 +945,8 @@ def main() -> None:
         records.append(record)
     payload = {
         "checkpoint": str(args.checkpoint),
+        "denoising_process": process,
+        "discrete_flow_source": model.flow_config.to_dict() if process == "discrete_flow" else None,
         "target": str(target_path),
         "continuous_time": True,
         "sampling_steps": steps,
