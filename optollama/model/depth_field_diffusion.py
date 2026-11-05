@@ -570,6 +570,26 @@ class DepthFieldAttentionBlock(nn.Module):
         return x
 
 
+def attention_forward(
+    attention: nn.MultiheadAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    fp32: bool,
+    key_padding_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, None]:
+    """Keep attention projections and backward in FP32 when requested."""
+    if not fp32:
+        output, _ = attention(query, key, value, key_padding_mask=key_padding_mask, need_weights=False)
+        return output, None
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        output, _ = attention(
+            query.float(), key.float(), value.float(), key_padding_mask=key_padding_mask, need_weights=False
+        )
+    return output.to(dtype=query.dtype), None
+
+
 class DepthFieldOptoLlamaBlock(nn.Module):
     """OptoLlama-style DiT block adapted to dense depth-field tokens."""
 
@@ -600,18 +620,21 @@ class DepthFieldOptoLlamaBlock(nn.Module):
         nn.init.zeros_(self.to_alpha2.bias)
 
         self.dropout = nn.Dropout(float(dropout))
+        self.fp32_attention = False
 
     def forward(self, depth_tokens: torch.Tensor, spectrum_tokens: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """Apply spectrum cross-attention, depth self-attention, and FFN."""
         residual = depth_tokens
         h = self.norm1(depth_tokens, cond)
-        h, _ = self.cross_attn(query=h, key=spectrum_tokens, value=spectrum_tokens, need_weights=False)
+        h, _ = attention_forward(
+            self.cross_attn, h, spectrum_tokens, spectrum_tokens, fp32=self.fp32_attention
+        )
         h = h * (1.0 + self.to_alpha1(cond).unsqueeze(1))
         depth_tokens = residual + h
 
         residual = depth_tokens
         h = self.norm2(depth_tokens, cond)
-        h, _ = self.self_attn(query=h, key=h, value=h, need_weights=False)
+        h, _ = attention_forward(self.self_attn, h, h, h, fp32=self.fp32_attention)
         h = h * (1.0 + self.to_alpha2(cond).unsqueeze(1))
         depth_tokens = residual + h
 
@@ -706,11 +729,12 @@ class SpectrumEncoderBlock(nn.Module):
             nn.Linear(hidden, int(d_model)),
         )
         self.dropout = nn.Dropout(float(dropout))
+        self.fp32_attention = False
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """Apply spectrum self-attention and a position-wise feed-forward layer."""
         h = self.norm1(tokens)
-        attended, _ = self.self_attn(h, h, h, need_weights=False)
+        attended, _ = attention_forward(self.self_attn, h, h, h, fp32=self.fp32_attention)
         tokens = tokens + self.dropout(attended)
         return tokens + self.dropout(self.ff(self.norm2(tokens)))
 

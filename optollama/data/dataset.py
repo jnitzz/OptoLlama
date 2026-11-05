@@ -296,6 +296,7 @@ class ShardedSpectraDataset(IterableDataset):
         self.seed = int(seed or 0)
         self.shuffle = bool(shuffle)
         self.epoch = 0
+        self.resume_samples_per_rank = 0
 
         self.shard_lengths: list[int] = []
         self.shard_offsets: list[int] = [0]
@@ -354,11 +355,19 @@ class ShardedSpectraDataset(IterableDataset):
 
     def __len__(self) -> int:
         """Return the number of samples visible to this rank."""
-        return self.samples_per_rank
+        return self.samples_per_rank - self.resume_samples_per_rank
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch seed used for deterministic per-shard shuffling."""
         self.epoch = int(epoch)
+        self.resume_samples_per_rank = 0
+
+    def set_resume_batch(self, batch_index: int, batch_size: int) -> None:
+        """Seek to a rank-local batch without loading preceding shards."""
+        skip = int(batch_index) * int(batch_size)
+        if batch_index < 0 or batch_size <= 0 or skip > self.samples_per_rank:
+            raise ValueError("Resume batch lies outside the rank-local dataset range.")
+        self.resume_samples_per_rank = skip
 
     def example_spectrum(self) -> torch.Tensor:
         """Load one representative spectrum without materializing the dataset."""
@@ -379,12 +388,17 @@ class ShardedSpectraDataset(IterableDataset):
 
     def __iter__(self):
         """Yield ``(spectrum, stack, global_index)`` samples for this rank."""
+        skip = self.resume_samples_per_rank
         for shard_idx in self._rank_shard_indices():
             shard_start = self.shard_offsets[shard_idx]
             shard_stop = self.shard_offsets[shard_idx + 1]
             local_start = max(self.rank_start, shard_start) - shard_start
             local_stop = min(self.rank_stop, shard_stop) - shard_start
             if local_start >= local_stop:
+                continue
+            shard_rows = local_stop - local_start
+            if skip >= shard_rows:
+                skip -= shard_rows
                 continue
 
             data = safetensors.torch.load_file(self.paths[shard_idx], device="cpu")
@@ -397,6 +411,10 @@ class ShardedSpectraDataset(IterableDataset):
                 indices = torch.randperm(local_stop - local_start, generator=generator) + local_start
             else:
                 indices = torch.arange(local_start, local_stop)
+
+            if skip:
+                indices = indices[skip:]
+                skip = 0
 
             for local_idx_t in indices:
                 local_idx = int(local_idx_t.item())

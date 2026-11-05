@@ -12,6 +12,9 @@ from .depth_field_diffusion import (
     DepthFieldCorruptionConfig,
     DepthFieldHybridDiffusion,
     DepthFieldModelConfig,
+    DepthFieldOptoLlamaBlock,
+    SpectrumEncoderBlock,
+    attention_forward,
     depth_field_boundary_mask,
     depth_field_corruption_mask,
     drop_spectrum_condition,
@@ -52,6 +55,7 @@ class OpenVocabularyDepthFieldConfig:
     wavelength_fourier_bands: int = 4
     query_spectrum: bool = False
     candidate_cross_attention: bool = False
+    fp32_attention: bool = False
 
     def __post_init__(self) -> None:
         """Normalize dilation defaults and validate structural dimensions."""
@@ -111,6 +115,9 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
         )
         super().__init__(base_config)
         self.open_vocab_config = config
+        for module in self.modules():
+            if isinstance(module, (DepthFieldOptoLlamaBlock, SpectrumEncoderBlock)):
+                module.fp32_attention = bool(config.fp32_attention)
         self.max_candidates = int(config.max_candidates)
         self.void_id = self.max_candidates
         self.num_materials = self.max_candidates + 1
@@ -251,12 +258,13 @@ class OpenVocabularyDepthFieldDiffusion(DepthFieldHybridDiffusion):
             strict=True,
         ):
             depth_tokens = block(depth_tokens, spectrum_tokens, condition)
-            candidate_update, _ = attention(
-                query=norm(depth_tokens),
-                key=material_memory,
-                value=material_memory,
+            candidate_update, _ = attention_forward(
+                attention,
+                norm(depth_tokens),
+                material_memory,
+                material_memory,
+                fp32=self.open_vocab_config.fp32_attention,
                 key_padding_mask=~candidate_mask,
-                need_weights=False,
             )
             depth_tokens = depth_tokens + torch.tanh(gate) * candidate_update
             depth_tokens = conv(depth_tokens, time_condition, spectrum_condition)

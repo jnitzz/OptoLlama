@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 import torch.nn.functional as functional
 import tqdm  # type: ignore[import-untyped]
@@ -54,6 +56,50 @@ def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenVocabularyDepthF
             core = original
             continue
         return core  # type: ignore[return-value]
+
+
+class LocalGradientDiagnostic:
+    """Inspect DDP buckets before their gradients are averaged across ranks."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.names = {id(parameter): name for name, parameter in model.named_parameters()}
+        self.bad_parameters: list[str] = []
+
+    def reset(self) -> None:
+        """Discard observations from the preceding backward pass."""
+        self.bad_parameters.clear()
+
+
+def diagnostic_allreduce(state: LocalGradientDiagnostic, bucket):
+    """Preserve DDP's mean reduction while recording rank-local bad gradients."""
+    if not bool(torch.isfinite(bucket.buffer()).all().item()):
+        for parameter, gradient in zip(bucket.parameters(), bucket.gradients(), strict=True):
+            if not bool(torch.isfinite(gradient).all().item()):
+                state.bad_parameters.append(state.names.get(id(parameter), "<unnamed>"))
+    world = torch.distributed.get_world_size()
+    future = torch.distributed.all_reduce(bucket.buffer(), async_op=True).get_future()
+    return future.then(lambda result: result.value()[0].div_(world))
+
+
+def capture_rank_state(train_collator: Any, val_collator: Any) -> dict[str, Any]:
+    """Capture rank-local randomness and collator positions at a batch boundary."""
+    return {
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        "python_rng": random.getstate(),
+        "numpy_rng": np.random.get_state(),
+        "train_collator_calls": train_collator.calls,
+        "val_collator_calls": val_collator.calls,
+    }
+
+
+def restore_rank_state(state: dict[str, Any]) -> None:
+    """Restore randomness after creating the resumed data iterator."""
+    random.setstate(state["python_rng"])
+    np.random.set_state(state["numpy_rng"])
+    torch.set_rng_state(state["torch_rng"])
+    if state["cuda_rng"] is not None:
+        torch.cuda.set_rng_state(state["cuda_rng"])
 
 
 class ModelEma:
@@ -147,6 +193,7 @@ def model_config_from_mapping(
         wavelength_fourier_bands=int(model.get("WAVELENGTH_FOURIER_BANDS", 4)),
         query_spectrum=bool(model.get("QUERY_SPECTRUM", False)),
         candidate_cross_attention=bool(model.get("CANDIDATE_CROSS_ATTENTION", False)),
+        fp32_attention=bool(model.get("FP32_ATTENTION", False)),
     )
 
 
@@ -276,6 +323,9 @@ def compute_loss(
         "condition_dropped": dropped.float().mean(),
     }
     if isinstance(core, optollama.model.OpenVocabularyDepthFieldDFM):
+        result["diagnostic_timesteps"] = timesteps.detach()
+        result["diagnostic_noised"] = noised.detach()
+        result["diagnostic_logits"] = logits.detach()
         with torch.no_grad():
             correct = prediction == clean
             source_groups = (
@@ -332,6 +382,11 @@ def run_epoch(
     ema_update_every_steps: int = 1,
     eval_every_steps: int | None = None,
     on_evaluation_step: Callable[[int, int, dict[str, float]], None] | None = None,
+    checkpoint_every_steps: int | None = None,
+    on_checkpoint_step: Callable[[int, int, int, dict[str, Any]], None] | None = None,
+    resume_state: dict[str, Any] | None = None,
+    gradient_diagnostic: LocalGradientDiagnostic | None = None,
+    diagnostic_dir: Path | None = None,
 ) -> dict[str, float]:
     """Train or validate one epoch and aggregate metrics over all ranks."""
     training = optimizer is not None
@@ -351,9 +406,22 @@ def run_epoch(
     consecutive_nonfinite_skips = 0
     max_nonfinite_steps = max(0, int(train_cfg.get("MAX_NONFINITE_STEPS_PER_EPOCH", 0)))
     max_consecutive_nonfinite_steps = max(0, int(train_cfg.get("MAX_CONSECUTIVE_NONFINITE_STEPS", 0)))
+    start_batch = 0
+    if training and resume_state:
+        start_batch = int(resume_state["next_batch"])
+        totals.copy_(resume_state["totals"].to(device))
+        if flow_totals is not None and resume_state.get("flow_totals") is not None:
+            flow_totals.copy_(resume_state["flow_totals"].to(device))
+        local_rows = int(resume_state["local_rows"])
+        optimizer_steps = int(resume_state["optimizer_steps"])
+        nonfinite_skips = int(resume_state["nonfinite_skips"])
+        nonfinite_loss_skips = int(resume_state["nonfinite_loss_skips"])
+        nonfinite_grad_skips = int(resume_state["nonfinite_grad_skips"])
+        consecutive_nonfinite_skips = int(resume_state["consecutive_nonfinite_skips"])
     log_every_steps = max(1, int(log_every_steps))
     ema_update_every_steps = max(1, int(ema_update_every_steps))
     eval_every_steps = None if not eval_every_steps else max(1, int(eval_every_steps))
+    checkpoint_every_steps = None if not checkpoint_every_steps else max(1, int(checkpoint_every_steps))
     world = torch.distributed.get_world_size() if optollama.utils.is_ddp() else 1
     show = not optollama.utils.is_ddp() or torch.distributed.get_rank() == 0
     progress = tqdm.tqdm(
@@ -362,10 +430,14 @@ def run_epoch(
         disable=not show,
         miniters=log_every_steps,
         mininterval=5.0,
+        initial=start_batch if training else 0,
+        total=start_batch + len(loader) if training else len(loader),
     )
-    for step, raw in enumerate(progress):
+    for step, raw in enumerate(progress, start=start_batch):
         if max_steps is not None and step >= max_steps:
             break
+        if training and resume_state is not None and step == start_batch:
+            restore_rank_state(resume_state["rng"])
         selected = select_valid_rows(raw)
         if selected is None:
             continue
@@ -384,6 +456,8 @@ def run_epoch(
         if training:
             assert optimizer is not None
             # Complete DDP backward even for a bad loss so the next forward is safe.
+            if gradient_diagnostic is not None:
+                gradient_diagnostic.reset()
             scaler.scale(output["loss"]).backward()
             scaler.unscale_(optimizer)
             norm = torch.nn.utils.clip_grad_norm_(
@@ -406,12 +480,40 @@ def run_epoch(
                     sample_ids = batch.get("sample_indices")
                     indices = sample_ids.tolist() if sample_ids is not None else []
                     rank = torch.distributed.get_rank() if optollama.utils.is_ddp() else 0
+                    bad_names = gradient_diagnostic.bad_parameters if gradient_diagnostic is not None else []
                     print(
                         f"[rank{rank}] Non-finite {failure} at epoch={epoch + 1}, step={step}, "
                         f"loss={float(output['loss'].detach()):.6g}, "
-                        f"grad_norm={float(norm):.6g}, sample_indices={indices}",
+                        f"grad_norm={float(norm):.6g}, local_bad_parameters={bad_names[:12]}, "
+                        f"sample_indices={indices}",
                         flush=True,
                     )
+                    if diagnostic_dir is not None:
+                        t = output.get("diagnostic_timesteps")
+                        noised = output.get("diagnostic_noised")
+                        logits = output.get("diagnostic_logits")
+                        core = unwrap_model(model)
+                        valid_logits = None
+                        if logits is not None:
+                            valid_materials = batch["candidate_mask"][:, None, :].expand_as(logits[..., :-1])
+                            valid_logits = torch.cat((logits[..., :-1][valid_materials], logits[..., -1].reshape(-1)))
+                        record = {
+                            "epoch": epoch + 1,
+                            "batch_index": step,
+                            "rank": rank,
+                            "failure": failure,
+                            "loss": float(output["loss"].detach()) if loss_finite else None,
+                            "grad_norm": float(norm) if gradient_finite else None,
+                            "local_bad_parameters": bad_names,
+                            "sample_indices": indices,
+                            "candidate_counts": batch["candidate_mask"].sum(dim=1).tolist(),
+                            "timestep_min_mean_max": [float(value) for value in (t.min(), t.mean(), t.max())] if t is not None else None,
+                            "input_mask_fraction": float((noised == core.mask_id).float().mean()) if noised is not None else None,
+                            "input_void_fraction": float((noised == core.void_id).float().mean()) if noised is not None else None,
+                            "valid_logits_finite": bool(torch.isfinite(valid_logits).all()) if valid_logits is not None else None,
+                            "valid_logit_abs_max": float(valid_logits.abs().max()) if valid_logits is not None and bool(torch.isfinite(valid_logits).all()) else None,
+                        }
+                        optollama.utils.save_as_json(str(diagnostic_dir / f"epoch_{epoch + 1:04d}_batch_{step:06d}_rank_{rank}.json"), record)
                 optimizer.zero_grad(set_to_none=True)
                 if scaler.is_enabled():
                     scaler.update()
@@ -482,6 +584,24 @@ def run_epoch(
                 snapshot,
             )
             model.train(True)
+        if (
+            training
+            and checkpoint_every_steps is not None
+            and on_checkpoint_step is not None
+            and current_global_step % checkpoint_every_steps == 0
+        ):
+            state = {
+                "next_batch": step + 1,
+                "totals": totals.detach().cpu(),
+                "flow_totals": flow_totals.detach().cpu() if flow_totals is not None else None,
+                "local_rows": local_rows,
+                "optimizer_steps": optimizer_steps,
+                "nonfinite_skips": nonfinite_skips,
+                "nonfinite_loss_skips": nonfinite_loss_skips,
+                "nonfinite_grad_skips": nonfinite_grad_skips,
+                "consecutive_nonfinite_skips": consecutive_nonfinite_skips,
+            }
+            on_checkpoint_step(current_global_step, global_samples_seen + local_rows * world, step + 1, state)
     if optollama.utils.is_ddp():
         torch.distributed.all_reduce(totals)
         if flow_totals is not None:
@@ -544,6 +664,8 @@ def main() -> None:
         cfg, split="train", collator=train_collator, subset_n=train_n, rank=rank, world_size=world
     )
     _, val_loader = make_loader(cfg, split="test", collator=val_collator, subset_n=val_n, rank=rank, world_size=world)
+    if int(train_cfg.get("CHECKPOINT_EVERY_STEPS", 0)) and not hasattr(train_dataset, "set_resume_batch"):
+        raise ValueError("Mid-epoch checkpoints require DATA_LOADING.SHARDED_LOADING: true.")
 
     query_cfg = nested(block, "QUERY", default={}) or {}
     query_points = (
@@ -608,6 +730,8 @@ def main() -> None:
     start_epoch = 0
     history: list[dict[str, Any]] = []
     step_evaluations: list[dict[str, Any]] = []
+    resume_cursor: dict[str, Any] | None = None
+    rank_resume_state: dict[str, Any] | None = None
     ema_cfg = train_cfg.get("EMA") or {}
     ema = ModelEma(raw_model, float(ema_cfg.get("DECAY", 0.9998))) if bool(ema_cfg.get("ENABLED", True)) else None
     resume = args.resume or nested(cfg, "CHECKPOINT", "RESUME")
@@ -627,6 +751,21 @@ def main() -> None:
         step_evaluations = list(checkpoint_extra.get("step_evaluations") or [])
         if ema is not None and isinstance(checkpoint_extra.get("ema"), dict):
             ema.load_state_dict(checkpoint_extra["ema"], raw_model)
+        resume_cursor = checkpoint_extra.get("resume_cursor")
+        if resume_cursor is not None:
+            expected = {
+                "world_size": world,
+                "batch_size": int(cfg["TRAIN_BATCH_SIZE"]),
+                "train_samples": train_n,
+                "dataset_paths": [str(path) for path in train_dataset.paths],
+            }
+            for key, value in expected.items():
+                if resume_cursor.get(key) != value:
+                    raise ValueError(f"Mid-epoch resume requires unchanged {key}: {resume_cursor.get(key)!r} != {value!r}")
+            start_epoch = int(resume_cursor["epoch"])
+            rank_resume_state = resume_cursor["rank_states"][rank]
+            train_collator.calls = int(rank_resume_state["rng"]["train_collator_calls"])
+            val_collator.calls = int(rank_resume_state["rng"]["val_collator_calls"])
 
     model: torch.nn.Module = raw_model
     compile_cfg = train_cfg.get("COMPILE") or {}
@@ -652,16 +791,31 @@ def main() -> None:
             static_graph=bool(ddp_cfg.get("STATIC_GRAPH", True)),
             gradient_as_bucket_view=bool(ddp_cfg.get("GRADIENT_AS_BUCKET_VIEW", True)),
         )
-    global_seen = resume_global_samples(history, start_epoch, train_n)
+    gradient_diagnostic = None
+    if bool(train_cfg.get("DIAGNOSE_LOCAL_GRADIENTS", False)) and optollama.utils.is_ddp():
+        gradient_diagnostic = LocalGradientDiagnostic(raw_model)
+        model.register_comm_hook(gradient_diagnostic, diagnostic_allreduce)
+    global_seen = (
+        int(resume_cursor["epoch_base_global_seen"])
+        if resume_cursor is not None
+        else resume_global_samples(history, start_epoch, train_n)
+    )
     global_steps = int(
-        checkpoint_extra.get("global_optimizer_steps", 0)
+        (resume_cursor["epoch_base_global_steps"] if resume_cursor is not None else checkpoint_extra.get("global_optimizer_steps", 0))
         or global_seen // max(1, int(cfg["TRAIN_BATCH_SIZE"]) * world)
     )
     log_every_steps = max(1, int(train_cfg.get("LOG_EVERY_STEPS", 50)))
     eval_every_steps = max(0, int(train_cfg.get("EVAL_EVERY_STEPS", 0)))
+    checkpoint_every_steps = max(0, int(train_cfg.get("CHECKPOINT_EVERY_STEPS", 0)))
     ema_update_every_steps = max(1, int(ema_cfg.get("UPDATE_EVERY_STEPS", 1)))
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
+    if optollama.utils.is_ddp():
+        torch.distributed.barrier()
+    diagnostic_dir = output_dir / "nonfinite_diagnostics" if bool(train_cfg.get("DIAGNOSE_LOCAL_GRADIENTS", False)) else None
+    if diagnostic_dir is not None:
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
         print(
             f"Open-vocab depth model: parameters={sum(p.numel() for p in model.parameters()):,}, world={world}, batch/rank={cfg['TRAIN_BATCH_SIZE']}"
         )
@@ -678,11 +832,71 @@ def main() -> None:
             f"log_every={log_every_steps}, eval_every={eval_every_steps or 'epoch'}, "
             f"ema_every={ema_update_every_steps}"
         )
+        print(
+            f"Stability: amp_dtype={amp_dtype}, fp32_attention={model_config.fp32_attention}, "
+            f"local_gradient_diagnostics={gradient_diagnostic is not None}, "
+            f"checkpoint_every={checkpoint_every_steps or 'epoch'}"
+        )
     best = min((float(item["val"]["loss"]) for item in history), default=math.inf)
     for epoch in range(start_epoch, epochs):
         if hasattr(train_dataset, "set_epoch"):
             train_dataset.set_epoch(epoch)
+        if rank_resume_state is not None:
+            train_dataset.set_resume_batch(int(rank_resume_state["next_batch"]), int(cfg["TRAIN_BATCH_SIZE"]))
         max_train_steps = 1 if args.smoke_test else args.max_train_steps
+
+        def checkpoint_metadata(optimizer_step: int, cursor: dict[str, Any] | None = None) -> dict[str, Any]:
+            return {
+                "open_vocab_depth_field_config": model_config.to_dict(),
+                "denoising_process": process,
+                "discrete_flow_config": flow_config.to_dict() if flow_config is not None else None,
+                "material_names": list(catalog.names),
+                "config_path": args.config,
+                "history": history,
+                "step_evaluations": step_evaluations,
+                "global_optimizer_steps": optimizer_step,
+                "continuous_time": True,
+                "ema": ema.state_dict() if ema is not None else None,
+                "resume_cursor": cursor,
+            }
+
+        def checkpoint_at_step(step: int, samples_seen: int, next_batch: int, state: dict[str, Any]) -> None:
+            state["rng"] = capture_rank_state(train_collator, val_collator)
+            rank_states: list[dict[str, Any] | None] = [None] * world
+            if optollama.utils.is_ddp():
+                torch.distributed.all_gather_object(rank_states, state)
+            else:
+                rank_states[0] = state
+            cursor = {
+                "epoch": epoch,
+                "next_batch": next_batch,
+                "epoch_base_global_seen": global_seen,
+                "epoch_base_global_steps": global_steps,
+                "world_size": world,
+                "batch_size": int(cfg["TRAIN_BATCH_SIZE"]),
+                "train_samples": train_n,
+                "dataset_paths": [str(path) for path in train_dataset.paths],
+                "rank_states": rank_states,
+            }
+            save_error = None
+            if rank == 0:
+                try:
+                    optollama.utils.save_checkpoint(
+                        str(output_dir / "open-vocab-depth-progress.pt"),
+                        model=raw_model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        extra=checkpoint_metadata(step, cursor),
+                    )
+                    print(f"Saved resumable open-vocab depth checkpoint at step {step:,}, batch {next_batch:,}.")
+                except Exception as exc:
+                    save_error = f"{type(exc).__name__}: {exc}"
+            errors = [save_error]
+            if optollama.utils.is_ddp():
+                torch.distributed.broadcast_object_list(errors, src=0)
+            if errors[0] is not None:
+                raise RuntimeError(f"Could not save mid-epoch checkpoint: {errors[0]}")
 
         def evaluate_at_step(step: int, samples_seen: int, train_running: dict[str, float]) -> None:
             """Run and persist lightweight validation at a global optimizer-step boundary."""
@@ -745,7 +959,13 @@ def main() -> None:
             ema_update_every_steps=ema_update_every_steps,
             eval_every_steps=eval_every_steps,
             on_evaluation_step=evaluate_at_step if eval_every_steps else None,
+            checkpoint_every_steps=checkpoint_every_steps,
+            on_checkpoint_step=checkpoint_at_step if checkpoint_every_steps else None,
+            resume_state=rank_resume_state,
+            gradient_diagnostic=gradient_diagnostic,
+            diagnostic_dir=diagnostic_dir,
         )
+        rank_resume_state = None
         global_seen = int(train["global_samples_seen"])
         global_steps = int(train["global_optimizer_steps"])
         validate_ema = bool(ema is not None and ema_cfg.get("VALIDATE", True))
@@ -774,18 +994,7 @@ def main() -> None:
                 )
         history.append({"epoch": epoch + 1, "train": train, "val": val})
         if rank == 0:
-            extra = {
-                "open_vocab_depth_field_config": model_config.to_dict(),
-                "denoising_process": process,
-                "discrete_flow_config": flow_config.to_dict() if flow_config is not None else None,
-                "material_names": list(catalog.names),
-                "config_path": args.config,
-                "history": history,
-                "step_evaluations": step_evaluations,
-                "global_optimizer_steps": global_steps,
-                "continuous_time": True,
-                "ema": ema.state_dict() if ema is not None else None,
-            }
+            extra = checkpoint_metadata(global_steps)
             optollama.utils.save_checkpoint(
                 str(output_dir / "open-vocab-depth-last.pt"),
                 model=raw_model,
