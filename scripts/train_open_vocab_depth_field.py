@@ -743,8 +743,12 @@ def main() -> None:
         start_epoch = int(loaded_epoch or 0)
         checkpoint_extra = blob.get("extra") or {}
         saved_process = checkpoint_extra.get("denoising_process", "remask")
+        saved_flow = checkpoint_extra.get("discrete_flow_config")
         if saved_process != process or (
-            flow_config is not None and checkpoint_extra.get("discrete_flow_config") != flow_config.to_dict()
+            flow_config is not None and (
+                not isinstance(saved_flow, dict)
+                or optollama.model.DiscreteFlowConfig.from_dict(saved_flow) != flow_config
+            )
         ):
             raise ValueError("Checkpoint denoising process or discrete-flow source differs from this config.")
         history = list(checkpoint_extra.get("history") or [])

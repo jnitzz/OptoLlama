@@ -788,7 +788,8 @@ def main() -> None:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if process == "discrete_flow":
         flow_config = optollama.model.DiscreteFlowConfig.from_dict(nested(block, "DENOISING", "FLOW", default={}))
-        if extra.get("discrete_flow_config") != flow_config.to_dict():
+        saved_flow = extra.get("discrete_flow_config")
+        if not isinstance(saved_flow, dict) or optollama.model.DiscreteFlowConfig.from_dict(saved_flow) != flow_config:
             raise ValueError("Config discrete-flow source differs from checkpoint metadata.")
         model = optollama.model.OpenVocabularyDepthFieldDFM(model_config, flow_config).to(device).eval()
     elif process == "remask":

@@ -94,6 +94,42 @@ def test_fp32_attention_under_bf16_autocast() -> None:
     assert torch.isfinite(model.pointer_query.weight.grad).all()
 
 
+def test_bf16_autocast_without_fp32_attention() -> None:
+    """The configurable fast attention path supports a finite BF16 step."""
+    config = OpenVocabularyDepthFieldConfig(
+        spectrum_shape=(3, 8),
+        depth_bins=8,
+        max_candidates=3,
+        d_model=16,
+        n_blocks=1,
+        n_heads=2,
+        hybrid_dilations=(1,),
+        spectrum_patch_size=2,
+        spectrum_patch_stride=2,
+        spectrum_encoder_blocks=1,
+        spectrum_encoder_heads=2,
+        fp32_attention=False,
+    )
+    model = OpenVocabularyDepthFieldDFM(config, DiscreteFlowConfig())
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = model(
+            torch.rand(1, 3, 8),
+            torch.full((1, 8), model.mask_id),
+            torch.tensor([0.5]),
+            wavelengths_nm=torch.linspace(300, 700, 8).unsqueeze(0),
+            candidate_nk=torch.rand(1, 3, 8, 2),
+            candidate_mask=torch.tensor([[True, True, False]]),
+            incidence_angle_deg=torch.zeros(1),
+            polarization_id=torch.zeros(1, dtype=torch.long),
+        )
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, model.num_materials).float(), torch.zeros(8, dtype=torch.long)
+        )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(model.pointer_query.weight.grad).all()
+
+
 def test_local_gradient_diagnostic_precedes_reduction() -> None:
     """The hook names a rank-local bad parameter without modifying mean reduction."""
     model = torch.nn.Linear(2, 2)

@@ -7,11 +7,14 @@ from optollama.model.open_vocab_depth_field_dfm import DiscreteFlowConfig, OpenV
 from scripts.train_open_vocab_depth_field import compute_loss, run_epoch
 
 
-def tiny_flow_model() -> OpenVocabularyDepthFieldDFM:
+def tiny_flow_model(
+    flow_config: DiscreteFlowConfig | None = None, *, depth_patch_size: int = 1
+) -> OpenVocabularyDepthFieldDFM:
     """Build a CPU-sized Patch4/DFM model."""
     config = OpenVocabularyDepthFieldConfig(
         spectrum_shape=(3, 8),
         depth_bins=12,
+        depth_patch_size=depth_patch_size,
         max_candidates=3,
         d_model=16,
         n_blocks=2,
@@ -23,7 +26,7 @@ def tiny_flow_model() -> OpenVocabularyDepthFieldDFM:
         spectrum_encoder_blocks=1,
         spectrum_encoder_heads=2,
     )
-    return OpenVocabularyDepthFieldDFM(config, DiscreteFlowConfig())
+    return OpenVocabularyDepthFieldDFM(config, flow_config or DiscreteFlowConfig())
 
 
 def model_batch(batch_size: int = 2) -> dict[str, torch.Tensor]:
@@ -51,6 +54,94 @@ def test_source_uses_only_mask_void_and_valid_candidates() -> None:
     assert 0.75 < float((draws == model.mask_id).float().mean()) < 0.85
     assert 0.05 < float((draws == model.void_id).float().mean()) < 0.15
     assert bool((model.sample_source(mask, deterministic=True) == model.mask_id).all())
+
+
+def test_block_source_and_corruption_share_patch_aligned_blocks() -> None:
+    """Source labels and time switches stay coherent within each sampled block."""
+    flow = DiscreteFlowConfig(source_mode="block", block_min_bins=2, block_max_bins=4)
+    model = tiny_flow_model(flow)
+    candidates = model_batch()["candidate_mask"]
+    source, block_ids, block_count = model._sample_block_source(
+        candidates, generator=torch.Generator().manual_seed(7)
+    )
+    assert source.shape == block_ids.shape == (2, model.depth_bins)
+    assert int(block_ids.max()) < block_count
+    assert not bool((source == 2).any())
+    for row in range(2):
+        for block in block_ids[row].unique():
+            assert source[row, block_ids[row] == block].unique().numel() == 1
+
+    clean = model_batch()["clean_fields"]
+    with patch.object(model, "_sample_block_source", return_value=(source, block_ids, block_count)):
+        noisy, from_source = model.corrupt(
+            clean, torch.full((2,), 0.5), candidates, generator=torch.Generator().manual_seed(8)
+        )
+    for row in range(2):
+        for block in block_ids[row].unique():
+            selected = block_ids[row] == block
+            assert from_source[row, selected].unique().numel() == 1
+    torch.testing.assert_close(noisy, torch.where(from_source, source, clean))
+
+
+def test_block_partition_aligns_with_model_patches() -> None:
+    """Block boundaries respect the model patch grid and the quadratic path."""
+    flow = DiscreteFlowConfig(source_mode="block", block_min_bins=4, block_max_bins=8)
+    model = tiny_flow_model(flow, depth_patch_size=4)
+    candidates = model_batch(batch_size=128)["candidate_mask"]
+    source, block_ids, _ = model._sample_block_source(
+        candidates, generator=torch.Generator().manual_seed(11)
+    )
+    for start in range(0, model.depth_bins, model.depth_patch_size):
+        assert bool((block_ids[:, start : start + model.depth_patch_size] == block_ids[:, start : start + 1]).all())
+    assert 0.73 < float((source == model.mask_id).float().mean()) < 0.87
+    clean = model_batch(batch_size=128)["clean_fields"]
+    _, from_source = model.corrupt(
+        clean, torch.full((128,), 0.5), candidates, generator=torch.Generator().manual_seed(12)
+    )
+    assert 0.18 < float(from_source.float().mean()) < 0.32
+
+
+def test_block_sampler_redraws_entire_blocks() -> None:
+    """Inference revises complete blocks rather than isolated depth bins."""
+    flow = DiscreteFlowConfig(source_mode="block", block_min_bins=4, block_max_bins=4)
+    model = tiny_flow_model(flow).eval()
+    batch = model_batch(batch_size=1)
+    block_ids = torch.arange(model.depth_bins).div(4, rounding_mode="floor").unsqueeze(0)
+    source = torch.tensor([[model.mask_id] * 4 + [model.void_id] * 4 + [0] * 4])
+
+    def predict(*args: object, **kwargs: object) -> torch.Tensor:
+        logits = torch.full((1, model.depth_bins, model.num_materials), -100.0)
+        logits[..., 1] = 100.0
+        return logits
+
+    traced: list[torch.Tensor] = []
+    with patch.object(model, "_sample_block_source", return_value=(source, block_ids, 3)), patch.object(
+        model, "forward", side_effect=predict
+    ):
+        result = model.sample(
+            spectra=batch["target_spectrum"].transpose(1, 2),
+            wavelengths_nm=batch["wavelengths_nm"],
+            candidate_nk=batch["candidate_nk"],
+            candidate_mask=batch["candidate_mask"],
+            incidence_angle_deg=batch["incidence_angle_deg"],
+            polarization_id=batch["polarization_id"],
+            steps=3,
+            generator=torch.Generator().manual_seed(4),
+            trace_step=lambda _step, _time, _endpoint, state: traced.append(state),
+        )
+    for state in traced:
+        for block in range(3):
+            assert state[0, block_ids[0] == block].unique().numel() == 1
+    assert bool((result == 1).all())
+
+
+def test_legacy_flow_config_defaults_to_iid() -> None:
+    """Old checkpoint metadata still resolves to the original IID process."""
+    saved = {"source_mask_prob": 0.7, "source_void_prob": 0.2, "source_material_prob": 0.1}
+    flow = DiscreteFlowConfig.from_dict(saved)
+    assert flow.source_mode == "iid"
+    assert flow.source_mask_prob == 0.7
+    assert DiscreteFlowConfig.from_dict(flow.to_dict()) == flow
 
 
 def test_flow_path_endpoints_and_gradients() -> None:
