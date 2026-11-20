@@ -21,18 +21,32 @@ class DiscreteFlowConfig:
     source_mode: str = "iid"
     block_min_bins: int = 8
     block_max_bins: int = 64
+    block_ranges: tuple[tuple[int, int], ...] = ()
+    block_scale_probs: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
-        """Require a full-support probability distribution."""
+        """Validate the source and optional block-scale distributions."""
         probabilities = (self.source_mask_prob, self.source_void_prob, self.source_material_prob)
-        if not all(math.isfinite(value) and value > 0 for value in probabilities):
-            raise ValueError("All discrete-flow source probabilities must be positive and finite.")
+        if not all(math.isfinite(value) and value >= 0 for value in probabilities):
+            raise ValueError("All discrete-flow source probabilities must be nonnegative and finite.")
         if not math.isclose(sum(probabilities), 1.0, abs_tol=1.0e-6):
             raise ValueError("Discrete-flow source probabilities must sum to one.")
         if self.source_mode not in {"iid", "block"}:
             raise ValueError("Discrete-flow source_mode must be 'iid' or 'block'.")
         if self.block_min_bins <= 0 or self.block_max_bins < self.block_min_bins:
             raise ValueError("Discrete-flow block sizes must be positive and ordered.")
+        if self.block_ranges or self.block_scale_probs:
+            if self.source_mode != "block" or not self.block_ranges or len(self.block_ranges) != len(self.block_scale_probs):
+                raise ValueError("Block ranges and matching scale probabilities require SOURCE_MODE: block.")
+            if any(
+                len(bounds) != 2 or any(type(size) is not int for size in bounds) or not 0 < bounds[0] <= bounds[1]
+                for bounds in self.block_ranges
+            ):
+                raise ValueError("Each discrete-flow block range must be an ordered pair of positive integers.")
+            if not all(math.isfinite(value) and value >= 0 for value in self.block_scale_probs) or not math.isclose(
+                sum(self.block_scale_probs), 1.0, abs_tol=1.0e-6
+            ):
+                raise ValueError("Block scale probabilities must be finite, nonnegative, and sum to one.")
 
     @classmethod
     def from_dict(cls, value: dict | None) -> DiscreteFlowConfig:
@@ -49,11 +63,17 @@ class DiscreteFlowConfig:
             source_mode=str(get("SOURCE_MODE", "iid")).lower(),
             block_min_bins=int(get("BLOCK_MIN_BINS", 8)),
             block_max_bins=int(get("BLOCK_MAX_BINS", 64)),
+            block_ranges=tuple(tuple(bounds) for bounds in get("BLOCK_RANGES", ())),
+            block_scale_probs=tuple(float(prob) for prob in get("BLOCK_SCALE_PROBS", ())),
         )
 
-    def to_dict(self) -> dict[str, float | int | str]:
+    def to_dict(self) -> dict[str, float | int | str | tuple]:
         """Serialize the source distribution into checkpoint metadata."""
-        return asdict(self)
+        metadata = asdict(self)
+        if not self.block_ranges:
+            del metadata["block_ranges"]
+            del metadata["block_scale_probs"]
+        return metadata
 
 
 class OpenVocabularyDepthFieldDFM(OpenVocabularyDepthFieldDiffusion):
@@ -62,11 +82,25 @@ class OpenVocabularyDepthFieldDFM(OpenVocabularyDepthFieldDiffusion):
     def __init__(self, config: OpenVocabularyDepthFieldConfig, flow_config: DiscreteFlowConfig):
         super().__init__(config)
         self.flow_config = flow_config
+        self.mask_only_source = (
+            flow_config.source_mask_prob, flow_config.source_void_prob, flow_config.source_material_prob
+        ) == (1.0, 0.0, 0.0)
         if flow_config.source_mode == "block":
-            if flow_config.block_max_bins > self.depth_bins or any(
-                size % self.depth_patch_size for size in (flow_config.block_min_bins, flow_config.block_max_bins)
+            ranges = flow_config.block_ranges or ((flow_config.block_min_bins, flow_config.block_max_bins),)
+            if any(
+                size > self.depth_bins or size % self.depth_patch_size for bounds in ranges for size in bounds
             ):
                 raise ValueError("Block sizes must fit the field and be multiples of the depth patch size.")
+            if flow_config.block_ranges:
+                self.register_buffer(
+                    "_block_ranges_patches", torch.tensor(ranges, dtype=torch.long) // self.depth_patch_size, persistent=False
+                )
+                self.register_buffer("_block_scale_probs", torch.tensor(flow_config.block_scale_probs), persistent=False)
+                modal_scale = max(range(len(ranges)), key=flow_config.block_scale_probs.__getitem__)
+                self._modal_block_min_patches = ranges[modal_scale][0] // self.depth_patch_size
+                min_width = min(lo for (lo, _), prob in zip(ranges, flow_config.block_scale_probs, strict=True) if prob > 0)
+                # Reserve space for partial blocks at both field edges, without a device-to-host reduction.
+                self._multiscale_block_count = (self.depth_bins + min_width - 2 * self.depth_patch_size) // min_width + 1
 
     def _sample_block_source(
         self,
@@ -85,7 +119,15 @@ class OpenVocabularyDepthFieldDFM(OpenVocabularyDepthFieldDiffusion):
         min_patches = self.flow_config.block_min_bins // patch_size
         max_patches = self.flow_config.block_max_bins // patch_size
         device = candidate_mask.device
-        if deterministic:
+        if self.flow_config.block_ranges and not deterministic:
+            scales = torch.multinomial(self._block_scale_probs, batch_size, replacement=True, generator=generator)
+            bounds = self._block_ranges_patches[scales]
+            low, high = bounds[:, :1], bounds[:, 1:]
+            block_width = low + (torch.rand(low.shape, device=device, generator=generator) * (high - low + 1)).long()
+            offset = (torch.rand(low.shape, device=device, generator=generator) * block_width).long()
+        elif deterministic:
+            if self.flow_config.block_ranges:
+                min_patches = self._modal_block_min_patches
             block_width = torch.full((batch_size, 1), min_patches, device=device, dtype=torch.long)
             offset = torch.zeros_like(block_width)
         else:
@@ -95,7 +137,12 @@ class OpenVocabularyDepthFieldDFM(OpenVocabularyDepthFieldDiffusion):
             offset = (torch.rand((batch_size, 1), device=device, generator=generator) * block_width).long()
         patch_positions = torch.arange(self.depth_bins, device=device).div(patch_size, rounding_mode="floor")
         block_ids = (patch_positions[None, :] + offset).div(block_width, rounding_mode="floor")
-        block_count = self.depth_bins // self.flow_config.block_min_bins + 1
+        block_count = (
+            self._multiscale_block_count if self.flow_config.block_ranges
+            else self.depth_bins // self.flow_config.block_min_bins + 1
+        )
+        if self.mask_only_source:
+            return torch.full_like(block_ids, self.mask_id), block_ids, block_count
         if deterministic:
             material_probability = self.flow_config.source_material_prob / candidate_mask.sum(dim=1)
             best_material = candidate_mask.long().argmax(dim=1)
@@ -142,6 +189,8 @@ class OpenVocabularyDepthFieldDFM(OpenVocabularyDepthFieldDiffusion):
             )
             return source
         batch_size = candidate_mask.shape[0]
+        if self.mask_only_source:
+            return torch.full((batch_size, self.depth_bins), self.mask_id, device=candidate_mask.device, dtype=torch.long)
         if deterministic:
             material_probability = self.flow_config.source_material_prob / candidate_mask.sum(dim=1)
             best_material = candidate_mask.long().argmax(dim=1)

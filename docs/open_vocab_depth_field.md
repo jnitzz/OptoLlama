@@ -36,6 +36,19 @@ python scripts/train_open_vocab_depth_field.py \
 
 The full checkpoint stores raw and EMA states. Inference uses EMA by default; pass `--weights raw` for comparison.
 
+### Multiscale DFM experiment
+
+Start a fresh full-data run with `--config configs/depth_field_open_vocab_dfm_multiscale_07.yaml` and no `--resume`.
+The output is separate from run 06. Under `OPEN_VOCAB_DEPTH_FIELD.DENOISING.FLOW`, `BLOCK_RANGES` defines
+inclusive bin-width ranges, and `BLOCK_SCALE_PROBS` gives one probability per range. Each example independently
+chooses a range, a uniform patch-aligned width in that range, and a patch-aligned offset. The field-edge blocks can
+be shorter than the chosen width. If the mixture keys are omitted, the original `BLOCK_MIN_BINS` / `BLOCK_MAX_BINS`
+sampler is used.
+
+Run 07 begins with an all-MASK source. Training uses one partition for the source-versus-clean switch at `t^2`;
+inference draws a partition once per candidate and reuses it at every step. Deterministic inference uses the minimum
+width of the most probable scale and a zero offset. The clean-field loss and flow schedule are unchanged.
+
 ## Conditions and new materials
 
 The current data configuration supplies `0` degrees and `s` polarization to every sample. The model interface accepts per-sample angle and polarization tensors, so future datasets can vary them without an architecture change. At normal incidence the optical condition is exactly zero and `s`/`p` are intentionally identical.
