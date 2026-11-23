@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenVocabularyDepthFieldDiffusion:
+def unwrap_model(model: torch.nn.Module) -> optollama.model.OpenVocabularyDepthFieldDiffusion | optollama.model.OpenLayerJointDFM:
     """Return the underlying model when DDP and/or torch.compile are active."""
     core = model
     while True:
@@ -208,7 +208,8 @@ def make_collator(
     *,
     train: bool,
     seed: int,
-) -> optollama.data.OpenVocabularyDepthFieldCollator:
+    joint: bool = False,
+) -> optollama.data.OpenLayerBatchCollator:
     """Build a full-grid or coordinate-query training/validation collator."""
     bank = nested(block, "MATERIAL_BANK", default={}) or {}
     grid = nested(block, "GRID", default={}) or {}
@@ -218,7 +219,13 @@ def make_collator(
     coordinate_query = bool(query.get("ENABLED", False))
     query_points = int(query.get("POINTS", len(wavelengths))) if coordinate_query else len(wavelengths)
     query_mode = str(query.get("TRAIN_MODE" if train else "VAL_MODE", "mixed" if train else "full"))
-    return optollama.data.OpenVocabularyDepthFieldCollator(
+    collator_type = optollama.data.OpenLayerJointDFMCollator if joint else optollama.data.OpenVocabularyDepthFieldCollator
+    geometry = (
+        {"min_layer_nm": float(nested(block, "THICKNESS", "MIN_NM", default=1.0)),
+         "max_total_nm": float(nested(block, "THICKNESS", "MAX_TOTAL_NM", default=10_000.0))}
+        if joint else {"dz_nm": float(grid.get("DZ_NM", 5.0)), "max_total_nm": float(grid.get("MAX_THICKNESS_NM", 10_000.0))}
+    )
+    return collator_type(
         wavelengths_nm=wavelengths,
         catalog=catalog,
         idx_to_token=idx_to_token,
@@ -242,13 +249,11 @@ def make_collator(
         ),
         full_bank_probability=float(bank.get("FULL_BANK_PROBABILITY", 0.0)) if train else 0.0,
         holdout_materials=bank.get("HOLDOUT_MATERIALS", []) if train else (),
-        merge_adjacent=True,
         coverage_tolerance_nm=float(bank.get("MATERIAL_COVERAGE_TOLERANCE_NM", 100.0)),
         seed=seed,
-        dz_nm=float(grid.get("DZ_NM", 5.0)),
-        max_total_nm=float(grid.get("MAX_THICKNESS_NM", 10_000.0)),
         incidence_angle_deg=float(optical.get("ANGLE_DEG", 0.0)),
         polarization=str(optical.get("POLARIZATION", "s")),
+        **geometry,
     )
 
 
@@ -260,6 +265,44 @@ def select_valid_rows(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]
     return {key: value[valid] for key, value in batch.items()}
 
 
+def compute_joint_loss(
+    model: torch.nn.Module, core: optollama.model.OpenLayerJointDFM, batch: dict[str, torch.Tensor], train_cfg: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Train count, unweighted categorical endpoints, and velocity on one noised state."""
+    clean = batch["material_targets"]
+    mask = batch["layer_mask"]
+    s = torch.rand(clean.shape[0], device=clean.device)
+    material, thickness, target_velocity, corrupted = core.training_state(batch, s)
+    output = model(
+        material_ids=material, thickness_state=thickness, layer_mask=mask, flow_time=s,
+        spectra=batch["target_spectrum"].transpose(1, 2), wavelengths_nm=batch["wavelengths_nm"],
+        candidate_nk=batch["candidate_nk"], candidate_mask=batch["candidate_mask"],
+        incidence_angle_deg=batch["incidence_angle_deg"], polarization_id=batch["polarization_id"],
+    )
+    logits = output["material_logits"].float()
+    material_loss = functional.cross_entropy(logits.flatten(0, 1), clean.flatten(), reduction="sum") / mask.sum().clamp_min(1)
+    active_state = core.state_mask(mask)
+    squared = (output["thickness_velocity"].float() - target_velocity).square()
+    thickness_loss = squared.masked_fill(~active_state, 0).sum() / active_state.sum().clamp_min(1)
+    target_counts = mask.sum(dim=1)
+    count_loss = functional.cross_entropy(output["count_logits"].float(), target_counts)
+    correct = logits.argmax(dim=-1) == clean
+    return {
+        "loss": material_loss + float(train_cfg.get("THICKNESS_LOSS_WEIGHT", 1.0)) * thickness_loss +
+        float(train_cfg.get("COUNT_LOSS_WEIGHT", 1.0)) * count_loss,
+        "material_loss": material_loss, "thickness_loss": thickness_loss, "count_loss": count_loss,
+        "count_accuracy": (output["count_logits"].argmax(dim=-1) == target_counts).float().mean(),
+        "accuracy": (correct & mask).sum() / mask.sum().clamp_min(1),
+        "corrupted_accuracy": (correct & corrupted).sum() / corrupted.sum().clamp_min(1),
+        "noise_probability": (1 - s).square().mean(),
+        "corrupted_fraction": corrupted.sum() / mask.sum().clamp_min(1),
+        "condition_dropped": logits.new_zeros(()),
+        "diagnostic_timesteps": s.detach(),
+        "diagnostic_noised": material.detach(),
+        "diagnostic_logits": logits.detach(),
+    }
+
+
 def compute_loss(
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
@@ -268,6 +311,8 @@ def compute_loss(
 ) -> dict[str, torch.Tensor]:
     """Compute continuous-time denoising loss through the DDP wrapper."""
     core = unwrap_model(model)
+    if isinstance(core, optollama.model.OpenLayerJointDFM):
+        return compute_joint_loss(model, core, batch, train_cfg)
     clean = batch["clean_fields"].long()
     timesteps = torch.rand(clean.shape[0], device=clean.device)
     noised, corrupted = core.corrupt(
@@ -391,7 +436,10 @@ def run_epoch(
     """Train or validate one epoch and aggregate metrics over all ranks."""
     training = optimizer is not None
     model.train(training)
+    joint = isinstance(unwrap_model(model), optollama.model.OpenLayerJointDFM)
     keys = ("loss", "accuracy", "corrupted_accuracy", "noise_probability", "corrupted_fraction", "condition_dropped")
+    if joint:
+        keys += ("material_loss", "thickness_loss", "count_loss", "count_accuracy")
     totals = torch.zeros(len(keys) + 1, dtype=torch.float64, device=device)
     flow_totals = (
         torch.zeros((8, 3), dtype=torch.float64, device=device)
@@ -426,7 +474,7 @@ def run_epoch(
     show = not optollama.utils.is_ddp() or torch.distributed.get_rank() == 0
     progress = tqdm.tqdm(
         loader,
-        desc=f"Epoch {epoch + 1}/{epochs} open-vocab depth {'train' if training else 'val'}",
+        desc=f"Epoch {epoch + 1}/{epochs} {'joint layer DFM' if joint else 'open-vocab depth'} {'train' if training else 'val'}",
         disable=not show,
         miniters=log_every_steps,
         mininterval=5.0,
@@ -438,11 +486,11 @@ def run_epoch(
             break
         if training and resume_state is not None and step == start_batch:
             restore_rank_state(resume_state["rng"])
-        selected = select_valid_rows(raw)
+        selected = raw if joint else select_valid_rows(raw)
         if selected is None:
             continue
         batch = {key: value.to(device, non_blocking=True) for key, value in selected.items()}
-        rows = int(batch["clean_fields"].shape[0])
+        rows = int(batch["material_targets" if joint else "clean_fields"].shape[0])
         if training:
             assert optimizer is not None
             lr = scheduled_learning_rate(base_lr, lr_schedule, global_samples_seen + local_rows * world)
@@ -495,8 +543,11 @@ def run_epoch(
                         core = unwrap_model(model)
                         valid_logits = None
                         if logits is not None:
-                            valid_materials = batch["candidate_mask"][:, None, :].expand_as(logits[..., :-1])
-                            valid_logits = torch.cat((logits[..., :-1][valid_materials], logits[..., -1].reshape(-1)))
+                            if joint:
+                                valid_logits = logits[batch["layer_mask"][:, :, None] & batch["candidate_mask"][:, None, :]]
+                            else:
+                                valid_materials = batch["candidate_mask"][:, None, :].expand_as(logits[..., :-1])
+                                valid_logits = torch.cat((logits[..., :-1][valid_materials], logits[..., -1].reshape(-1)))
                         record = {
                             "epoch": epoch + 1,
                             "batch_index": step,
@@ -509,9 +560,9 @@ def run_epoch(
                             "candidate_counts": batch["candidate_mask"].sum(dim=1).tolist(),
                             "timestep_min_mean_max": [float(value) for value in (t.min(), t.mean(), t.max())] if t is not None else None,
                             "input_mask_fraction": float((noised == core.mask_id).float().mean()) if noised is not None else None,
-                            "input_void_fraction": float((noised == core.void_id).float().mean()) if noised is not None else None,
+                            "input_void_fraction": float((noised == core.void_id).float().mean()) if noised is not None and not joint else None,
                             "valid_logits_finite": bool(torch.isfinite(valid_logits).all()) if valid_logits is not None else None,
-                            "valid_logit_abs_max": float(valid_logits.abs().max()) if valid_logits is not None and bool(torch.isfinite(valid_logits).all()) else None,
+                            "valid_logit_abs_max": float(valid_logits.abs().max()) if valid_logits is not None and valid_logits.numel() and bool(torch.isfinite(valid_logits).all()) else None,
                         }
                         optollama.utils.save_as_json(str(diagnostic_dir / f"epoch_{epoch + 1:04d}_batch_{step:06d}_rank_{rank}.json"), record)
                 optimizer.zero_grad(set_to_none=True)
@@ -559,6 +610,7 @@ def run_epoch(
                 acc=f"{100 * running['accuracy']:.1f}%",
                 corr=f"{100 * running['corrupted_accuracy']:.1f}%",
                 refresh=False,
+                **({key: f"{running[key]:.4f}" for key in ("material_loss", "thickness_loss", "count_loss")} if joint else {}),
             )
         if (
             training
@@ -623,6 +675,13 @@ def run_epoch(
     return metrics
 
 
+def joint_metric_suffix(metrics: dict[str, float], enabled: bool) -> str:
+    """Report the three joint losses without changing legacy log formats."""
+    return "" if not enabled else ", " + ", ".join(
+        f"{key}={metrics[key]:.5f}" for key in ("material_loss", "thickness_loss", "count_loss", "count_accuracy")
+    )
+
+
 def main() -> None:
     """Train and checkpoint an open-vocabulary depth-field model."""
     args = parse_args()
@@ -630,7 +689,11 @@ def main() -> None:
     cfg["WAVELENGTHS"] = torch.arange(
         int(cfg["WAVELENGTH_MIN"]), int(cfg["WAVELENGTH_MAX"]) + 1, int(cfg["WAVELENGTH_STEPS"]), dtype=torch.float32
     )
-    block = cfg.get("OPEN_VOCAB_DEPTH_FIELD") or {}
+    joint = "OPEN_LAYER_DFM_JOINT" in cfg
+    block = cfg.get("OPEN_LAYER_DFM_JOINT" if joint else "OPEN_VOCAB_DEPTH_FIELD") or {}
+    checkpoint_prefix = "open-layer-dfm-joint" if joint else "open-vocab-depth"
+    model_metadata_key = "open_layer_dfm_joint_config" if joint else "open_vocab_depth_field_config"
+    label = "Joint layer DFM" if joint else "Open-vocab depth"
     train_cfg = nested(block, "TRAIN", default={}) or {}
     if args.batch_size is not None:
         cfg["TRAIN_BATCH_SIZE"] = args.batch_size
@@ -645,7 +708,7 @@ def main() -> None:
     if device.type == "cuda":
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("highest" if joint and nested(block, "MODEL", "FP32_ATTENTION", default=True) else "high")
     tokens, token_to_idx, idx_to_token, _, _, _, eos_idx, pad_idx, msk_idx = optollama.data.init_tokens(cfg["TOKENS_PATH"])
     material_names = optollama.data.material_names_from_tokens(tokens)
     catalog = optollama.data.load_material_catalog(cfg["MATERIALS_PATH"], material_names)
@@ -653,10 +716,12 @@ def main() -> None:
     if len(catalog.names) > max_candidates and not bool(nested(block, "MATERIAL_BANK", "RANDOM_DISTRACTORS", default=True)):
         raise ValueError("The complete catalog exceeds MAX_CANDIDATES.")
     train_collator = make_collator(
-        cfg, block, catalog, idx_to_token, eos_idx, pad_idx, msk_idx, train=True, seed=int(cfg.get("SEED", 0)) + rank * 17
+        cfg, block, catalog, idx_to_token, eos_idx, pad_idx, msk_idx, train=True,
+        seed=int(cfg.get("SEED", 0)) + rank * 17, joint=joint,
     )
     val_collator = make_collator(
-        cfg, block, catalog, idx_to_token, eos_idx, pad_idx, msk_idx, train=False, seed=int(cfg.get("SEED", 0)) + 10_000 + rank * 17
+        cfg, block, catalog, idx_to_token, eos_idx, pad_idx, msk_idx, train=False,
+        seed=int(cfg.get("SEED", 0)) + 10_000 + rank * 17, joint=joint,
     )
     train_n = int(args.max_train_samples or (world * 2 if args.smoke_test else cfg["NUM_SAMPLES_TRAIN"]))
     val_n = int(args.max_val_samples or (world if args.smoke_test else cfg["NUM_SAMPLES_TEST"]))
@@ -664,6 +729,11 @@ def main() -> None:
         cfg, split="train", collator=train_collator, subset_n=train_n, rank=rank, world_size=world
     )
     _, val_loader = make_loader(cfg, split="test", collator=val_collator, subset_n=val_n, rank=rank, world_size=world)
+    if joint:
+        if len(train_loader) * int(cfg["TRAIN_BATCH_SIZE"]) * world != train_n:
+            raise ValueError("Joint DFM requires all requested training rows and a sample count divisible by the global batch size.")
+        if len(val_loader.dataset) * world != val_n:
+            raise ValueError("Joint DFM requires all requested validation rows, evenly partitioned across ranks.")
     if int(train_cfg.get("CHECKPOINT_EVERY_STEPS", 0)) and not hasattr(train_dataset, "set_resume_batch"):
         raise ValueError("Mid-epoch checkpoints require DATA_LOADING.SHARDED_LOADING: true.")
 
@@ -673,26 +743,30 @@ def main() -> None:
         if query_cfg.get("ENABLED", False)
         else len(cfg["WAVELENGTHS"])
     )
-    model_config = model_config_from_mapping(block, (3, query_points))
-    if model_config.query_spectrum != bool(query_cfg.get("ENABLED", False)):
-        raise ValueError("MODEL.QUERY_SPECTRUM and QUERY.ENABLED must agree.")
-    if args.smoke_test:
-        model_config = replace(
-            model_config,
-            d_model=32,
-            n_blocks=2,
-            n_heads=4,
-            ffn_multiplier=2.0,
-            kernel_size=3,
-            hybrid_dilations=(1, 2),
-            spectrum_encoder_blocks=1,
-            spectrum_encoder_heads=4,
-        )
-    process = str(nested(block, "DENOISING", "PROCESS", default="remask"))
-    if process not in {"remask", "discrete_flow"}:
-        raise ValueError(f"Unknown open-vocabulary depth process: {process}")
     flow_config = None
-    if process == "discrete_flow":
+    if joint:
+        model_config = optollama.model.OpenLayerJointDFMConfig.from_mapping(block)
+        if args.smoke_test:
+            model_config = replace(model_config, d_model=32, n_blocks=2, n_heads=4, ffn_multiplier=2.0, query_encoder_blocks=1)
+        for key in ("COUNT_LOSS_WEIGHT", "THICKNESS_LOSS_WEIGHT"):
+            value = float(train_cfg.get(key, 1.0))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{key} must be finite and positive.")
+        process = "joint_layer_dfm"
+        raw_model = optollama.model.OpenLayerJointDFM(model_config).to(device)
+    else:
+        model_config = model_config_from_mapping(block, (3, query_points))
+        if model_config.query_spectrum != bool(query_cfg.get("ENABLED", False)):
+            raise ValueError("MODEL.QUERY_SPECTRUM and QUERY.ENABLED must agree.")
+        if args.smoke_test:
+            model_config = replace(
+                model_config, d_model=32, n_blocks=2, n_heads=4, ffn_multiplier=2.0, kernel_size=3,
+                hybrid_dilations=(1, 2), spectrum_encoder_blocks=1, spectrum_encoder_heads=4,
+            )
+        process = str(nested(block, "DENOISING", "PROCESS", default="remask"))
+        if process not in {"remask", "discrete_flow"}:
+            raise ValueError(f"Unknown open-vocabulary depth process: {process}")
+    if not joint and process == "discrete_flow":
         flow_config = optollama.model.DiscreteFlowConfig.from_dict(nested(block, "DENOISING", "FLOW", default={}))
         if float(train_cfg.get("RANDOM_REPLACE_PROB", 0.0)) != 0.0:
             raise ValueError("DFM requires TRAIN.RANDOM_REPLACE_PROB: 0.")
@@ -703,7 +777,7 @@ def main() -> None:
         ):
             raise ValueError("DFM clean-field posterior training requires unweighted cross-entropy.")
         raw_model = optollama.model.OpenVocabularyDepthFieldDFM(model_config, flow_config).to(device)
-    else:
+    elif not joint:
         raw_model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device)
     base_lr = float(train_cfg.get("LEARNING_RATE", 5.0e-5))
     optimizer_cfg = train_cfg.get("OPTIMIZER") or {}
@@ -742,6 +816,8 @@ def main() -> None:
         )
         start_epoch = int(loaded_epoch or 0)
         checkpoint_extra = blob.get("extra") or {}
+        if joint and (checkpoint_extra.get(model_metadata_key) != model_config.to_dict() or "optimizer_state" not in blob):
+            raise ValueError("Joint DFM resume requires a full checkpoint with the same joint architecture.")
         saved_process = checkpoint_extra.get("denoising_process", "remask")
         saved_flow = checkpoint_extra.get("discrete_flow_config")
         if saved_process != process or (
@@ -821,11 +897,14 @@ def main() -> None:
         diagnostic_dir.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         print(
-            f"Open-vocab depth model: parameters={sum(p.numel() for p in model.parameters()):,}, world={world}, batch/rank={cfg['TRAIN_BATCH_SIZE']}"
+            f"{label} model: parameters={sum(p.numel() for p in model.parameters()):,}, world={world}, batch/rank={cfg['TRAIN_BATCH_SIZE']}"
         )
-        print(
-            f"Continuous time: t~Uniform(0,1), noise_probability=t^2; validation sampling steps={nested(block, 'EVAL', 'SAMPLING_STEPS', default=64)}"
-        )
+        if joint:
+            print(f"Continuous time: s~Uniform(0,1), mask probability=(1-s)^2, linear thickness flow; held-out loss rows={val_n:,}")
+        else:
+            print(
+                f"Continuous time: t~Uniform(0,1), noise_probability=t^2; validation sampling steps={nested(block, 'EVAL', 'SAMPLING_STEPS', default=64)}"
+            )
         print(f"Denoising process: {process}" + (f", source={flow_config.to_dict()}" if flow_config else ""))
         print(
             f"Optical condition: angle={nested(block, 'OPTICAL_CONDITION', 'ANGLE_DEG', default=0.0)}deg, polarization={nested(block, 'OPTICAL_CONDITION', 'POLARIZATION', default='s')}"
@@ -851,7 +930,7 @@ def main() -> None:
 
         def checkpoint_metadata(optimizer_step: int, cursor: dict[str, Any] | None = None) -> dict[str, Any]:
             return {
-                "open_vocab_depth_field_config": model_config.to_dict(),
+                model_metadata_key: model_config.to_dict(),
                 "denoising_process": process,
                 "discrete_flow_config": flow_config.to_dict() if flow_config is not None else None,
                 "material_names": list(catalog.names),
@@ -886,14 +965,14 @@ def main() -> None:
             if rank == 0:
                 try:
                     optollama.utils.save_checkpoint(
-                        str(output_dir / "open-vocab-depth-progress.pt"),
+                        str(output_dir / f"{checkpoint_prefix}-progress.pt"),
                         model=raw_model,
                         optimizer=optimizer,
                         scaler=scaler,
                         epoch=epoch,
                         extra=checkpoint_metadata(step, cursor),
                     )
-                    print(f"Saved resumable open-vocab depth checkpoint at step {step:,}, batch {next_batch:,}.")
+                    print(f"Saved resumable {label.lower()} checkpoint at step {step:,}, batch {next_batch:,}.")
                 except Exception as exc:
                     save_error = f"{type(exc).__name__}: {exc}"
             errors = [save_error]
@@ -935,11 +1014,11 @@ def main() -> None:
             step_evaluations.append(record)
             if rank == 0:
                 optollama.utils.save_as_json(
-                    str(output_dir / "open-vocab-depth-step-evaluations.json"), step_evaluations
+                    str(output_dir / f"{checkpoint_prefix}-step-evaluations.json"), step_evaluations
                 )
                 print(
-                    f"Open-vocab depth step {step:,}: val_loss={interval_val['loss']:.6f}, "
-                    f"val_acc={100 * interval_val['accuracy']:.2f}%"
+                    f"{label} step {step:,}: val_loss={interval_val['loss']:.6f}, "
+                    f"val_acc={100 * interval_val['accuracy']:.2f}%" + joint_metric_suffix(interval_val, joint)
                 )
 
         train = run_epoch(
@@ -1000,7 +1079,7 @@ def main() -> None:
         if rank == 0:
             extra = checkpoint_metadata(global_steps)
             optollama.utils.save_checkpoint(
-                str(output_dir / "open-vocab-depth-last.pt"),
+                str(output_dir / f"{checkpoint_prefix}-last.pt"),
                 model=raw_model,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -1010,16 +1089,17 @@ def main() -> None:
             if val["loss"] < best:
                 best = val["loss"]
                 optollama.utils.save_checkpoint(
-                    str(output_dir / "open-vocab-depth-best.pt"),
+                    str(output_dir / f"{checkpoint_prefix}-best.pt"),
                     model=raw_model,
                     optimizer=optimizer,
                     scaler=scaler,
                     epoch=epoch,
                     extra=extra,
                 )
-            optollama.utils.save_as_json(str(output_dir / "open-vocab-depth-history.json"), history)
+            optollama.utils.save_as_json(str(output_dir / f"{checkpoint_prefix}-history.json"), history)
             print(
-                f"Open-vocab depth epoch {epoch + 1}: val_loss={val['loss']:.6f}, val_acc={100 * val['accuracy']:.2f}%, best={best:.6f}"
+                f"{label} epoch {epoch + 1}: val_loss={val['loss']:.6f}, val_acc={100 * val['accuracy']:.2f}%, best={best:.6f}"
+                + joint_metric_suffix(val, joint)
             )
     if optollama.utils.is_ddp():
         torch.distributed.barrier()

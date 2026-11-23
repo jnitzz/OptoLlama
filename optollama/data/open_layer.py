@@ -453,6 +453,7 @@ class OpenLayerBatchCollator:
         coverage_tolerance_nm: float = 0.0,
         seed: int = 0,
         query_shape_seed: int | None = None,
+        supervise_empty: bool = False,
     ) -> None:
         self.wavelengths_nm = wavelengths_nm.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         self.catalog = catalog
@@ -490,6 +491,7 @@ class OpenLayerBatchCollator:
         self.seed = int(seed)
         self.query_shape_seed = None if query_shape_seed is None else int(query_shape_seed)
         self.calls = 0
+        self.supervise_empty = supervise_empty
         if self.max_layers <= 0 or self.max_candidates <= 0:
             raise ValueError("max_layers and max_candidates must be positive.")
         if len(self.catalog.names) > self.max_candidates:
@@ -607,7 +609,7 @@ class OpenLayerBatchCollator:
                 merge_adjacent=self.merge_adjacent,
             )
             physical_layer_count = len(global_materials)
-            if physical_layer_count == 0:
+            if physical_layer_count == 0 and not self.supervise_empty:
                 sample_mask[batch_idx] = False
             if any(material_id in self.holdout_indices for material_id in global_materials):
                 sample_mask[batch_idx] = False
@@ -619,7 +621,7 @@ class OpenLayerBatchCollator:
             candidates = self._candidate_indices(global_materials, generator)
             local_lookup = {int(global_id): local_id for local_id, global_id in enumerate(candidates.tolist())}
             local_materials = torch.tensor([local_lookup[value] for value in global_materials], dtype=torch.long)
-            active_layer_count = max(physical_layer_count, 1)
+            active_layer_count = physical_layer_count if self.supervise_empty else max(physical_layer_count, 1)
             candidate_count = len(candidates)
 
             selected_spectrum = (
@@ -653,6 +655,43 @@ class OpenLayerBatchCollator:
             "sample_indices": sample_indices,
             "sample_mask": sample_mask,
         }
+
+
+class OpenLayerJointDFMCollator(OpenLayerBatchCollator):
+    """Keep native layers and valid count-zero examples for joint DFM."""
+
+    def __init__(
+        self, *, min_layer_nm: float, max_total_nm: float, incidence_angle_deg: float = 0.0,
+        polarization: str = "s", include_source_spectrum: bool = False, **kwargs: Any,
+    ) -> None:
+        super().__init__(supervise_empty=True, merge_adjacent=False, **kwargs)
+        if self.holdout_indices:
+            raise ValueError("Joint layer DFM training does not filter material holdouts.")
+        self.min_layer_nm = float(min_layer_nm)
+        self.max_total_nm = float(max_total_nm)
+        self.incidence_angle_deg = float(incidence_angle_deg)
+        normalized = str(polarization).lower()
+        if normalized not in {"s", "p"}:
+            raise ValueError("polarization must be 's' or 'p'.")
+        self.polarization_id = int(normalized == "p")
+        self.include_source_spectrum = include_source_spectrum
+
+    def __call__(self, samples: Sequence[tuple[torch.Tensor, torch.Tensor, int]]) -> dict[str, torch.Tensor]:
+        """Assemble native lengths without rasterization and reject out-of-domain references."""
+        batch = super().__call__(samples)
+        batch.pop("thickness_targets")  # Joint flow uses the native thicknesses.
+        native = batch["thickness_nm"]
+        invalid = (batch["layer_mask"] & (~native.isfinite() | (native < self.min_layer_nm))).any(dim=1) | (
+            native.double().sum(dim=1) > self.max_total_nm + 1e-6
+        )
+        if bool(invalid.any()):
+            ids = batch["sample_indices"][invalid].tolist()
+            raise ValueError(f"Native thicknesses outside the joint DFM budget for samples {ids}.")
+        batch["incidence_angle_deg"] = torch.full((len(samples),), self.incidence_angle_deg, dtype=torch.float32)
+        batch["polarization_id"] = torch.full((len(samples),), self.polarization_id, dtype=torch.long)
+        if self.include_source_spectrum:
+            batch["source_spectrum_rat"] = torch.stack([spectrum.transpose(0, 1) for spectrum, _, _ in samples])
+        return batch
 
 
 class OpenVocabularyDepthFieldCollator(OpenLayerBatchCollator):
@@ -764,6 +803,8 @@ def layer_batch_to_runs(
     candidate_global_ids: torch.Tensor,
     catalog: MaterialCatalog,
     layer_mask: torch.Tensor,
+    *,
+    merge_adjacent: bool = True,
 ) -> list[list[dict[str, Any]]]:
     """Decode local material-pointer outputs into TMM-compatible material runs."""
     if material_ids.shape != thickness_nm.shape or material_ids.shape != layer_mask.shape:
@@ -782,7 +823,7 @@ def layer_batch_to_runs(
                 raise ValueError(f"Local candidate {local_id} is padding at row={row}.")
             material = catalog.names[global_id]
             value = float(thickness_nm[row, layer].item())
-            if runs and runs[-1]["material"] == material:
+            if merge_adjacent and runs and runs[-1]["material"] == material:
                 runs[-1]["thickness_nm"] += value
             else:
                 runs.append({"material": material, "thickness_nm": value})

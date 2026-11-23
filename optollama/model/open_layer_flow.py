@@ -11,6 +11,8 @@ from torch import nn
 
 from optollama.data.open_layer import ThicknessTransform
 
+from .depth_field_diffusion import attention_forward
+
 
 def _normalize_material_process(value: str | None) -> str:
     """Normalize material denoising process aliases."""
@@ -319,9 +321,10 @@ class SinusoidalTimeEmbedding(nn.Module):
 class TargetQueryEncoder(nn.Module):
     """Encode variable-grid target spectra into wavelength-aware memory tokens."""
 
-    def __init__(self, config: OpenLayerFlowConfig, coordinates: WavelengthFeatures) -> None:
+    def __init__(self, config: OpenLayerFlowConfig, coordinates: WavelengthFeatures, *, fp32_attention: bool = False) -> None:
         super().__init__()
         self.coordinates = coordinates
+        self.fp32_attention = fp32_attention
         self.input = nn.Sequential(
             nn.Linear(config.target_channels + coordinates.output_dim, config.d_model),
             nn.SiLU(),
@@ -356,7 +359,11 @@ class TargetQueryEncoder(nn.Module):
         x = self.input(torch.cat((target_spectrum.to(dtype=torch.float32), coordinates), dim=-1))
         padding_mask = ~query_mask.to(dtype=torch.bool)
         for block in self.blocks:
-            x = block(x, src_key_padding_mask=padding_mask)
+            if self.fp32_attention:
+                with torch.autocast(device_type=x.device.type, enabled=False):
+                    x = block(x.float(), src_key_padding_mask=padding_mask).to(dtype=x.dtype)
+            else:
+                x = block(x, src_key_padding_mask=padding_mask)
         return self.output_norm(x)
 
 
@@ -401,8 +408,9 @@ class MaterialCurveEncoder(nn.Module):
 class OpenLayerDecoderBlock(nn.Module):
     """Layer-token self-attention with separate target and material memories."""
 
-    def __init__(self, config: OpenLayerFlowConfig) -> None:
+    def __init__(self, config: OpenLayerFlowConfig, *, fp32_attention: bool = False) -> None:
         super().__init__()
+        self.fp32_attention = fp32_attention
         self.adaln_zero = bool(config.adaln_zero)
         self.adaln_shift_limit = config.adaln_shift_limit
         self.adaln_scale_limit = config.adaln_scale_limit
@@ -519,19 +527,20 @@ class OpenLayerDecoderBlock(nn.Module):
         shift, scale, self_gate = self._branch_modulation(components, "self")
 
         h = self._modulate(self.self_norm(x), shift, scale)
-        h, _ = self.self_attention(h, h, h, key_padding_mask=layer_padding_mask, need_weights=False)
+        h, _ = attention_forward(self.self_attention, h, h, h, fp32=self.fp32_attention, key_padding_mask=layer_padding_mask)
         if self_gate is not None:
             h = self_gate[:, None, :] * h
         x = x + self.dropout(h)
 
         shift, scale, target_gate = self._branch_modulation(components, "target")
         h = self._modulate(self.target_norm(x), shift, scale)
-        h, _ = self.target_attention(
+        h, _ = attention_forward(
+            self.target_attention,
             h,
             target_memory,
             target_memory,
             key_padding_mask=query_padding_mask,
-            need_weights=False,
+            fp32=self.fp32_attention,
         )
         if target_gate is not None:
             h = target_gate[:, None, :] * h
@@ -539,12 +548,13 @@ class OpenLayerDecoderBlock(nn.Module):
 
         shift, scale, material_gate = self._branch_modulation(components, "material")
         h = self._modulate(self.material_norm(x), shift, scale)
-        h, _ = self.material_attention(
+        h, _ = attention_forward(
+            self.material_attention,
             h,
             material_memory,
             material_memory,
             key_padding_mask=candidate_padding_mask,
-            need_weights=False,
+            fp32=self.fp32_attention,
         )
         if material_gate is not None:
             h = material_gate[:, None, :] * h

@@ -14,6 +14,7 @@ import optollama.data
 import optollama.evaluation.simulation
 import optollama.model
 import optollama.utils
+from scripts.inference_open_layer_flow import tmm_vocabulary_for_candidates
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--angle-deg", type=float, default=None)
     parser.add_argument("--polarization", choices=("s", "p"), default=None)
     parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument("--mc-samples", type=int, default=10)
+    parser.add_argument("--mc-samples", type=int, default=None)
     parser.add_argument("--mc-batch-size", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
@@ -186,14 +187,16 @@ def apply_fixed_candidate_bank(
     *,
     max_candidates: int,
     selected_global_ids: torch.Tensor | None = None,
+    joint: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Remap collated fields and conditions to one catalog-ordered material bank."""
     candidate_count = int(candidate_curves.shape[0])
     if candidate_count <= 0 or candidate_count > max_candidates:
         raise ValueError(f"Fixed candidate bank has {candidate_count} materials; supported maximum is {max_candidates}.")
-    old_fields = batch["clean_fields"].long()
+    field_key = "material_targets" if joint else "clean_fields"
+    old_fields = batch[field_key].long()
     old_global_ids = batch["candidate_global_ids"].long()
-    is_material = old_fields < max_candidates
+    is_material = batch["layer_mask"] if joint else old_fields < max_candidates
     old_local_ids = old_fields.clamp(min=0, max=max_candidates - 1)
     remapped = old_global_ids.gather(1, old_local_ids)
     if selected_global_ids is not None:
@@ -207,7 +210,7 @@ def apply_fixed_candidate_bank(
         remapped = lookup[remapped.clamp_min(0)]
     if bool((is_material & (remapped < 0)).any()):
         raise ValueError("A clean field points to padding in its collated candidate bank.")
-    remapped_fields = torch.where(is_material, remapped, torch.full_like(remapped, max_candidates))
+    remapped_fields = torch.where(is_material, remapped, torch.full_like(remapped, -100 if joint else max_candidates))
 
     batch_size = int(old_fields.shape[0])
     fixed_nk = candidate_curves.new_zeros((max_candidates, *candidate_curves.shape[1:]))
@@ -217,7 +220,7 @@ def apply_fixed_candidate_bank(
     fixed_ids = torch.full((max_candidates,), -1, dtype=torch.long)
     fixed_ids[:candidate_count] = torch.arange(candidate_count)
     updated = dict(batch)
-    updated["clean_fields"] = remapped_fields
+    updated[field_key] = remapped_fields
     updated["candidate_nk"] = fixed_nk.unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
     updated["candidate_mask"] = fixed_mask.unsqueeze(0).expand(batch_size, -1).clone()
     updated["candidate_global_ids"] = fixed_ids.unsqueeze(0).expand(batch_size, -1).clone()
@@ -289,6 +292,8 @@ def make_split_loader(
     eos_idx: int,
     pad_idx: int,
     msk_idx: int,
+    *,
+    joint: bool = False,
 ) -> tuple[torch.utils.data.DataLoader, int]:
     """Build a deterministic, single-process loader for held-out RAT evaluation."""
     if args.split is None:
@@ -316,7 +321,13 @@ def make_split_loader(
     query_points = int(query.get("POINTS", len(wavelengths))) if coordinate_query else len(wavelengths)
     query_bands = parse_query_bands(args.query_bands) if coordinate_query else ()
     query_mode = "custom" if query_bands else str(args.query_mode or "full")
-    collator = optollama.data.OpenVocabularyDepthFieldCollator(
+    collator_type = optollama.data.OpenLayerJointDFMCollator if joint else optollama.data.OpenVocabularyDepthFieldCollator
+    geometry = (
+        {"min_layer_nm": float(nested(block, "THICKNESS", "MIN_NM", default=1.0)),
+         "max_total_nm": float(nested(block, "THICKNESS", "MAX_TOTAL_NM", default=10_000.0))}
+        if joint else {"dz_nm": float(grid.get("DZ_NM", 5.0)), "max_total_nm": float(grid.get("MAX_THICKNESS_NM", 10_000.0))}
+    )
+    collator = collator_type(
         wavelengths_nm=wavelengths,
         catalog=catalog,
         idx_to_token=idx_to_token,
@@ -335,14 +346,12 @@ def make_split_loader(
         randomize_candidates=False,
         random_distractors=bool(bank.get("RANDOM_DISTRACTORS", True)),
         holdout_materials=(),
-        merge_adjacent=True,
         coverage_tolerance_nm=float(bank.get("MATERIAL_COVERAGE_TOLERANCE_NM", 100.0)),
         seed=int(args.seed if args.seed is not None else cfg.get("SEED", 0)) + 10_000,
-        dz_nm=float(grid.get("DZ_NM", 5.0)),
-        max_total_nm=float(grid.get("MAX_THICKNESS_NM", 10_000.0)),
         incidence_angle_deg=float(optical.get("ANGLE_DEG", 0.0)),
         polarization=str(optical.get("POLARIZATION", "s")),
         include_source_spectrum=score_full_grid,
+        **geometry,
     )
     paths = split_paths(cfg, args.split)
     workers = int(args.num_workers if args.num_workers is not None else cfg.get("NUM_WORKERS", 0))
@@ -382,14 +391,24 @@ def _channel_mapping(values: torch.Tensor) -> dict[str, float]:
     return {channel: float(values[index]) for index, channel in enumerate(RAT_CHANNELS)}
 
 
+def joint_sample_runs(
+    model: optollama.model.OpenLayerJointDFM, catalog: optollama.data.MaterialCatalog, settings: dict[str, Any],
+) -> tuple[list[list[dict[str, Any]]], list[int]]:
+    """Decode sampled slots into physical runs without quantizing thicknesses."""
+    sample = model.sample(**settings)
+    ids, thickness, counts, mask = (value.cpu() for value in sample)
+    global_ids = torch.arange(len(catalog.names)).expand(len(ids), -1)
+    return optollama.data.layer_batch_to_runs(ids, thickness, global_ids, catalog, mask, merge_adjacent=False), counts.tolist()
+
+
 @torch.inference_mode()
 def evaluate_split(
     *,
     args: argparse.Namespace,
     cfg: dict[str, Any],
     block: dict[str, Any],
-    model: optollama.model.OpenVocabularyDepthFieldDiffusion,
-    model_config: optollama.model.OpenVocabularyDepthFieldConfig,
+    model: optollama.model.OpenVocabularyDepthFieldDiffusion | optollama.model.OpenLayerJointDFM,
+    model_config: optollama.model.OpenVocabularyDepthFieldConfig | optollama.model.OpenLayerJointDFMConfig,
     catalog: optollama.data.MaterialCatalog,
     source_catalog: optollama.data.MaterialCatalog,
     candidate_names: Sequence[str],
@@ -425,14 +444,16 @@ def evaluate_split(
         else bool(nested(block, "EVAL", "FULL_GRID_METRICS", default=False))
     )
 
-    loader, dataset_size = make_split_loader(args, cfg, block, source_catalog, idx_to_token, eos_idx, pad_idx, msk_idx)
+    joint = isinstance(model, optollama.model.OpenLayerJointDFM)
+    process = "joint_layer_dfm" if joint else ("discrete_flow" if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else "remask")
+    loader, dataset_size = make_split_loader(args, cfg, block, source_catalog, idx_to_token, eos_idx, pad_idx, msk_idx, joint=joint)
     token_materials = set(optollama.data.material_names_from_tokens(tokens))
     unsupported = sorted(set(candidate_names) - token_materials)
     if unsupported:
         raise ValueError(f"Exact TMM split scoring cannot map these candidates to tokens: {unsupported}")
     depth_vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
     material_to_token_id = {name: depth_vocab.token_options[name][0].token_id for name in candidate_names}
-    coordinate_query = model_config.query_spectrum
+    coordinate_query = joint or model_config.query_spectrum
     query_mode = "custom" if args.query_bands else str(args.query_mode or "full")
     query_bands = parse_query_bands(args.query_bands)
     if not coordinate_query and (args.query_bands or args.query_mode):
@@ -482,7 +503,7 @@ def evaluate_split(
         if str(previous.get("checkpoint")) != str(args.checkpoint):
             raise ValueError(f"Cannot resume {save_path}: checkpoint path differs from --checkpoint.")
         expected_settings = {
-            "denoising_process": "discrete_flow" if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else "remask",
+            "denoising_process": process,
             "weights": args.weights,
             "sampling_steps": steps,
             "mc_samples": int(args.mc_samples),
@@ -518,13 +539,13 @@ def evaluate_split(
 
     def payload() -> dict[str, Any]:
         ordered = sorted(records, key=lambda record: int(record["sample_index"]))
-        return {
+        result = {
             "mode": "split",
             "split": args.split,
             "checkpoint": str(args.checkpoint),
             "weights": args.weights,
             "continuous_time": True,
-            "denoising_process": "discrete_flow" if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else "remask",
+            "denoising_process": process,
             "discrete_flow_source": model.flow_config.to_dict() if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else None,
             "sampling_steps": steps,
             "mc_samples": int(args.mc_samples),
@@ -554,16 +575,25 @@ def evaluate_split(
             "summary": summarize_split_records(ordered),
             "samples": ordered,
         }
+        if joint:
+            legacy_rows = [row for row in ordered if row["target_layer_count"] > 0]
+            result["summary"]["nonempty_reference"] = summarize_split_records(legacy_rows)
+            for key in ("predicted_layer_count", "best_physical_layer_count", "best_total_thickness_nm"):
+                result["summary"][key] = _distribution([row[key] for row in ordered])
+            if score_full_grid and ordered:
+                for key in ("predicted_layer_count", "total_thickness_nm"):
+                    result["summary"]["full_grid"][key] = _distribution([row["full_grid"][key] for row in ordered])
+        return result
 
 
     saved_count = len(records)
     progress = tqdm.tqdm(loader, total=math.ceil(dataset_size / int(args.batch_size)), desc=f"RAT {args.split}")
     for raw in progress:
         raw_indices = raw["sample_indices"].tolist()
-        raw_fields = raw["clean_fields"].long()
-        material_bins = raw_fields < model_config.max_candidates
+        raw_fields = raw["material_targets" if joint else "clean_fields"].long()
+        material_bins = raw["layer_mask"] if joint else raw_fields < model_config.max_candidates
         global_fields = raw["candidate_global_ids"].gather(
-            1, raw_fields.clamp(max=model_config.max_candidates - 1)
+            1, raw_fields.clamp(min=0, max=model_config.max_candidates - 1)
         )
         supported = (~material_bins | source_allowed[global_fields.clamp_min(0)]).all(dim=1)
         valid_rows = raw["sample_mask"] & supported
@@ -586,8 +616,12 @@ def evaluate_split(
             candidate_curves,
             max_candidates=model_config.max_candidates,
             selected_global_ids=selected_global_ids,
+            joint=joint,
         )
         batch_size = int(batch["sample_indices"].shape[0])
+        if joint:
+            batch["incidence_angle_deg"].fill_(angle)
+            batch["polarization_id"].fill_(int(polarization == "p"))
         batch_seed = evaluation_seed + int(batch["sample_indices"][0]) * 1_000_003
         torch.manual_seed(batch_seed)
         if torch.cuda.is_available():
@@ -595,8 +629,15 @@ def evaluate_split(
         banks = [tuple(candidate_names)] * batch_size
         target_rat = batch["target_spectrum_rat"].transpose(1, 2).contiguous().cpu()
         full_target_rat = batch["source_spectrum_rat"].transpose(1, 2).contiguous().cpu() if score_full_grid else None
-        target_runs = (
-            [
+        if not args.record_fields:
+            target_runs = []
+        elif joint:
+            target_runs = optollama.data.layer_batch_to_runs(
+                batch["material_targets"], batch["thickness_nm"], batch["candidate_global_ids"], catalog, batch["layer_mask"],
+                merge_adjacent=False,
+            )
+        else:
+            target_runs = [
                 local_fields_to_runs(
                     batch["clean_fields"][row : row + 1],
                     banks[row],
@@ -605,9 +646,6 @@ def evaluate_split(
                 )[0]
                 for row in range(batch_size)
             ]
-            if args.record_fields
-            else []
-        )
         mae_chunks: list[torch.Tensor] = []
         channel_mae_chunks: list[torch.Tensor] = []
         predicted_chunks: list[torch.Tensor] = []
@@ -615,10 +653,11 @@ def evaluate_split(
         full_channel_mae_chunks: list[torch.Tensor] = []
         full_predicted_chunks: list[torch.Tensor] = []
         runs_by_target: list[list[list[dict[str, float | str]]]] = [[] for _ in range(batch_size)]
+        counts_by_target: list[list[int]] = [[] for _ in range(batch_size)]
 
         for mc_start in range(0, args.mc_samples, mc_batch):
             count = min(mc_batch, args.mc_samples - mc_start)
-            fields = model.sample(
+            settings = dict(
                 spectra=_repeat_rows(batch["target_spectrum"].transpose(1, 2), count, device),
                 wavelengths_nm=_repeat_rows(batch["wavelengths_nm"], count, device),
                 candidate_nk=_repeat_rows(batch["candidate_nk"], count, device),
@@ -629,19 +668,16 @@ def evaluate_split(
                 temperature=args.temperature,
                 top_k=args.top_k,
                 deterministic=args.deterministic,
-                remask_strategy=remask,
-                corruption_config=corruption,
-            ).cpu().reshape(batch_size, count, -1)
-            chunk_runs: list[list[dict[str, float | str]]] = []
+            )
+            if joint:
+                chunk_runs, counts = joint_sample_runs(model, catalog, settings)
+            else:
+                fields = model.sample(**settings, remask_strategy=remask, corruption_config=corruption).cpu()
+                chunk_runs = local_fields_to_runs(fields, candidate_names, void_id=model_config.max_candidates, dz_nm=dz_nm)
             for row in range(batch_size):
-                decoded = local_fields_to_runs(
-                    fields[row],
-                    banks[row],
-                    void_id=model_config.max_candidates,
-                    dz_nm=dz_nm,
-                )
-                runs_by_target[row].extend(decoded)
-                chunk_runs.extend(decoded)
+                runs_by_target[row].extend(chunk_runs[row * count : (row + 1) * count])
+                if joint:
+                    counts_by_target[row].extend(counts[row * count : (row + 1) * count])
             predicted = optollama.evaluation.simulation.simulate_material_runs(
                 chunk_runs,
                 tmm_ctx,
@@ -698,6 +734,15 @@ def evaluate_split(
             if args.record_fields:
                 record["target_field_runs"] = target_runs[row]
                 record["best_field_runs"] = runs_by_target[row][best_index]
+            if joint:
+                selected_runs = runs_by_target[row][best_index]
+                record.update(
+                    target_layer_count=int(batch["layer_mask"][row].sum()),
+                    predicted_layer_count=counts_by_target[row][best_index], candidate_layer_counts=counts_by_target[row],
+                    candidate_total_thickness_nm=[sum(float(layer["thickness_nm"]) for layer in run) for run in runs_by_target[row]],
+                    best_physical_layer_count=len(selected_runs),
+                    best_total_thickness_nm=sum(float(layer["thickness_nm"]) for layer in selected_runs),
+                )
             if predicted_grid is not None:
                 record["target_spectra"] = target_rat[row].tolist()
                 record["best_pred_spectra"] = predicted_grid[row, best_index].tolist()
@@ -717,6 +762,12 @@ def evaluate_split(
                 if full_predicted_grid is not None:
                     full_record["target_spectra"] = full_target_rat[row].tolist()
                     full_record["best_pred_spectra"] = full_predicted_grid[row, full_best_index].tolist()
+                if joint:
+                    full_run = runs_by_target[row][full_best_index]
+                    full_record.update(predicted_layer_count=counts_by_target[row][full_best_index],
+                                       physical_layer_count=len(full_run), total_thickness_nm=record["candidate_total_thickness_nm"][full_best_index])
+                    if args.record_fields:
+                        full_record["best_field_runs"] = full_run
                 record["full_grid"] = full_record
             records.append(record)
             completed.add(sample_index)
@@ -731,6 +782,15 @@ def evaluate_split(
         raise RuntimeError(f"The {args.split!r} split contained no valid samples to score.")
     summary = final_payload["summary"]["rat_mae"]
     print(f"Saved {len(records):,} exact-TMM split results -> {save_path}")
+    if joint:
+        joint_summary = final_payload["summary"]
+        layer_summary = joint_summary.get("full_grid", joint_summary)
+        thickness = layer_summary["total_thickness_nm" if score_full_grid else "best_total_thickness_nm"]["mean"]
+        print(
+            f"Evaluated {len(records):,}/{dataset_size:,} targets; "
+            f"best-of-MC mean predicted count={layer_summary['predicted_layer_count']['mean']:.2f}, "
+            f"mean thickness={thickness:.2f} nm."
+        )
     print(
         f"RAT MAE: single-draw mean={summary['single_draw']['mean']:.6f}, "
         f"candidate mean={summary['mean_candidate']['mean']:.6f}, "
@@ -757,7 +817,10 @@ def main() -> None:
     """Sample candidate-local fields and optionally score them with exact TMM."""
     args = parse_args()
     cfg = optollama.utils.load_config_file(args.config)
-    block = cfg.get("OPEN_VOCAB_DEPTH_FIELD") or {}
+    joint = "OPEN_LAYER_DFM_JOINT" in cfg
+    block = cfg.get("OPEN_LAYER_DFM_JOINT" if joint else "OPEN_VOCAB_DEPTH_FIELD") or {}
+    if args.mc_samples is None:
+        args.mc_samples = int(nested(block, "EVAL", "MC_SAMPLES", default=4)) if joint else 10
     wavelengths = torch.arange(
         int(cfg["WAVELENGTH_MIN"]), int(cfg["WAVELENGTH_MAX"]) + 1, int(cfg["WAVELENGTH_STEPS"]), dtype=torch.float32
     )
@@ -769,24 +832,35 @@ def main() -> None:
 
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     extra = blob.get("extra") or {}
-    model_metadata = extra.get("open_vocab_depth_field_config")
+    metadata_key = "open_layer_dfm_joint_config" if joint else "open_vocab_depth_field_config"
+    model_metadata = extra.get(metadata_key)
     if not isinstance(model_metadata, dict):
-        raise ValueError("Checkpoint has no open_vocab_depth_field_config metadata.")
-    model_config = optollama.model.OpenVocabularyDepthFieldConfig.from_dict(model_metadata)
-    if model_config.query_spectrum != bool(nested(block, "QUERY", "ENABLED", default=False)):
-        raise ValueError("Checkpoint query-spectrum mode and config QUERY.ENABLED disagree.")
-    configured_points = int(nested(block, "QUERY", "POINTS", default=len(cfg["WAVELENGTHS"])))
-    if model_config.query_spectrum and configured_points != model_config.spectrum_shape[-1]:
-        raise ValueError("Checkpoint spectrum width and config QUERY.POINTS disagree.")
-    configured_patch = int(nested(block, "MODEL", "DEPTH_PATCH_SIZE", default=1))
-    if configured_patch != model_config.depth_patch_size:
-        raise ValueError("Checkpoint depth patch size and config MODEL.DEPTH_PATCH_SIZE disagree.")
-    process = str(nested(block, "DENOISING", "PROCESS", default="remask"))
+        raise ValueError(f"Checkpoint has no {metadata_key} metadata.")
+    if joint:
+        model_config = optollama.model.OpenLayerJointDFMConfig(**model_metadata)
+        requested = optollama.model.OpenLayerJointDFMConfig.from_mapping(block)
+        for attribute in ("query_points", "max_layers", "max_candidates", "min_thickness_nm", "max_total_nm"):
+            if getattr(requested, attribute) != getattr(model_config, attribute):
+                raise ValueError(f"Joint DFM checkpoint and config disagree on {attribute}.")
+        process = "joint_layer_dfm"
+    else:
+        model_config = optollama.model.OpenVocabularyDepthFieldConfig.from_dict(model_metadata)
+        if model_config.query_spectrum != bool(nested(block, "QUERY", "ENABLED", default=False)):
+            raise ValueError("Checkpoint query-spectrum mode and config QUERY.ENABLED disagree.")
+        configured_points = int(nested(block, "QUERY", "POINTS", default=len(cfg["WAVELENGTHS"])))
+        if model_config.query_spectrum and configured_points != model_config.spectrum_shape[-1]:
+            raise ValueError("Checkpoint spectrum width and config QUERY.POINTS disagree.")
+        configured_patch = int(nested(block, "MODEL", "DEPTH_PATCH_SIZE", default=1))
+        if configured_patch != model_config.depth_patch_size:
+            raise ValueError("Checkpoint depth patch size and config MODEL.DEPTH_PATCH_SIZE disagree.")
+        process = str(nested(block, "DENOISING", "PROCESS", default="remask"))
     saved_process = str(extra.get("denoising_process", "remask"))
     if process != saved_process:
         raise ValueError(f"Config process {process} does not match checkpoint process {saved_process}.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if process == "discrete_flow":
+    if joint:
+        model = optollama.model.OpenLayerJointDFM(model_config).to(device).eval()
+    elif process == "discrete_flow":
         flow_config = optollama.model.DiscreteFlowConfig.from_dict(nested(block, "DENOISING", "FLOW", default={}))
         saved_flow = extra.get("discrete_flow_config")
         if not isinstance(saved_flow, dict) or optollama.model.DiscreteFlowConfig.from_dict(saved_flow) != flow_config:
@@ -796,7 +870,10 @@ def main() -> None:
         model = optollama.model.OpenVocabularyDepthFieldDiffusion(model_config).to(device).eval()
     else:
         raise ValueError(f"Unknown open-vocabulary depth process: {process}")
-    optollama.utils.load_checkpoint(args.checkpoint, model, map_location="cpu")
+    if joint:
+        model.load_state_dict(blob["model_state"], strict=True)
+    else:
+        optollama.utils.load_checkpoint(args.checkpoint, model, map_location="cpu")
     ema_state = extra.get("ema") if args.weights == "ema" else None
     if isinstance(ema_state, dict) and isinstance(ema_state.get("shadow"), dict):
         current = model.state_dict()
@@ -865,11 +942,11 @@ def main() -> None:
     target_path = Path(args.target or cfg["TARGET"])
     target_rat, target_wavelengths = optollama.data.load_open_layer_target(target_path, wavelengths)
     query_bands = parse_query_bands(args.query_bands)
-    if model_config.query_spectrum:
+    if joint or model_config.query_spectrum:
         target_rat, wavelengths = target_query(
             target_rat,
             target_wavelengths,
-            points=model_config.spectrum_shape[-1],
+            points=model_config.query_points if joint else model_config.spectrum_shape[-1],
             bands=query_bands,
         )
     elif query_bands or target_wavelengths.shape != wavelengths.shape or not torch.allclose(target_wavelengths, wavelengths):
@@ -882,12 +959,14 @@ def main() -> None:
     candidate_nk[:, : len(candidate_names)] = curves
     candidate_mask = torch.zeros(1, max_candidates, dtype=torch.bool)
     candidate_mask[:, : len(candidate_names)] = True
+    if args.mc_samples < 1 or (args.mc_batch_size is not None and args.mc_batch_size < 1):
+        raise ValueError("--mc-samples and --mc-batch-size must be positive.")
     mc_batch = max(1, int(args.mc_batch_size or args.mc_samples))
-    all_fields: list[torch.Tensor] = []
     all_runs: list[list[dict[str, float | str]]] = []
+    all_counts: list[int] = []
     for start in range(0, args.mc_samples, mc_batch):
         count = min(mc_batch, args.mc_samples - start)
-        fields = model.sample(
+        settings = dict(
             spectra=target_rat.unsqueeze(0).expand(count, -1, -1).to(device),
             wavelengths_nm=wavelengths.unsqueeze(0).expand(count, -1).to(device),
             candidate_nk=candidate_nk.expand(count, -1, -1, -1).to(device),
@@ -898,20 +977,32 @@ def main() -> None:
             temperature=args.temperature,
             top_k=args.top_k,
             deterministic=args.deterministic,
-            remask_strategy=remask,
-            corruption_config=corruption,
-        ).cpu()
-        all_fields.append(fields)
-        all_runs.extend(local_fields_to_runs(fields, candidate_names, void_id=model.void_id, dz_nm=dz_nm))
-    fields = torch.cat(all_fields, dim=0)
+        )
+        if joint:
+            runs, counts = joint_sample_runs(model, catalog, settings)
+            all_runs.extend(runs)
+            all_counts.extend(counts)
+        else:
+            fields = model.sample(**settings, remask_strategy=remask, corruption_config=corruption).cpu()
+            all_runs.extend(local_fields_to_runs(fields, candidate_names, void_id=model.void_id, dz_nm=dz_nm))
 
     token_materials = optollama.data.material_names_from_tokens(tokens)
-    can_simulate = set(candidate_names).issubset(token_materials)
+    can_simulate = joint or set(candidate_names).issubset(token_materials)
     predicted_rat: torch.Tensor | None = None
     mae: torch.Tensor | None = None
     if can_simulate:
-        depth_vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
-        material_to_token_id = {name: depth_vocab.token_options[name][0].token_id for name in candidate_names}
+        if joint:
+            # Keep special-token IDs but do not require unused optical constants in an override directory.
+            selected_names = set(candidate_names)
+            pad_token = idx_to_token[pad_idx]
+            scoring_tokens = {
+                index: token if (parts := optollama.data.layer_token_parts(token)) is None or parts[0] in selected_names else pad_token
+                for index, token in idx_to_token.items()
+            }
+            idx_to_token, material_to_token_id = tmm_vocabulary_for_candidates(scoring_tokens, candidate_names)
+        else:
+            depth_vocab = optollama.data.build_depth_field_vocab(tokens, token_to_idx)
+            material_to_token_id = {name: depth_vocab.token_options[name][0].token_id for name in candidate_names}
         cfg["MATERIALS_PATH"] = materials_dir
         cfg["WAVELENGTHS"] = wavelengths
         cfg["INCIDENCE_ANGLE"] = angle
@@ -940,6 +1031,9 @@ def main() -> None:
     records = []
     for index, runs in enumerate(all_runs):
         record: dict[str, Any] = {"mc_index": index, "field_runs": runs}
+        if joint:
+            record.update(predicted_layer_count=all_counts[index], physical_layer_count=len(runs),
+                          total_thickness_nm=sum(float(run["thickness_nm"]) for run in runs))
         if predicted_rat is not None and mae is not None:
             record["mae"] = float(mae[index])
             record["pred_spectra"] = predicted_rat[index].tolist()
@@ -960,7 +1054,8 @@ def main() -> None:
         "samples": records,
     }
     save_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"Saved {len(records)} open-vocabulary depth-field samples -> {save_path}")
+    label = "joint layer DFM" if joint else "open-vocabulary depth-field"
+    print(f"Saved {len(records)} {label} samples -> {save_path}")
     if mae is None:
         print("Exact TMM scoring skipped because at least one candidate is not represented by the current token/TMM catalog.")
     else:

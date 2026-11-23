@@ -11,6 +11,11 @@ import torch
 from .open_vocab_depth_field import OpenVocabularyDepthFieldConfig, OpenVocabularyDepthFieldDiffusion
 
 
+def dfm_step_flip_probability(step_index: int, steps: int) -> float:
+    """Convert the quadratic source schedule into one revisable endpoint update probability."""
+    return 1.0 - ((steps - step_index - 1) / (steps - step_index)) ** 2
+
+
 @dataclass(frozen=True)
 class DiscreteFlowConfig:
     """Source-state mixture for candidate-local discrete flow."""
@@ -322,7 +327,7 @@ class OpenVocabularyDepthFieldDFM(OpenVocabularyDepthFieldDiffusion):
             )
             # For kappa(s)=1-(1-s)^2, a source coordinate flips by the next grid point
             # with probability 1-((1-s_next)/(1-s_current))^2.
-            flip_probability = 1.0 - ((steps - step_index - 1) / (steps - step_index)) ** 2
+            flip_probability = dfm_step_flip_probability(step_index, steps)
             if deterministic:
                 if flip_probability >= 0.5:
                     fields = endpoint

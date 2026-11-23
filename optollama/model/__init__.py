@@ -5,3 +5,4 @@ from .spectrum_autoencoder import *
 from .open_layer_flow import *
 from .open_vocab_depth_field import *
 from .open_vocab_depth_field_dfm import *
+from .open_layer_dfm_joint import *
