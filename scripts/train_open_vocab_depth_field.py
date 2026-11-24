@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--output-dir", type=Path, help="Override the checkpoint and history output directory.")
+    parser.add_argument("--visible-material-replace-peak", type=float, help="Joint DFM training-only peak replacement probability.")
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument("--max-train-steps", type=int, default=None)
@@ -265,14 +267,32 @@ def select_valid_rows(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]
     return {key: value[valid] for key, value in batch.items()}
 
 
+REPLACEMENT_KEYS = ("wrong_visible_slots_per_row", "corrected_visible_slots_per_row", "visible_slots_per_row")
+
+
+def summarize_replacement_metrics(metrics: dict[str, float]) -> None:
+    """Report rates over actual slots, not an average of per-batch ratios."""
+    if REPLACEMENT_KEYS[0] in metrics:
+        wrong, corrected, visible = (metrics.pop(key) for key in REPLACEMENT_KEYS)
+        metrics["wrong_visible_fraction"] = wrong / visible if visible else 0.0
+        metrics["wrong_visible_accuracy"] = corrected / wrong if wrong else 0.0
+
+
 def compute_joint_loss(
     model: torch.nn.Module, core: optollama.model.OpenLayerJointDFM, batch: dict[str, torch.Tensor], train_cfg: dict[str, Any],
+    *, replacement_generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     """Train count, unweighted categorical endpoints, and velocity on one noised state."""
     clean = batch["material_targets"]
     mask = batch["layer_mask"]
     s = torch.rand(clean.shape[0], device=clean.device)
     material, thickness, target_velocity, corrupted = core.training_state(batch, s)
+    wrong = None
+    if replacement_generator is not None:
+        material, wrong = core.replace_visible_materials(
+            material, s, batch["candidate_mask"], peak=float(train_cfg["VISIBLE_MATERIAL_REPLACE_PEAK"]),
+            generator=replacement_generator,
+        )
     output = model(
         material_ids=material, thickness_state=thickness, layer_mask=mask, flow_time=s,
         spectra=batch["target_spectrum"].transpose(1, 2), wavelengths_nm=batch["wavelengths_nm"],
@@ -287,7 +307,7 @@ def compute_joint_loss(
     target_counts = mask.sum(dim=1)
     count_loss = functional.cross_entropy(output["count_logits"].float(), target_counts)
     correct = logits.argmax(dim=-1) == clean
-    return {
+    losses = {
         "loss": material_loss + float(train_cfg.get("THICKNESS_LOSS_WEIGHT", 1.0)) * thickness_loss +
         float(train_cfg.get("COUNT_LOSS_WEIGHT", 1.0)) * count_loss,
         "material_loss": material_loss, "thickness_loss": thickness_loss, "count_loss": count_loss,
@@ -301,6 +321,13 @@ def compute_joint_loss(
         "diagnostic_noised": material.detach(),
         "diagnostic_logits": logits.detach(),
     }
+    if wrong is not None:
+        losses.update(zip(REPLACEMENT_KEYS, (
+            wrong.sum() / len(clean),
+            (correct & wrong).sum() / len(clean),
+            (mask & ~corrupted).sum() / len(clean),
+        ), strict=True))
+    return losses
 
 
 def compute_loss(
@@ -436,10 +463,15 @@ def run_epoch(
     """Train or validate one epoch and aggregate metrics over all ranks."""
     training = optimizer is not None
     model.train(training)
-    joint = isinstance(unwrap_model(model), optollama.model.OpenLayerJointDFM)
+    core = unwrap_model(model)
+    joint = isinstance(core, optollama.model.OpenLayerJointDFM)
     keys = ("loss", "accuracy", "corrupted_accuracy", "noise_probability", "corrupted_fraction", "condition_dropped")
     if joint:
         keys += ("material_loss", "thickness_loss", "count_loss", "count_accuracy")
+    replacement_generator = None
+    if training and joint and float(train_cfg.get("VISIBLE_MATERIAL_REPLACE_PEAK", 0.0)) > 0:
+        replacement_generator = torch.Generator(device=device)
+        keys += REPLACEMENT_KEYS
     totals = torch.zeros(len(keys) + 1, dtype=torch.float64, device=device)
     flow_totals = (
         torch.zeros((8, 3), dtype=torch.float64, device=device)
@@ -472,6 +504,9 @@ def run_epoch(
     checkpoint_every_steps = None if not checkpoint_every_steps else max(1, int(checkpoint_every_steps))
     world = torch.distributed.get_world_size() if optollama.utils.is_ddp() else 1
     show = not optollama.utils.is_ddp() or torch.distributed.get_rank() == 0
+    if replacement_generator is not None:
+        rank = torch.distributed.get_rank() if optollama.utils.is_ddp() else 0
+        replacement_seed = torch.initial_seed() + 0x5D804C1 + epoch * 1_000_003 * world + rank
     progress = tqdm.tqdm(
         loader,
         desc=f"Epoch {epoch + 1}/{epochs} {'joint layer DFM' if joint else 'open-vocab depth'} {'train' if training else 'val'}",
@@ -498,7 +533,11 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
         context = torch.enable_grad() if training else torch.no_grad()
         with context, autocast_context(device, amp_dtype):
-            output = compute_loss(model, batch, train_cfg, corruption)
+            if replacement_generator is None:
+                output = compute_loss(model, batch, train_cfg, corruption)
+            else:
+                replacement_generator.manual_seed((replacement_seed + step * world) % (1 << 64))
+                output = compute_joint_loss(model, core, batch, train_cfg, replacement_generator=replacement_generator)
         if not training and not synchronized_finite(output["loss"]):
             raise FloatingPointError(f"Non-finite open-vocabulary depth loss at epoch={epoch + 1}, step={step}.")
         if training:
@@ -605,12 +644,14 @@ def run_epoch(
         display_step = optimizer_steps if training else step + 1
         if display_step == 1 or display_step % log_every_steps == 0:
             running = {key: float((totals[index] / totals[-1]).item()) for index, key in enumerate(keys)}
+            summarize_replacement_metrics(running)
             progress.set_postfix(
                 loss=f"{running['loss']:.4f}",
                 acc=f"{100 * running['accuracy']:.1f}%",
                 corr=f"{100 * running['corrupted_accuracy']:.1f}%",
                 refresh=False,
                 **({key: f"{running[key]:.4f}" for key in ("material_loss", "thickness_loss", "count_loss")} if joint else {}),
+                **{key: f"{running[key]:.1%}" for key in ("wrong_visible_fraction", "wrong_visible_accuracy") if key in running},
             )
         if (
             training
@@ -624,6 +665,7 @@ def run_epoch(
             snapshot = {
                 key: float((snapshot_totals[index] / snapshot_totals[-1]).item()) for index, key in enumerate(keys)
             }
+            summarize_replacement_metrics(snapshot)
             snapshot["samples"] = int(snapshot_totals[-1].item())
             if flow_totals is not None:
                 flow_snapshot = flow_totals.clone()
@@ -661,6 +703,7 @@ def run_epoch(
     if totals[-1] <= 0:
         raise RuntimeError("No valid samples were processed.")
     metrics = {key: float(totals[index] / totals[-1]) for index, key in enumerate(keys)}
+    summarize_replacement_metrics(metrics)
     if flow_totals is not None:
         metrics.update(flow_diagnostic_metrics(flow_totals))
     metrics["samples"] = int(totals[-1].item())
@@ -695,6 +738,13 @@ def main() -> None:
     model_metadata_key = "open_layer_dfm_joint_config" if joint else "open_vocab_depth_field_config"
     label = "Joint layer DFM" if joint else "Open-vocab depth"
     train_cfg = nested(block, "TRAIN", default={}) or {}
+    if args.visible_material_replace_peak is not None:
+        if not joint:
+            raise ValueError("--visible-material-replace-peak requires a joint layer DFM config.")
+        train_cfg["VISIBLE_MATERIAL_REPLACE_PEAK"] = args.visible_material_replace_peak
+    replacement_peak = float(train_cfg.get("VISIBLE_MATERIAL_REPLACE_PEAK", 0.0)) if joint else 0.0
+    if not 0 <= replacement_peak <= 1:
+        raise ValueError("VISIBLE_MATERIAL_REPLACE_PEAK must be between zero and one.")
     if args.batch_size is not None:
         cfg["TRAIN_BATCH_SIZE"] = args.batch_size
     if args.smoke_test:
@@ -797,7 +847,7 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     lr_schedule = train_cfg.get("LR_SCHEDULE")
     corruption = optollama.model.DepthFieldCorruptionConfig.from_dict(nested(block, "DENOISING", "CORRUPTION", default={}))
-    output_dir = Path(block.get("OUT_DIR") or cfg["OUTPUT_PATH"])
+    output_dir = args.output_dir or Path(block.get("OUT_DIR") or cfg["OUTPUT_PATH"])
     if args.smoke_test:
         output_dir = output_dir / "smoke-test"
     epochs = 1 if args.smoke_test else int(args.epochs or train_cfg.get("EPOCHS", 20))
@@ -833,6 +883,8 @@ def main() -> None:
             ema.load_state_dict(checkpoint_extra["ema"], raw_model)
         resume_cursor = checkpoint_extra.get("resume_cursor")
         if resume_cursor is not None:
+            if joint and float(checkpoint_extra.get("visible_material_replace_peak", 0.0)) != replacement_peak:
+                raise ValueError("Mid-epoch resume requires the same visible material replacement probability.")
             expected = {
                 "world_size": world,
                 "batch_size": int(cfg["TRAIN_BATCH_SIZE"]),
@@ -901,6 +953,7 @@ def main() -> None:
         )
         if joint:
             print(f"Continuous time: s~Uniform(0,1), mask probability=(1-s)^2, linear thickness flow; held-out loss rows={val_n:,}")
+            print(f"Visible material replacement: peak={replacement_peak:g} (training only)")
         else:
             print(
                 f"Continuous time: t~Uniform(0,1), noise_probability=t^2; validation sampling steps={nested(block, 'EVAL', 'SAMPLING_STEPS', default=64)}"
@@ -941,6 +994,7 @@ def main() -> None:
                 "continuous_time": True,
                 "ema": ema.state_dict() if ema is not None else None,
                 "resume_cursor": cursor,
+                **({"visible_material_replace_peak": replacement_peak} if joint else {}),
             }
 
         def checkpoint_at_step(step: int, samples_seen: int, next_batch: int, state: dict[str, Any]) -> None:

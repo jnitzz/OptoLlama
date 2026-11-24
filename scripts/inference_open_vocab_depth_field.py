@@ -28,6 +28,19 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--split", choices=("train", "test"), default=None, help="Evaluate a configured dataset split.")
     parser.add_argument("--max-samples", type=int, default=None, help="Maximum split samples; defaults to NUM_SAMPLES_TEST.")
     parser.add_argument("--batch-size", type=int, default=1, help="Target spectra per split-evaluation batch.")
+    parser.add_argument(
+        "--layer-count-mode", choices=("predicted", "reference"),
+        help="Joint DFM split diagnostic: hold sampling shapes fixed and use predicted or reference counts.",
+    )
+    trajectory = parser.add_mutually_exclusive_group()
+    trajectory.add_argument(
+        "--reference-thickness", action="store_true",
+        help="With reference counts, follow the forward-noised reference thicknesses and generate only materials.",
+    )
+    trajectory.add_argument(
+        "--reference-materials", action="store_true",
+        help="With reference counts, reveal reference labels at scheduled material jumps and generate only thicknesses.",
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--materials-dir", default=None)
@@ -426,6 +439,7 @@ def evaluate_split(
     steps: int,
     remask: str,
     dz_nm: float,
+    checkpoint_step: int | None = None,
 ) -> Path:
     """Generate candidate fields for a split and score their exact-TMM RAT spectra."""
     if args.split is None:
@@ -445,6 +459,15 @@ def evaluate_split(
     )
 
     joint = isinstance(model, optollama.model.OpenLayerJointDFM)
+    count_mode = args.layer_count_mode
+    count_key = "applied_layer_count" if count_mode == "reference" else "predicted_layer_count"
+    thickness_mode = "reference_trajectory" if args.reference_thickness else None
+    material_mode = "reference_trajectory" if args.reference_materials else None
+    diagnostic = {"layer_count_mode": count_mode, "checkpoint_step": checkpoint_step} if count_mode is not None else {}
+    if thickness_mode is not None:
+        diagnostic["thickness_mode"] = thickness_mode
+    if material_mode is not None:
+        diagnostic["material_mode"] = material_mode
     process = "joint_layer_dfm" if joint else ("discrete_flow" if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else "remask")
     loader, dataset_size = make_split_loader(args, cfg, block, source_catalog, idx_to_token, eos_idx, pad_idx, msk_idx, joint=joint)
     token_materials = set(optollama.data.material_names_from_tokens(tokens))
@@ -520,6 +543,10 @@ def evaluate_split(
             "record_fields": bool(args.record_fields),
             "seed": evaluation_seed,
             "dataset_size": dataset_size,
+            "layer_count_mode": count_mode,
+            "thickness_mode": thickness_mode,
+            "material_mode": material_mode,
+            **diagnostic,
         }
         if coordinate_query:
             expected_settings.update({"query_mode": query_mode, "query_bands": [list(band) for band in query_bands]})
@@ -546,6 +573,7 @@ def evaluate_split(
             "weights": args.weights,
             "continuous_time": True,
             "denoising_process": process,
+            **diagnostic,
             "discrete_flow_source": model.flow_config.to_dict() if isinstance(model, optollama.model.OpenVocabularyDepthFieldDFM) else None,
             "sampling_steps": steps,
             "mc_samples": int(args.mc_samples),
@@ -578,10 +606,10 @@ def evaluate_split(
         if joint:
             legacy_rows = [row for row in ordered if row["target_layer_count"] > 0]
             result["summary"]["nonempty_reference"] = summarize_split_records(legacy_rows)
-            for key in ("predicted_layer_count", "best_physical_layer_count", "best_total_thickness_nm"):
+            for key in (count_key, "best_physical_layer_count", "best_total_thickness_nm"):
                 result["summary"][key] = _distribution([row[key] for row in ordered])
             if score_full_grid and ordered:
-                for key in ("predicted_layer_count", "total_thickness_nm"):
+                for key in (count_key, "total_thickness_nm"):
                     result["summary"]["full_grid"][key] = _distribution([row["full_grid"][key] for row in ordered])
         return result
 
@@ -654,6 +682,7 @@ def evaluate_split(
         full_predicted_chunks: list[torch.Tensor] = []
         runs_by_target: list[list[list[dict[str, float | str]]]] = [[] for _ in range(batch_size)]
         counts_by_target: list[list[int]] = [[] for _ in range(batch_size)]
+        reference_counts = batch["layer_mask"].sum(dim=1) if count_mode == "reference" else None
 
         for mc_start in range(0, args.mc_samples, mc_batch):
             count = min(mc_batch, args.mc_samples - mc_start)
@@ -670,6 +699,14 @@ def evaluate_split(
                 deterministic=args.deterministic,
             )
             if joint:
+                if count_mode is not None:
+                    settings["fixed_layer_slots"] = True
+                if reference_counts is not None:
+                    settings["reference_layer_counts"] = _repeat_rows(reference_counts, count, device)
+                if args.reference_thickness:
+                    settings["reference_thickness_nm"] = _repeat_rows(batch["thickness_nm"], count, device)
+                if args.reference_materials:
+                    settings["reference_material_ids"] = _repeat_rows(batch["material_targets"], count, device)
                 chunk_runs, counts = joint_sample_runs(model, catalog, settings)
             else:
                 fields = model.sample(**settings, remask_strategy=remask, corruption_config=corruption).cpu()
@@ -738,11 +775,12 @@ def evaluate_split(
                 selected_runs = runs_by_target[row][best_index]
                 record.update(
                     target_layer_count=int(batch["layer_mask"][row].sum()),
-                    predicted_layer_count=counts_by_target[row][best_index], candidate_layer_counts=counts_by_target[row],
+                    candidate_layer_counts=counts_by_target[row],
                     candidate_total_thickness_nm=[sum(float(layer["thickness_nm"]) for layer in run) for run in runs_by_target[row]],
                     best_physical_layer_count=len(selected_runs),
                     best_total_thickness_nm=sum(float(layer["thickness_nm"]) for layer in selected_runs),
                 )
+                record[count_key] = counts_by_target[row][best_index]
             if predicted_grid is not None:
                 record["target_spectra"] = target_rat[row].tolist()
                 record["best_pred_spectra"] = predicted_grid[row, best_index].tolist()
@@ -764,8 +802,10 @@ def evaluate_split(
                     full_record["best_pred_spectra"] = full_predicted_grid[row, full_best_index].tolist()
                 if joint:
                     full_run = runs_by_target[row][full_best_index]
-                    full_record.update(predicted_layer_count=counts_by_target[row][full_best_index],
-                                       physical_layer_count=len(full_run), total_thickness_nm=record["candidate_total_thickness_nm"][full_best_index])
+                    full_record.update(
+                        physical_layer_count=len(full_run), total_thickness_nm=record["candidate_total_thickness_nm"][full_best_index],
+                    )
+                    full_record[count_key] = counts_by_target[row][full_best_index]
                     if args.record_fields:
                         full_record["best_field_runs"] = full_run
                 record["full_grid"] = full_record
@@ -786,9 +826,10 @@ def evaluate_split(
         joint_summary = final_payload["summary"]
         layer_summary = joint_summary.get("full_grid", joint_summary)
         thickness = layer_summary["total_thickness_nm" if score_full_grid else "best_total_thickness_nm"]["mean"]
+        count_label = "applied reference" if count_mode == "reference" else "predicted"
         print(
             f"Evaluated {len(records):,}/{dataset_size:,} targets; "
-            f"best-of-MC mean predicted count={layer_summary['predicted_layer_count']['mean']:.2f}, "
+            f"best-of-MC mean {count_label} count={layer_summary[count_key]['mean']:.2f}, "
             f"mean thickness={thickness:.2f} nm."
         )
     print(
@@ -818,6 +859,12 @@ def main() -> None:
     args = parse_args()
     cfg = optollama.utils.load_config_file(args.config)
     joint = "OPEN_LAYER_DFM_JOINT" in cfg
+    if args.layer_count_mode is not None and (not joint or args.split is None):
+        raise ValueError("--layer-count-mode requires a joint layer DFM config and --split.")
+    if args.reference_thickness and args.layer_count_mode != "reference":
+        raise ValueError("--reference-thickness requires --layer-count-mode reference.")
+    if args.reference_materials and args.layer_count_mode != "reference":
+        raise ValueError("--reference-materials requires --layer-count-mode reference.")
     block = cfg.get("OPEN_LAYER_DFM_JOINT" if joint else "OPEN_VOCAB_DEPTH_FIELD") or {}
     if args.mc_samples is None:
         args.mc_samples = int(nested(block, "EVAL", "MC_SAMPLES", default=4)) if joint else 10
@@ -936,6 +983,7 @@ def main() -> None:
             steps=steps,
             remask=remask,
             dz_nm=dz_nm,
+            checkpoint_step=extra.get("global_optimizer_steps"),
         )
         return
 

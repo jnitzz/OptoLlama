@@ -20,6 +20,44 @@ export OPTOLLAMA_DATA_PATH="${OPTOLLAMA_DATA_PATH:-$ROOT/data}"
 OUT_DIR="$OPTOLLAMA_DATA_PATH/output_OPEN_LAYER_DFM_JOINT_01"
 cd "$ROOT"
 
+train_args=(--config "$CONFIG")
+if (( $# > 0 )); then
+    if (( $# != 2 )); then
+        echo "Usage: sbatch $0 [FORK_DIR {control|wrong-label}]" >&2
+        exit 1
+    fi
+    case "$2" in
+        control) peak=0 ;;
+        wrong-label) peak=0.10 ;;
+        *) echo "Unknown fork arm: $2" >&2; exit 1 ;;
+    esac
+    source_checkpoint="$1/source.pt"
+    OUT_DIR="$1/$2"
+    if [[ ! -s "$source_checkpoint" ]]; then
+        echo "Missing frozen fork source: $source_checkpoint" >&2
+        exit 1
+    fi
+    if [[ -s "$OUT_DIR/open-layer-dfm-joint-last.pt" ]]; then
+        echo "Fork arm $2 already completed: $OUT_DIR"
+        exit 0
+    fi
+    end_epoch="$("$VENV_PY" -c '
+import sys, torch
+p = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)
+extra = p.get("extra") or {}
+if (not isinstance(p.get("epoch"), int) or not p.get("optimizer_state")
+        or extra.get("resume_cursor") is not None or extra.get("denoising_process") != "joint_layer_dfm"):
+    raise SystemExit("source.pt must be a completed-epoch joint layer DFM checkpoint with optimizer state")
+print(p["epoch"] + 2)
+' "$source_checkpoint")"
+    RESUME_CHECKPOINT="$source_checkpoint"
+    if [[ -s "$OUT_DIR/open-layer-dfm-joint-progress.pt" ]]; then
+        RESUME_CHECKPOINT="$OUT_DIR/open-layer-dfm-joint-progress.pt"
+    fi
+    echo "Fork arm=$2 peak=$peak through epoch=$end_epoch resume=$RESUME_CHECKPOINT"
+    train_args+=(--output-dir "$OUT_DIR" --epochs "$end_epoch" --visible-material-replace-peak "$peak")
+fi
+
 resume_args=()
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
     if [[ ! -s "$RESUME_CHECKPOINT" ]]; then
@@ -47,4 +85,4 @@ trap 'kill "$telemetry_pid" 2>/dev/null || true' EXIT
 
 srun --export=ALL --cpu-bind=none --kill-on-bad-exit=1 \
     "$VENV_PY" -u "$ROOT/scripts/train_open_vocab_depth_field.py" \
-    --config "$CONFIG" "${resume_args[@]}"
+    "${train_args[@]}" "${resume_args[@]}"

@@ -247,6 +247,26 @@ class OpenLayerJointDFM(nn.Module):
         return material, (1 - s) * noise + s * endpoint, endpoint - noise, corrupted
 
     @staticmethod
+    def replace_visible_materials(
+        material_ids: torch.Tensor,
+        flow_time: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        *,
+        peak: float,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inject a wrong, candidate-local label into some already-visible slots."""
+        s = flow_time.float()[:, None]
+        probability = 4 * peak * s * (1 - s)
+        replace = torch.rand(material_ids.shape, device=material_ids.device, generator=generator) < probability
+        replace &= (material_ids >= 0) & (candidate_mask.sum(dim=1, keepdim=True) > 1)
+        ids = torch.arange(candidate_mask.shape[1], device=material_ids.device)
+        allowed = candidate_mask[:, None, :] & (ids != material_ids[..., None])
+        scores = torch.rand(allowed.shape, device=material_ids.device, generator=generator)
+        replacement = scores.masked_fill(~allowed, -torch.inf).argmax(dim=-1)
+        return torch.where(replace, replacement, material_ids), replace
+
+    @staticmethod
     def _categorical(
         logits: torch.Tensor,
         temperature: float,
@@ -274,24 +294,67 @@ class OpenLayerJointDFM(nn.Module):
         top_k: int = 0,
         deterministic: bool = False,
         generator: torch.Generator | None = None,
+        reference_layer_counts: torch.Tensor | None = None,
+        reference_thickness_nm: torch.Tensor | None = None,
+        reference_material_ids: torch.Tensor | None = None,
+        fixed_layer_slots: bool = False,
         **condition: torch.Tensor,
     ) -> JointLayerSample:
         """Sample a count, then co-evolve material jumps and thickness latents."""
         if steps < 1 or not math.isfinite(temperature) or temperature < 0 or top_k < 0:
             raise ValueError("Sampling requires positive steps and finite nonnegative temperature/top-k.")
+        if reference_thickness_nm is not None and reference_layer_counts is None:
+            raise ValueError("A reference thickness trajectory requires reference layer counts.")
+        if reference_material_ids is not None:
+            if reference_layer_counts is None:
+                raise ValueError("A reference material trajectory requires reference layer counts.")
+            if reference_thickness_nm is not None:
+                raise ValueError("Only one reference trajectory can be used at a time.")
         bank = condition["candidate_mask"]
         if not bool(bank.any(dim=1).all()):
             raise ValueError("Every candidate needs a nonempty material bank.")
         cached = self.encode_condition(**condition)
         greedy = deterministic or temperature == 0
+        # Always draw from the count head so that both diagnostic arms use the same RNG stream.
         count = self._categorical(cached[2], temperature, 0, greedy, generator)
-        layers = max(1, int(count.max().item()))
+        if reference_layer_counts is not None:
+            if reference_layer_counts.shape != count.shape or reference_layer_counts.dtype != torch.long:
+                raise ValueError("Reference layer counts must be one int64 value per candidate.")
+            count = reference_layer_counts.to(device=count.device)
+            if bool(((count < 0) | (count > self.config.max_layers)).any()):
+                raise ValueError("Reference layer counts must be between zero and MAX_LAYERS.")
+        # Padding to the same shape pairs the Gaussian source and material draws despite different counts.
+        layers = self.config.max_layers if fixed_layer_slots or reference_layer_counts is not None else max(1, int(count.max().item()))
         mask = torch.arange(layers, device=count.device)[None] < count[:, None]
         material = torch.full(mask.shape, self.mask_id, device=count.device, dtype=torch.long).masked_fill(~mask, self.pad_id)
-        state = torch.randn((len(count), layers + 1), device=count.device, generator=generator)
-        state = state.masked_fill(~self.state_mask(mask), 0)
+        if reference_material_ids is not None:
+            if reference_material_ids.shape != mask.shape or reference_material_ids.dtype != torch.long:
+                raise ValueError("Reference materials must have one int64 label per padded layer slot.")
+            reference_material_ids = reference_material_ids.to(device=count.device).masked_fill(~mask, self.pad_id)
+            last_id = bank.shape[1] - 1
+            allowed = bank.gather(1, reference_material_ids.clamp(0, last_id))
+            invalid = (reference_material_ids < 0) | (reference_material_ids > last_id) | ~allowed
+            if bool((mask & invalid).any()):
+                raise ValueError("Reference material labels must belong to the active candidate bank.")
+        source = torch.randn((len(count), layers + 1), device=count.device, generator=generator)
+        source = source.masked_fill(~self.state_mask(mask), 0)
+        state = source
+        reference_endpoint = None
+        if reference_thickness_nm is not None:
+            if reference_thickness_nm.shape != mask.shape:
+                raise ValueError("Reference thicknesses must have one value per padded layer slot.")
+            reference_thickness_nm = reference_thickness_nm.to(source).masked_fill(~mask, 0)
+            invalid = (mask & (reference_thickness_nm < self.config.min_thickness_nm)).any()
+            over_budget = (reference_thickness_nm.double().sum(dim=1) > self.config.max_total_nm + 1e-6).any()
+            if bool(invalid | over_budget | ~reference_thickness_nm.isfinite().all()):
+                raise ValueError("Reference thicknesses must be finite and within the thickness budget.")
+            reference_endpoint = self.encode_thickness(reference_thickness_nm, mask)
         for step in range(steps):
-            flow_time = torch.full_like(count, step / steps, dtype=torch.float32)
+            s = step / steps
+            if reference_endpoint is not None:
+                # Use the training interpolation at the current time, not clean thickness from the start.
+                state = torch.lerp(source, reference_endpoint, s)
+            flow_time = torch.full_like(count, s, dtype=torch.float32)
             out = self(
                 material_ids=material,
                 thickness_state=state,
@@ -301,6 +364,9 @@ class OpenLayerJointDFM(nn.Module):
                 encoded_condition=cached,
             )
             proposal = self._categorical(out["material_logits"], temperature, top_k, greedy, generator)
+            if reference_material_ids is not None:
+                # Keep the same random draws and reveal the reference label only when its slot jumps.
+                proposal = reference_material_ids
             probability = dfm_step_flip_probability(step, steps)
             if greedy:
                 if probability >= 0.5:
@@ -308,7 +374,10 @@ class OpenLayerJointDFM(nn.Module):
             else:
                 flip = torch.rand(mask.shape, device=mask.device, generator=generator) < probability
                 material = torch.where(mask & flip, proposal, material)
-            state = state + out["thickness_velocity"].float() / steps
+            if reference_endpoint is None:
+                state = state + out["thickness_velocity"].float() / steps
         if not bool(torch.isfinite(state).all()):
             raise FloatingPointError("Non-finite thickness state after joint layer DFM sampling.")
-        return JointLayerSample(material, self.decode_thickness(state, mask), count, mask)
+        # At s=1 use the exact native lengths for TMM, avoiding endpoint-clamp roundoff.
+        thickness_nm = self.decode_thickness(state, mask) if reference_thickness_nm is None else reference_thickness_nm
+        return JointLayerSample(material, thickness_nm, count, mask)

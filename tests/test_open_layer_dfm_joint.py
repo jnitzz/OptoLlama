@@ -186,7 +186,112 @@ def test_reproducible_generation_uses_predicted_counts(example):
     assert (empty.material_ids == model.pad_id).all() and not empty.thickness_nm.any()
 
 
-def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch):
+def test_reference_count_ablation_pairs_sampling(example):
+    """A reference count overrides only the active slots without shifting the random stream."""
+    model, batch = example
+    model.eval()
+    with torch.no_grad():
+        model.count_head[-1].weight.zero_()
+        model.count_head[-1].bias.fill_(-100)
+        model.count_head[-1].bias[2] = 100
+    settings = dict(steps=4, fixed_layer_slots=True, **condition(batch))
+    predicted = model.sample(generator=torch.Generator().manual_seed(8), **settings)
+    reference = model.sample(
+        generator=torch.Generator().manual_seed(8), reference_layer_counts=torch.tensor([2, 0]), **settings,
+    )
+    assert predicted.layer_counts.tolist() == [2, 2]
+    assert reference.layer_counts.tolist() == [2, 0]
+    assert reference.material_ids.shape[1] == predicted.material_ids.shape[1] == model.config.max_layers
+    for without_override, with_override in zip(predicted, reference, strict=True):
+        torch.testing.assert_close(without_override[0], with_override[0], rtol=0, atol=0)
+    assert not reference.layer_mask[1].any()
+    assert (reference.material_ids[1] == model.pad_id).all()
+    assert not reference.thickness_nm[1].any()
+    with pytest.raises(ValueError, match="between zero and MAX_LAYERS"):
+        model.sample(reference_layer_counts=torch.tensor([1, model.config.max_layers + 1]), **settings)
+
+
+def test_reference_thickness_follows_forward_path(example):
+    """Give the treatment only the noised reference geometry at each denoising step."""
+    model, batch = example
+    model.eval()
+    mask = batch["layer_mask"]
+    lengths = batch["thickness_nm"]
+    latent = model.encode_thickness(lengths, mask)
+    traces = []
+
+    def capture(_, __, inputs):
+        traces.append((inputs["thickness_state"].clone(), inputs["material_ids"].clone()))
+
+    handle = model.register_forward_pre_hook(capture, with_kwargs=True)
+    settings = dict(steps=4, fixed_layer_slots=True, reference_layer_counts=mask.sum(dim=1), **condition(batch))
+    model.sample(generator=torch.Generator().manual_seed(8), **settings)
+    control = traces.copy()
+    traces.clear()
+    reference = model.sample(generator=torch.Generator().manual_seed(8), reference_thickness_nm=lengths, **settings)
+    handle.remove()
+    torch.testing.assert_close(traces[0][0], control[0][0], rtol=0, atol=0)
+    torch.testing.assert_close(traces[0][1], control[0][1], rtol=0, atol=0)
+    torch.testing.assert_close(traces[1][1], control[1][1], rtol=0, atol=0)
+    for step, (state, _) in enumerate(traces):
+        torch.testing.assert_close(state, torch.lerp(control[0][0], latent, step / 4))
+    torch.testing.assert_close(reference.thickness_nm, lengths, rtol=0, atol=0)
+    assert (reference.material_ids[mask] >= 0).all()
+    assert (reference.material_ids[~mask] == model.pad_id).all()
+    with pytest.raises(ValueError, match="within the thickness budget"):
+        model.sample(reference_thickness_nm=lengths * 1000, **settings)
+
+
+def test_reference_materials_follow_scheduled_jumps(example):
+    """Reveal reference labels on the original jump schedule while predicting thickness."""
+    model, batch = example
+    model.eval()
+    mask = batch["layer_mask"]
+    labels = batch["material_targets"]
+    traces = []
+
+    def capture(_, __, inputs):
+        traces.append((inputs["thickness_state"].clone(), inputs["material_ids"].clone()))
+
+    handle = model.register_forward_pre_hook(capture, with_kwargs=True)
+    settings = dict(steps=4, fixed_layer_slots=True, reference_layer_counts=mask.sum(dim=1), **condition(batch))
+    model.sample(generator=torch.Generator().manual_seed(17), **settings)
+    control = traces.copy()
+    traces.clear()
+    reference = model.sample(generator=torch.Generator().manual_seed(17), reference_material_ids=labels, **settings)
+    handle.remove()
+    torch.testing.assert_close(traces[0][0], control[0][0], rtol=0, atol=0)
+    torch.testing.assert_close(traces[1][0], control[1][0], rtol=0, atol=0)
+    assert (traces[0][1][mask] == model.mask_id).all()
+    for (_, state), (_, control_state) in zip(traces, control, strict=True):
+        torch.testing.assert_close(state == model.mask_id, control_state == model.mask_id)
+        assert (state[mask & (state != model.mask_id)] == labels[mask & (state != model.mask_id)]).all()
+    torch.testing.assert_close(reference.material_ids, labels)
+    assert (reference.thickness_nm[mask] >= model.config.min_thickness_nm).all()
+    assert not torch.equal(reference.thickness_nm, batch["thickness_nm"])
+    bad_labels = labels.masked_fill(mask, model.config.max_candidates - 1)
+    with pytest.raises(ValueError, match="active candidate bank"):
+        model.sample(reference_material_ids=bad_labels, **settings)
+
+
+def test_visible_wrong_materials_preserve_masks_and_rng():
+    """Replace only visible slots with valid alternatives, using an independent RNG."""
+    ids = torch.tensor([[0, 2, -1, -100], [1, 1, -1, -100]]).repeat(3, 1)
+    bank = torch.tensor([[True, False, True], [False, True, False]]).repeat(3, 1)
+    times = torch.tensor([0.0, 0.0, 0.5, 0.5, 1.0, 1.0])
+    state = torch.get_rng_state()
+    changed, wrong = OpenLayerJointDFM.replace_visible_materials(
+        ids, times, bank, peak=1.0, generator=torch.Generator().manual_seed(17),
+    )
+    torch.testing.assert_close(torch.get_rng_state(), state)
+    assert changed[2].tolist() == [2, 0, -1, -100]
+    torch.testing.assert_close(changed[~wrong], ids[~wrong])
+    torch.testing.assert_close(wrong, ids != changed)
+    assert wrong.sum() == 2
+
+
+@pytest.mark.parametrize("replacement_peak", [0.0, 0.10])
+def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak):
     """Restore optimizer, RNG, loader cursor and EMA and reproduce the completed epoch."""
     data = tmp_path / "data"
     (data / "materials").mkdir(parents=True)
@@ -231,21 +336,29 @@ def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch):
     }
     path = tmp_path / "joint.yaml"
     path.write_text(json.dumps(config), encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", ["train", "--config", str(path), "--device", "cpu"])
+    output = data / "arm"
+    monkeypatch.setattr(
+        sys, "argv", [
+            "train", "--config", str(path), "--device", "cpu", "--output-dir", str(output),
+            "--visible-material-replace-peak", str(replacement_peak),
+        ],
+    )
     trainer.main()
-    output = data / "output"
     progress = tmp_path / "progress.pt"
     shutil.copyfile(output / "open-layer-dfm-joint-progress.pt", progress)
     completed = torch.load(output / "open-layer-dfm-joint-last.pt", weights_only=False)
     checkpoint = torch.load(progress, weights_only=False)
     assert checkpoint["extra"]["resume_cursor"]["next_batch"] == 2
     assert checkpoint["extra"]["ema"]["updates"] == 2
+    assert checkpoint["extra"]["visible_material_replace_peak"] == replacement_peak
 
     monkeypatch.setattr(sys, "argv", [*sys.argv, "--resume", str(progress)])
     trainer.main()
     resumed = torch.load(output / "open-layer-dfm-joint-last.pt", weights_only=False)
     assert resumed["extra"]["global_optimizer_steps"] == completed["extra"]["global_optimizer_steps"] == 3
     assert resumed["extra"]["history"][0]["train"]["samples"] == 6
+    assert ("wrong_visible_accuracy" in resumed["extra"]["history"][0]["train"]) == bool(replacement_peak)
+    assert "wrong_visible_accuracy" not in resumed["extra"]["history"][0]["val"]
     for key, tensor in completed["model_state"].items():
         torch.testing.assert_close(resumed["model_state"][key], tensor, rtol=0, atol=0)
         torch.testing.assert_close(
