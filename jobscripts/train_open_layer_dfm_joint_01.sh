@@ -22,8 +22,8 @@ cd "$ROOT"
 
 train_args=(--config "$CONFIG")
 if (( $# > 0 )); then
-    if (( $# != 2 )); then
-        echo "Usage: sbatch $0 [FORK_DIR {control|wrong-label}]" >&2
+    if (( $# < 2 || $# > 3 )); then
+        echo "Usage: sbatch $0 [FORK_DIR {control|wrong-label} [END_EPOCH]]" >&2
         exit 1
     fi
     case "$2" in
@@ -37,22 +37,45 @@ if (( $# > 0 )); then
         echo "Missing frozen fork source: $source_checkpoint" >&2
         exit 1
     fi
-    if [[ -s "$OUT_DIR/open-layer-dfm-joint-last.pt" ]]; then
-        echo "Fork arm $2 already completed: $OUT_DIR"
-        exit 0
-    fi
-    end_epoch="$("$VENV_PY" -c '
+    selection="$("$VENV_PY" -c '
 import sys, torch
-p = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)
-extra = p.get("extra") or {}
-if (not isinstance(p.get("epoch"), int) or not p.get("optimizer_state")
-        or extra.get("resume_cursor") is not None or extra.get("denoising_process") != "joint_layer_dfm"):
-    raise SystemExit("source.pt must be a completed-epoch joint layer DFM checkpoint with optimizer state")
-print(p["epoch"] + 2)
-' "$source_checkpoint")"
-    RESUME_CHECKPOINT="$source_checkpoint"
-    if [[ -s "$OUT_DIR/open-layer-dfm-joint-progress.pt" ]]; then
-        RESUME_CHECKPOINT="$OUT_DIR/open-layer-dfm-joint-progress.pt"
+from pathlib import Path
+
+def position(path, *, progress=False, peak=None):
+    p = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    extra = p.get("extra") or {}
+    cursor = extra.get("resume_cursor")
+    if (not isinstance(p.get("epoch"), int) or not p.get("optimizer_state")
+            or (cursor is not None) != progress or extra.get("denoising_process") != "joint_layer_dfm"):
+        raise SystemExit(f"Invalid resumable joint layer DFM checkpoint: {path}")
+    if peak is not None and float(extra.get("visible_material_replace_peak", 0.0)) != peak:
+        raise SystemExit(f"Checkpoint replacement probability differs from the fork arm: {path}")
+    # A completed save wins over progress from the same zero-based epoch.
+    return (p["epoch"], not progress, int(extra.get("global_optimizer_steps", 0)))
+
+source, out = map(Path, sys.argv[1:3])
+peak = float(sys.argv[3])
+source_position = position(source)
+end = sys.argv[4]
+if end and (not end.isascii() or not end.isdecimal() or int(end) < 1):
+    raise SystemExit("END_EPOCH must be a positive integer")
+end_epoch = int(end) if end else source_position[0] + 2
+latest, resume = source_position, source
+for kind in ("last", "progress"):
+    path = out / f"open-layer-dfm-joint-{kind}.pt"
+    if path.is_file() and path.stat().st_size:
+        key = position(path, progress=kind == "progress", peak=peak)
+        if key > latest:
+            latest, resume = key, path
+if latest[0] + int(latest[1]) >= end_epoch:
+    print(end_epoch)
+else:
+    print(end_epoch, resume, sep="\t")
+' "$source_checkpoint" "$OUT_DIR" "$peak" "${3:-}")"
+    IFS=$'\t' read -r end_epoch RESUME_CHECKPOINT <<< "$selection"
+    if [[ -z "$RESUME_CHECKPOINT" ]]; then
+        echo "Fork arm $2 already reached epoch $end_epoch: $OUT_DIR"
+        exit 0
     fi
     echo "Fork arm=$2 peak=$peak through epoch=$end_epoch resume=$RESUME_CHECKPOINT"
     train_args+=(--output-dir "$OUT_DIR" --epochs "$end_epoch" --visible-material-replace-peak "$peak")

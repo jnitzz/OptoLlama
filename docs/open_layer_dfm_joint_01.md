@@ -46,7 +46,7 @@ batch size. Do not submit two training jobs against the same output folder.
 Take one completed checkpoint and submit a matched continuation. These are
 training branches, not Git branches. The hard link keeps the source fixed even
 as Run 01 atomically replaces its own `last.pt`; both paths must be on the same
-filesystem. The launcher runs exactly one additional epoch per arm.
+filesystem. By default, the launcher runs exactly one additional epoch per arm.
 
 ```bash
 mkdir -p logs
@@ -64,8 +64,17 @@ probability of `0.10 * 4 * s * (1-s)` to visible materials that have at least
 one valid alternative. The control uses zero replacement. Losses and the
 validation corruption are identical. The treatment logs the fraction of
 visible slots replaced and the accuracy of recovering their original labels.
-Re-submit the same arm with the same fork directory to continue from its
-progress checkpoint, after the original job has stopped.
+After the job has stopped, re-submit with the same fork directory and arm to
+resume an interrupted job. Pass a third argument to extend a completed fork
+to an absolute epoch number; for the configured 50-epoch schedule:
+
+```bash
+sbatch --job-name=joint-wrong-label jobscripts/train_open_layer_dfm_joint_01.sh "$fork" wrong-label 50
+```
+
+This resumes the arm's most advanced checkpoint, preferring a completed epoch
+over an older in-epoch save. Reuse the same command after each Slurm time limit.
+Do not submit overlapping jobs for the same arm and output directory.
 
 For the matched benchmark below, test each arm's own
 `$fork/<arm>/open-layer-dfm-joint-last.pt` with `--weights ema` and save into
