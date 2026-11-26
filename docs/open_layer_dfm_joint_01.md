@@ -76,6 +76,36 @@ This resumes the arm's most advanced checkpoint, preferring a completed epoch
 over an older in-epoch save. Reuse the same command after each Slurm time limit.
 Do not submit overlapping jobs for the same arm and output directory.
 
+### Material recovery weights
+
+Compare the existing wrong-label objective with a recovery-weighted version.
+Both arms keep the 0.10 wrong-label replacement peak, optimizer, EMA, and LR
+schedule. The new arm weights masked and deliberately wrong slots at 1.0,
+correctly visible slots at 0.25, and padding at zero, then divides by the sum
+of weights. Count loss, thickness loss, validation and inference are unchanged.
+
+Use a completed checkpoint from the current wrong-label training run. To
+start both arms on identical training state:
+
+```bash
+mkdir -p logs
+out="${OPTOLLAMA_DATA_PATH:-$PWD/data}/output_OPEN_LAYER_DFM_JOINT_01"
+src="$out/forks/wrong-label-261125-105921/wrong-label/open-layer-dfm-joint-last.pt"
+fork="$out/forks/material-reweight-$(date +%y%m%d-%H%M%S)"
+mkdir -p "$fork" &&
+  ln "$src" "$fork/source.pt" &&
+  sbatch --job-name=joint-weight-control jobscripts/train_open_layer_dfm_joint_01.sh "$fork" wrong-label +1 &&
+  sbatch --job-name=joint-weight-recover jobscripts/train_open_layer_dfm_joint_01.sh "$fork" material-recovery +1
+```
+
+Test each arm's completed `last.pt` before re-submitting with `+2` in place
+of `+1`. These limits are relative to the fixed `source.pt`, so the second
+submission trains one more epoch. Use the same 512-target, 16-step, MC4
+benchmark for both arms. To test a stronger weight of 0.10, set
+`CORRECT_VISIBLE_MATERIAL_WEIGHT=0.10` on the `sbatch` command for the
+`material-recovery` arm in a separate fork directory; keep that value on
+resubmission.
+
 For the matched benchmark below, test each arm's own
 `$fork/<arm>/open-layer-dfm-joint-last.pt` with `--weights ema` and save into
 that arm's directory. Use the normal sampler, without reference inputs.

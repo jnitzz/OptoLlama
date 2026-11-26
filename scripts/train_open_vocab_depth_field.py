@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, help="Override the checkpoint and history output directory.")
     parser.add_argument("--visible-material-replace-peak", type=float, help="Joint DFM training-only peak replacement probability.")
+    parser.add_argument(
+        "--correct-visible-material-weight", type=float, help="Joint DFM training weight for correctly visible material labels."
+    )
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument("--max-train-steps", type=int, default=None)
@@ -282,7 +285,7 @@ def compute_joint_loss(
     model: torch.nn.Module, core: optollama.model.OpenLayerJointDFM, batch: dict[str, torch.Tensor], train_cfg: dict[str, Any],
     *, replacement_generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Train count, unweighted categorical endpoints, and velocity on one noised state."""
+    """Train count, categorical endpoints, and velocity on one noised state."""
     clean = batch["material_targets"]
     mask = batch["layer_mask"]
     s = torch.rand(clean.shape[0], device=clean.device)
@@ -300,7 +303,15 @@ def compute_joint_loss(
         incidence_angle_deg=batch["incidence_angle_deg"], polarization_id=batch["polarization_id"],
     )
     logits = output["material_logits"].float()
-    material_loss = functional.cross_entropy(logits.flatten(0, 1), clean.flatten(), reduction="sum") / mask.sum().clamp_min(1)
+    visible_weight = float(train_cfg.get("CORRECT_VISIBLE_MATERIAL_WEIGHT", 1.0)) if model.training else 1.0
+    if visible_weight == 1.0:
+        material_loss = functional.cross_entropy(logits.flatten(0, 1), clean.flatten(), reduction="sum") / mask.sum().clamp_min(1)
+    else:
+        recover = corrupted if wrong is None else corrupted | wrong
+        slot_loss = functional.cross_entropy(logits.flatten(0, 1), clean.flatten(), reduction="none").reshape_as(clean)
+        weights = torch.full_like(slot_loss, visible_weight).masked_fill(recover, 1.0).masked_fill(~mask, 0.0)
+        total_weight = weights.sum()
+        material_loss = (slot_loss * weights).sum() / torch.where(total_weight > 0, total_weight, 1.0)
     active_state = core.state_mask(mask)
     squared = (output["thickness_velocity"].float() - target_velocity).square()
     thickness_loss = squared.masked_fill(~active_state, 0).sum() / active_state.sum().clamp_min(1)
@@ -745,6 +756,13 @@ def main() -> None:
     replacement_peak = float(train_cfg.get("VISIBLE_MATERIAL_REPLACE_PEAK", 0.0)) if joint else 0.0
     if not 0 <= replacement_peak <= 1:
         raise ValueError("VISIBLE_MATERIAL_REPLACE_PEAK must be between zero and one.")
+    if args.correct_visible_material_weight is not None:
+        if not joint:
+            raise ValueError("--correct-visible-material-weight requires a joint layer DFM config.")
+        train_cfg["CORRECT_VISIBLE_MATERIAL_WEIGHT"] = args.correct_visible_material_weight
+    visible_weight = float(train_cfg.get("CORRECT_VISIBLE_MATERIAL_WEIGHT", 1.0)) if joint else 1.0
+    if not 0 <= visible_weight <= 1:
+        raise ValueError("CORRECT_VISIBLE_MATERIAL_WEIGHT must be between zero and one.")
     if args.batch_size is not None:
         cfg["TRAIN_BATCH_SIZE"] = args.batch_size
     if args.smoke_test:
@@ -885,6 +903,8 @@ def main() -> None:
         if resume_cursor is not None:
             if joint and float(checkpoint_extra.get("visible_material_replace_peak", 0.0)) != replacement_peak:
                 raise ValueError("Mid-epoch resume requires the same visible material replacement probability.")
+            if joint and float(checkpoint_extra.get("correct_visible_material_weight", 1.0)) != visible_weight:
+                raise ValueError("Mid-epoch resume requires the same correctly visible material weight.")
             expected = {
                 "world_size": world,
                 "batch_size": int(cfg["TRAIN_BATCH_SIZE"]),
@@ -954,6 +974,7 @@ def main() -> None:
         if joint:
             print(f"Continuous time: s~Uniform(0,1), mask probability=(1-s)^2, linear thickness flow; held-out loss rows={val_n:,}")
             print(f"Visible material replacement: peak={replacement_peak:g} (training only)")
+            print(f"Material CE weights: masked/wrong=1 correct-visible={visible_weight:g} (validation unweighted)")
         else:
             print(
                 f"Continuous time: t~Uniform(0,1), noise_probability=t^2; validation sampling steps={nested(block, 'EVAL', 'SAMPLING_STEPS', default=64)}"
@@ -994,7 +1015,10 @@ def main() -> None:
                 "continuous_time": True,
                 "ema": ema.state_dict() if ema is not None else None,
                 "resume_cursor": cursor,
-                **({"visible_material_replace_peak": replacement_peak} if joint else {}),
+                **(
+                    {"visible_material_replace_peak": replacement_peak, "correct_visible_material_weight": visible_weight}
+                    if joint else {}
+                ),
             }
 
         def checkpoint_at_step(step: int, samples_seen: int, next_batch: int, state: dict[str, Any]) -> None:

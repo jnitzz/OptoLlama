@@ -81,7 +81,8 @@ def condition(batch):
     }
 
 
-def test_native_layers_and_empty_stacks(example):
+@pytest.mark.parametrize("visible_weight", [1.0, 0.25, 0.0])
+def test_native_layers_and_empty_stacks(example, visible_weight):
     """Do not merge or rasterize native targets, and do not discard empty stacks."""
     model, batch = example
     mask = batch["layer_mask"]
@@ -95,11 +96,50 @@ def test_native_layers_and_empty_stacks(example):
     assert batch["polarization_id"].tolist() == [1, 1]
 
     empty = {key: value[1:] for key, value in batch.items()}
-    loss = trainer.compute_joint_loss(model, model, empty, {})
+    loss = trainer.compute_joint_loss(model, model, empty, {"CORRECT_VISIBLE_MATERIAL_WEIGHT": visible_weight})
     assert loss["material_loss"].item() == loss["thickness_loss"].item() == 0.0
     torch.testing.assert_close(loss["loss"], loss["count_loss"])
     loss["loss"].backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("visible_weight", [0.25, 0.10, 0.0])
+def test_material_loss_weights_masked_and_wrong_slots(example, monkeypatch, visible_weight):
+    """Weight recovery slots but not padding, retaining the original validation metric."""
+    model, batch = example
+    clean = batch["material_targets"]
+    end = model.training_state(batch, torch.ones(clean.shape[0]))
+    masked, wrong = torch.zeros_like(clean, dtype=torch.bool), torch.zeros_like(clean, dtype=torch.bool)
+    masked[0, 0] = True
+    wrong[0, 1] = True
+    material = clean.masked_fill(masked, model.mask_id)
+    monkeypatch.setattr(model, "training_state", lambda *_: (material, end[1], end[2], masked))
+    monkeypatch.setattr(
+        model, "replace_visible_materials",
+        lambda *args, **kwargs: (torch.where(wrong, 1 - material, material), wrong),
+    )
+    logits = torch.randn((*clean.shape, model.config.max_candidates), generator=torch.Generator().manual_seed(8))
+    logits.requires_grad_()
+    monkeypatch.setattr(
+        model, "forward",
+        lambda **kwargs: {
+            "material_logits": logits, "thickness_velocity": torch.zeros_like(end[2]),
+            "count_logits": torch.zeros((clean.shape[0], model.config.max_layers + 1)),
+        },
+    )
+    config = {"CORRECT_VISIBLE_MATERIAL_WEIGHT": visible_weight, "VISIBLE_MATERIAL_REPLACE_PEAK": 0.10}
+    loss = trainer.compute_joint_loss(model, model, batch, config, replacement_generator=torch.Generator())
+    slot_loss = torch.nn.functional.cross_entropy(logits[0, :3], clean[0, :3], reduction="none")
+    expected = (slot_loss[0] + slot_loss[1] + visible_weight * slot_loss[2]) / (2 + visible_weight)
+    torch.testing.assert_close(loss["material_loss"], expected)
+    loss["loss"].backward()
+    assert not logits.grad[~batch["layer_mask"]].any()
+
+    model.eval()
+    validation = trainer.compute_joint_loss(model, model, batch, config)
+    torch.testing.assert_close(validation["material_loss"], slot_loss.mean())
+    for component in ("count_loss", "thickness_loss"):
+        torch.testing.assert_close(loss[component], validation[component])
 
 
 def test_thickness_geometry_and_flow_endpoints(example):
@@ -290,8 +330,8 @@ def test_visible_wrong_materials_preserve_masks_and_rng():
     assert wrong.sum() == 2
 
 
-@pytest.mark.parametrize("replacement_peak", [0.0, 0.10])
-def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak):
+@pytest.mark.parametrize(("replacement_peak", "visible_weight"), [(0.0, 1.0), (0.10, 1.0), (0.10, 0.25)])
+def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak, visible_weight):
     """Restore optimizer, RNG, loader cursor and EMA and reproduce the completed epoch."""
     data = tmp_path / "data"
     (data / "materials").mkdir(parents=True)
@@ -337,12 +377,13 @@ def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak):
     path = tmp_path / "joint.yaml"
     path.write_text(json.dumps(config), encoding="utf-8")
     output = data / "arm"
-    monkeypatch.setattr(
-        sys, "argv", [
-            "train", "--config", str(path), "--device", "cpu", "--output-dir", str(output),
-            "--visible-material-replace-peak", str(replacement_peak),
-        ],
-    )
+    args = [
+        "train", "--config", str(path), "--device", "cpu", "--output-dir", str(output),
+        "--visible-material-replace-peak", str(replacement_peak),
+    ]
+    if visible_weight != 1.0:
+        args += ["--correct-visible-material-weight", str(visible_weight)]
+    monkeypatch.setattr(sys, "argv", args)
     trainer.main()
     progress = tmp_path / "progress.pt"
     shutil.copyfile(output / "open-layer-dfm-joint-progress.pt", progress)
@@ -351,8 +392,16 @@ def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak):
     assert checkpoint["extra"]["resume_cursor"]["next_batch"] == 2
     assert checkpoint["extra"]["ema"]["updates"] == 2
     assert checkpoint["extra"]["visible_material_replace_peak"] == replacement_peak
+    assert checkpoint["extra"]["correct_visible_material_weight"] == visible_weight
 
-    monkeypatch.setattr(sys, "argv", [*sys.argv, "--resume", str(progress)])
+    if visible_weight == 1.0:
+        del checkpoint["extra"]["correct_visible_material_weight"]
+        torch.save(checkpoint, progress)
+    else:
+        monkeypatch.setattr(sys, "argv", [*args, "--resume", str(progress), "--correct-visible-material-weight", "0.10"])
+        with pytest.raises(ValueError, match="same correctly visible material weight"):
+            trainer.main()
+    monkeypatch.setattr(sys, "argv", [*args, "--resume", str(progress)])
     trainer.main()
     resumed = torch.load(output / "open-layer-dfm-joint-last.pt", weights_only=False)
     assert resumed["extra"]["global_optimizer_steps"] == completed["extra"]["global_optimizer_steps"] == 3
