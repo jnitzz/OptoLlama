@@ -330,8 +330,50 @@ def test_visible_wrong_materials_preserve_masks_and_rng():
     assert wrong.sum() == 2
 
 
-@pytest.mark.parametrize(("replacement_peak", "visible_weight"), [(0.0, 1.0), (0.10, 1.0), (0.10, 0.25)])
-def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak, visible_weight):
+def test_joint_flow_time_mixture_and_legacy_random_stream():
+    """Check the mixture distribution, determinism and disabled RNG compatibility."""
+    cpu = torch.device("cpu")
+    first = trainer.sample_joint_flow_time(40_000, cpu, (0.2, 0.35), generator=torch.Generator().manual_seed(7))
+    duplicate = trainer.sample_joint_flow_time(40_000, cpu, (0.2, 0.35), generator=torch.Generator().manual_seed(7))
+    torch.testing.assert_close(first, duplicate, rtol=0, atol=0)
+    assert float((first < 0.35).float().mean()) == pytest.approx(0.48, abs=0.009)
+    assert float((1 - first).square().mean()) == pytest.approx(0.4048, abs=0.008)
+    assert bool(((first >= 0) & (first < 1)).all())
+    legacy, current = torch.Generator().manual_seed(17), torch.Generator().manual_seed(17)
+    actual = trainer.sample_joint_flow_time(9, cpu, trainer.joint_flow_time_mix({}), generator=current)
+    torch.testing.assert_close(actual, torch.rand(9, generator=legacy), rtol=0, atol=0)
+    torch.testing.assert_close(current.get_state(), legacy.get_state())
+
+
+@pytest.mark.parametrize(("fraction", "max_s"), [(-0.1, 0.35), (1.1, 0.35), (0.2, 0.0), (0.2, 1.01), (float("nan"), 0.35)])
+def test_joint_flow_time_rejects_invalid_config(fraction, max_s):
+    """Reject invalid mixture bounds and probabilities before starting training."""
+    with pytest.raises(ValueError, match="FLOW_TIME_SAMPLING"):
+        trainer.joint_flow_time_mix({"FLOW_TIME_SAMPLING": {"HIGH_NOISE_FRACTION": fraction, "HIGH_NOISE_MAX_S": max_s}})
+
+
+def test_joint_flow_time_mixture_does_not_change_validation(example):
+    """Use the training mixture only in train mode, with the same validation RNG."""
+    model, batch = example
+    settings = {"FLOW_TIME_SAMPLING": {"HIGH_NOISE_FRACTION": 1.0, "HIGH_NOISE_MAX_S": 0.01}}
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(6)
+        train = trainer.compute_joint_loss(model, model, batch, settings)
+        assert bool((train["diagnostic_timesteps"] < 0.01).all())
+        model.eval()
+        torch.manual_seed(6)
+        plain = trainer.compute_joint_loss(model, model, batch, {})
+        torch.manual_seed(6)
+        mixed = trainer.compute_joint_loss(model, model, batch, settings)
+    for key in ("diagnostic_timesteps", "loss", "material_loss", "thickness_loss", "count_loss"):
+        torch.testing.assert_close(plain[key], mixed[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("replacement_peak", "visible_weight", "high_noise_fraction"),
+    [(0.0, 1.0, 0.0), (0.10, 1.0, 0.0), (0.10, 0.25, 0.0), (0.10, 1.0, 0.2)],
+)
+def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak, visible_weight, high_noise_fraction):
     """Restore optimizer, RNG, loader cursor and EMA and reproduce the completed epoch."""
     data = tmp_path / "data"
     (data / "materials").mkdir(parents=True)
@@ -374,6 +416,10 @@ def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak, vi
             "TRAIN": {"EPOCHS": 1, "AMP": False, "CHECKPOINT_EVERY_STEPS": 2, "EMA": {"UPDATE_EVERY_STEPS": 1}},
         },
     }
+    train = config["OPEN_LAYER_DFM_JOINT"]["TRAIN"]
+    if high_noise_fraction:
+        train["FLOW_TIME_SAMPLING"] = {"HIGH_NOISE_FRACTION": high_noise_fraction, "HIGH_NOISE_MAX_S": 0.35}
+        train["KEEP_EPOCH_CHECKPOINTS"] = [1]
     path = tmp_path / "joint.yaml"
     path.write_text(json.dumps(config), encoding="utf-8")
     output = data / "arm"
@@ -393,9 +439,22 @@ def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak, vi
     assert checkpoint["extra"]["ema"]["updates"] == 2
     assert checkpoint["extra"]["visible_material_replace_peak"] == replacement_peak
     assert checkpoint["extra"]["correct_visible_material_weight"] == visible_weight
+    assert checkpoint["extra"]["joint_flow_time_mix"] == (high_noise_fraction, 0.35)
 
-    if visible_weight == 1.0:
+    if high_noise_fraction:
+        archived = output / "open-layer-dfm-joint-epoch-0001.pt"
+        archived_bytes = archived.read_bytes()
+        assert archived_bytes == (output / "open-layer-dfm-joint-last.pt").read_bytes()
+        train["FLOW_TIME_SAMPLING"]["HIGH_NOISE_FRACTION"] = 0.0
+        path.write_text(json.dumps(config), encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [*args, "--resume", str(progress)])
+        with pytest.raises(ValueError, match="same joint flow-time mixture"):
+            trainer.main()
+        train["FLOW_TIME_SAMPLING"]["HIGH_NOISE_FRACTION"] = high_noise_fraction
+        path.write_text(json.dumps(config), encoding="utf-8")
+    elif visible_weight == 1.0:
         del checkpoint["extra"]["correct_visible_material_weight"]
+        del checkpoint["extra"]["joint_flow_time_mix"]
         torch.save(checkpoint, progress)
     else:
         monkeypatch.setattr(sys, "argv", [*args, "--resume", str(progress), "--correct-visible-material-weight", "0.10"])
@@ -408,6 +467,8 @@ def test_mid_epoch_checkpoint_resume(tmp_path, monkeypatch, replacement_peak, vi
     assert resumed["extra"]["history"][0]["train"]["samples"] == 6
     assert ("wrong_visible_accuracy" in resumed["extra"]["history"][0]["train"]) == bool(replacement_peak)
     assert "wrong_visible_accuracy" not in resumed["extra"]["history"][0]["val"]
+    if high_noise_fraction:
+        assert archived.read_bytes() == archived_bytes and not archived.samefile(output / "open-layer-dfm-joint-last.pt")
     for key, tensor in completed["model_state"].items():
         torch.testing.assert_close(resumed["model_state"][key], tensor, rtol=0, atol=0)
         torch.testing.assert_close(

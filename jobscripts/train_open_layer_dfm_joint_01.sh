@@ -15,9 +15,14 @@ set -euo pipefail
 
 ROOT="${SLURM_SUBMIT_DIR:?Submit from the OptoLlama repository root}"
 VENV_PY="${VENV_PY:-$HOME/.venv/optollama/bin/python}"
-CONFIG="$ROOT/configs/open_layer_dfm_joint_01.yaml"
+run_id="${OPTOLLAMA_JOINT_RUN:-01}"
+case "$run_id" in
+    01|02) ;;
+    *) echo "Unknown OPTOLLAMA_JOINT_RUN: $run_id (expected 01 or 02)" >&2; exit 1 ;;
+esac
+CONFIG="$ROOT/configs/open_layer_dfm_joint_${run_id}.yaml"
 export OPTOLLAMA_DATA_PATH="${OPTOLLAMA_DATA_PATH:-$ROOT/data}"
-OUT_DIR="$OPTOLLAMA_DATA_PATH/output_OPEN_LAYER_DFM_JOINT_01"
+OUT_DIR="$OPTOLLAMA_DATA_PATH/output_OPEN_LAYER_DFM_JOINT_${run_id}"
 cd "$ROOT"
 
 train_args=(--config "$CONFIG")
@@ -96,7 +101,7 @@ if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
     fi
     resume_args=(--resume "$RESUME_CHECKPOINT")
 elif [[ -e "$OUT_DIR/open-layer-dfm-joint-progress.pt" || -e "$OUT_DIR/open-layer-dfm-joint-last.pt" || -e "$OUT_DIR/open-layer-dfm-joint-best.pt" ]]; then
-    echo "Run 01 already has checkpoints. Set RESUME_CHECKPOINT explicitly." >&2
+    echo "Run $run_id already has checkpoints. Set RESUME_CHECKPOINT explicitly." >&2
     exit 1
 fi
 

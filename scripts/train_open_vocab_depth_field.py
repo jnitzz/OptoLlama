@@ -4,6 +4,8 @@ import argparse
 import math
 import os
 import random
+import shutil
+import tempfile
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -281,6 +283,57 @@ def summarize_replacement_metrics(metrics: dict[str, float]) -> None:
         metrics["wrong_visible_accuracy"] = corrected / wrong if wrong else 0.0
 
 
+UNIFORM_JOINT_FLOW_TIME = (0.0, 0.35)
+
+
+def joint_flow_time_mix(train_cfg: dict[str, Any]) -> tuple[float, float]:
+    """Read the probability and upper bound of the high-noise flow-time component."""
+    cfg = train_cfg.get("FLOW_TIME_SAMPLING") or {}
+    fraction = float(cfg.get("HIGH_NOISE_FRACTION", UNIFORM_JOINT_FLOW_TIME[0]))
+    max_s = float(cfg.get("HIGH_NOISE_MAX_S", UNIFORM_JOINT_FLOW_TIME[1]))
+    if not 0.0 <= fraction <= 1.0 or not 0.0 < max_s <= 1.0:
+        raise ValueError("FLOW_TIME_SAMPLING requires HIGH_NOISE_FRACTION in [0,1] and HIGH_NOISE_MAX_S in (0,1].")
+    return (fraction, max_s) if fraction else UNIFORM_JOINT_FLOW_TIME
+
+
+def sample_joint_flow_time(
+    size: int, device: torch.device, mix: tuple[float, float], *, generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample independently per example; a disabled mixture preserves the legacy RNG stream."""
+    fraction, max_s = mix
+    s = torch.rand(size, device=device, generator=generator)
+    if fraction:
+        high_noise = torch.rand(size, device=device, generator=generator) < fraction
+        s = torch.where(high_noise, s * max_s, s)
+    return s
+
+
+def retain_epoch_checkpoint(last_path: Path, archived: Path) -> None:
+    """Pin a completed save, falling back to an atomic copy if links are unavailable."""
+    if archived.exists():
+        print(f"Keeping existing epoch checkpoint: {archived}")
+        return
+    try:
+        archived.hardlink_to(last_path)
+    except FileExistsError:
+        print(f"Keeping existing epoch checkpoint: {archived}")
+        return
+    except OSError:
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=archived.parent, delete=False) as output:
+                temp_path = Path(output.name)
+                with last_path.open("rb") as source:
+                    shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+            temp_path.replace(archived)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+    print(f"Saved fixed epoch checkpoint: {archived}")
+
+
 def compute_joint_loss(
     model: torch.nn.Module, core: optollama.model.OpenLayerJointDFM, batch: dict[str, torch.Tensor], train_cfg: dict[str, Any],
     *, replacement_generator: torch.Generator | None = None,
@@ -288,7 +341,8 @@ def compute_joint_loss(
     """Train count, categorical endpoints, and velocity on one noised state."""
     clean = batch["material_targets"]
     mask = batch["layer_mask"]
-    s = torch.rand(clean.shape[0], device=clean.device)
+    mix = joint_flow_time_mix(train_cfg) if model.training else UNIFORM_JOINT_FLOW_TIME
+    s = sample_joint_flow_time(clean.shape[0], clean.device, mix)
     material, thickness, target_velocity, corrupted = core.training_state(batch, s)
     wrong = None
     if replacement_generator is not None:
@@ -763,6 +817,10 @@ def main() -> None:
     visible_weight = float(train_cfg.get("CORRECT_VISIBLE_MATERIAL_WEIGHT", 1.0)) if joint else 1.0
     if not 0 <= visible_weight <= 1:
         raise ValueError("CORRECT_VISIBLE_MATERIAL_WEIGHT must be between zero and one.")
+    time_mix = joint_flow_time_mix(train_cfg) if joint else UNIFORM_JOINT_FLOW_TIME
+    keep_epochs = train_cfg.get("KEEP_EPOCH_CHECKPOINTS") or []
+    if not isinstance(keep_epochs, list) or any(type(epoch) is not int or epoch < 1 for epoch in keep_epochs):
+        raise ValueError("KEEP_EPOCH_CHECKPOINTS must be a list of positive integer epoch numbers.")
     if args.batch_size is not None:
         cfg["TRAIN_BATCH_SIZE"] = args.batch_size
     if args.smoke_test:
@@ -905,6 +963,8 @@ def main() -> None:
                 raise ValueError("Mid-epoch resume requires the same visible material replacement probability.")
             if joint and float(checkpoint_extra.get("correct_visible_material_weight", 1.0)) != visible_weight:
                 raise ValueError("Mid-epoch resume requires the same correctly visible material weight.")
+            if joint and tuple(checkpoint_extra.get("joint_flow_time_mix", UNIFORM_JOINT_FLOW_TIME)) != time_mix:
+                raise ValueError("Mid-epoch resume requires the same joint flow-time mixture.")
             expected = {
                 "world_size": world,
                 "batch_size": int(cfg["TRAIN_BATCH_SIZE"]),
@@ -972,7 +1032,9 @@ def main() -> None:
             f"{label} model: parameters={sum(p.numel() for p in model.parameters()):,}, world={world}, batch/rank={cfg['TRAIN_BATCH_SIZE']}"
         )
         if joint:
-            print(f"Continuous time: s~Uniform(0,1), mask probability=(1-s)^2, linear thickness flow; held-out loss rows={val_n:,}")
+            fraction, max_s = time_mix
+            time_desc = f"{1-fraction:g} U(0,1) + {fraction:g} U(0,{max_s:g}); validation uniform" if fraction else "s~Uniform(0,1)"
+            print(f"Continuous time: {time_desc}, mask probability=(1-s)^2, linear thickness flow; held-out loss rows={val_n:,}")
             print(f"Visible material replacement: peak={replacement_peak:g} (training only)")
             print(f"Material CE weights: masked/wrong=1 correct-visible={visible_weight:g} (validation unweighted)")
         else:
@@ -1016,7 +1078,11 @@ def main() -> None:
                 "ema": ema.state_dict() if ema is not None else None,
                 "resume_cursor": cursor,
                 **(
-                    {"visible_material_replace_peak": replacement_peak, "correct_visible_material_weight": visible_weight}
+                    {
+                        "visible_material_replace_peak": replacement_peak,
+                        "correct_visible_material_weight": visible_weight,
+                        "joint_flow_time_mix": time_mix,
+                    }
                     if joint else {}
                 ),
             }
@@ -1156,14 +1222,18 @@ def main() -> None:
         history.append({"epoch": epoch + 1, "train": train, "val": val})
         if rank == 0:
             extra = checkpoint_metadata(global_steps)
+            last_path = output_dir / f"{checkpoint_prefix}-last.pt"
             optollama.utils.save_checkpoint(
-                str(output_dir / f"{checkpoint_prefix}-last.pt"),
+                str(last_path),
                 model=raw_model,
                 optimizer=optimizer,
                 scaler=scaler,
                 epoch=epoch,
                 extra=extra,
             )
+            if epoch + 1 in keep_epochs:
+                archived = output_dir / f"{checkpoint_prefix}-epoch-{epoch + 1:04d}.pt"
+                retain_epoch_checkpoint(last_path, archived)
             if val["loss"] < best:
                 best = val["loss"]
                 optollama.utils.save_checkpoint(
